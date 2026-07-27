@@ -19,7 +19,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.13"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
+APP_VERSION = "1.0.14"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
 
@@ -1062,21 +1062,31 @@ class DownloadUpdateThread(QThread):
             self.error_signal.emit(str(e))
 
 def _apply_update_and_restart(new_exe_path: str):
-    """Gọi trình cập nhật độc lập updater.exe để tránh triệt để lỗi xung đột DLL."""
+    """Tạo file .bat tạm để cập nhật — không cần updater.exe, không cần Python DLL."""
     current_exe = _get_exe_path()
-    app_dir = os.path.dirname(current_exe)
-    
-    # Đường dẫn tới updater.exe nằm cùng thư mục với app
-    updater_exe = os.path.join(app_dir, "updater.exe")
-    
-    # Nếu đang chạy môi trường test .py mà chưa có updater.exe thì copy tạm vào temp
-    if not os.path.exists(updater_exe):
-        updater_exe = os.path.join(tempfile.gettempdir(), "updater.exe")
-        # (Đảm bảo bạn đã build updater.exe và đặt sẵn ở đây nếu test local)
+    bat_path = os.path.join(tempfile.gettempdir(), "anhstudio_update.bat")
+
+    bat_content = f'''@echo off
+timeout /t 3 /nobreak >nul
+set RETRY=0
+:COPY_LOOP
+if %RETRY% GEQ 20 goto COPY_DONE
+copy /Y "{new_exe_path}" "{current_exe}" >nul 2>&1
+if %ERRORLEVEL%==0 goto COPY_DONE
+set /a RETRY+=1
+timeout /t 1 /nobreak >nul
+goto COPY_LOOP
+:COPY_DONE
+timeout /t 2 /nobreak >nul
+start "" "{current_exe}"
+del /f /q "{new_exe_path}" >nul 2>&1
+del /f /q "%~f0" >nul 2>&1
+'''
 
     try:
-        # Kích hoạt updater.exe chạy độc lập bên ngoài, truyền vào 2 tham số: file cũ và file mới
-        subprocess.Popen([updater_exe, current_exe, new_exe_path])
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write(bat_content)
+        subprocess.Popen(["cmd", "/c", bat_path], creationflags=subprocess.CREATE_NO_WINDOW)
     except Exception as e:
         QMessageBox.critical(None, "Lỗi", f"Không thể khởi chạy trình cập nhật: {e}")
         return
