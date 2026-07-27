@@ -19,7 +19,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.11"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
+APP_VERSION = "1.0.12"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
 
@@ -1062,64 +1062,58 @@ class DownloadUpdateThread(QThread):
             self.error_signal.emit(str(e))
 
 def _apply_update_and_restart(new_exe_path: str):
-    """Ghi file .bat thay thế exe cũ rồi restart (Đã Fix triệt để lỗi thiếu DLL)."""
+    """Cập nhật phần mềm bằng tiến trình Python độc lập, tránh triệt để lỗi DLL của PyInstaller."""
     current_exe = _get_exe_path()
+    
+    # Tạo một file script python phụ trợ ở thư mục tạm để thực hiện việc thay thế an toàn
+    updater_script = os.path.join(tempfile.gettempdir(), "anhstudio_updater.py")
+    script_content = f'''
+import os
+import sys
+import time
+import subprocess
 
-    if sys.platform == "win32":
-        bat_path = os.path.join(tempfile.gettempdir(), "anhstudio_update.bat")
-        bat_content = f'''@echo off
-chcp 65001 >nul
-echo AnhStudio - Dang cap nhat phien ban moi...
+target_exe = r"{current_exe}"
+new_exe = r"{new_exe_path}"
 
-:: Chờ tiến trình app cũ đóng hẳn
-timeout /t 3 /nobreak >nul
+# Chờ 3 giây để đảm bảo ứng dụng chính đã đóng hoàn toàn và giải phóng tài nguyên
+time.sleep(3)
 
-set /a retry=0
-:COPY_LOOP
-if %retry% GEQ 20 goto END_FAIL
-copy /Y "{new_exe_path}" "{current_exe}" >nul 2>&1
-if %errorlevel% neq 0 (
-    timeout /t 1 /nobreak >nul
-    set /a retry+=1
-    goto COPY_LOOP
-)
+# Thử ghi đè file mới lên file cũ (thử tối đa 20 lần)
+success = False
+for i in range(20):
+    try:
+        with open(new_exe, "rb") as f_src:
+            with open(target_exe, "wb") as f_dst:
+                f_dst.write(f_src.read())
+        success = True
+        break
+    except Exception:
+        time.sleep(1)
 
-:: Chờ thêm 2 giây để Windows giải phóng hoàn toàn thư mục tạm _MEI của PyInstaller
-timeout /t 2 /nobreak >nul
+if success:
+    # Chờ thêm 2 giây để hệ thống ổn định hoàn toàn trước khi khởi động
+    time.sleep(2)
+    subprocess.Popen([target_exe])
 
-:: Khởi động lại app mới
-start "" "{current_exe}"
-goto END
+# Dọn dẹp file cập nhật tạm thời
+try:
+    os.remove(new_exe)
+except:
+    pass
+'''.strip()
 
-:END_FAIL
-echo Loi: Khong the xoa file cu. Vui long tat app va copy thu cong.
-pause
-
-:END
-del /f /q "{new_exe_path}" >nul 2>&1
-del /f /q "%~f0" >nul 2>&1
-exit
-'''
-        with open(bat_path, 'w', encoding='utf-8') as f:
-            f.write(bat_content)
-        subprocess.Popen(
-            ['cmd', '/c', 'start', '', bat_path],
-            creationflags=subprocess.CREATE_NEW_CONSOLE
-        )
-    else:
-        sh_path = os.path.join(tempfile.gettempdir(), "anhstudio_update.sh")
-        sh_content = f'''#!/bin/bash
-sleep 3
-cp "{new_exe_path}" "{current_exe}" && chmod +x "{current_exe}"
-sleep 2
-"{current_exe}" &
-rm -f "{new_exe_path}" "$0"
-'''
-        with open(sh_path, 'w') as f:
-            f.write(sh_content)
-        os.chmod(sh_path, 0o755)
-        subprocess.Popen(['bash', sh_path])
-
+    try:
+        with open(updater_script, "w", encoding="utf-8") as f:
+            f.write(script_content)
+        
+        # Chạy file script phụ bằng Python ngầm, sau đó thoát app chính ngay lập tức
+        subprocess.Popen([sys.executable if not getattr(sys, 'frozen', False) else os.path.join(os.path.dirname(sys.executable), "python.exe") if os.path.exists(os.path.join(os.path.dirname(sys.executable), "python.exe")) else "python", updater_script], creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+    except Exception:
+        # Fallback nếu không gọi được python interpreter riêng thì gọi qua lệnh hệ thống
+        if sys.platform == "win32":
+            os.system(f'start /b python "{updater_script}"')
+            
     QApplication.instance().quit()
 
 class AutoUpdater:
