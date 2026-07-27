@@ -19,7 +19,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.12"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
+APP_VERSION = "1.0.13"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
 
@@ -1062,58 +1062,25 @@ class DownloadUpdateThread(QThread):
             self.error_signal.emit(str(e))
 
 def _apply_update_and_restart(new_exe_path: str):
-    """Cập nhật phần mềm bằng tiến trình Python độc lập, tránh triệt để lỗi DLL của PyInstaller."""
+    """Gọi trình cập nhật độc lập updater.exe để tránh triệt để lỗi xung đột DLL."""
     current_exe = _get_exe_path()
+    app_dir = os.path.dirname(current_exe)
     
-    # Tạo một file script python phụ trợ ở thư mục tạm để thực hiện việc thay thế an toàn
-    updater_script = os.path.join(tempfile.gettempdir(), "anhstudio_updater.py")
-    script_content = f'''
-import os
-import sys
-import time
-import subprocess
-
-target_exe = r"{current_exe}"
-new_exe = r"{new_exe_path}"
-
-# Chờ 3 giây để đảm bảo ứng dụng chính đã đóng hoàn toàn và giải phóng tài nguyên
-time.sleep(3)
-
-# Thử ghi đè file mới lên file cũ (thử tối đa 20 lần)
-success = False
-for i in range(20):
-    try:
-        with open(new_exe, "rb") as f_src:
-            with open(target_exe, "wb") as f_dst:
-                f_dst.write(f_src.read())
-        success = True
-        break
-    except Exception:
-        time.sleep(1)
-
-if success:
-    # Chờ thêm 2 giây để hệ thống ổn định hoàn toàn trước khi khởi động
-    time.sleep(2)
-    subprocess.Popen([target_exe])
-
-# Dọn dẹp file cập nhật tạm thời
-try:
-    os.remove(new_exe)
-except:
-    pass
-'''.strip()
+    # Đường dẫn tới updater.exe nằm cùng thư mục với app
+    updater_exe = os.path.join(app_dir, "updater.exe")
+    
+    # Nếu đang chạy môi trường test .py mà chưa có updater.exe thì copy tạm vào temp
+    if not os.path.exists(updater_exe):
+        updater_exe = os.path.join(tempfile.gettempdir(), "updater.exe")
+        # (Đảm bảo bạn đã build updater.exe và đặt sẵn ở đây nếu test local)
 
     try:
-        with open(updater_script, "w", encoding="utf-8") as f:
-            f.write(script_content)
-        
-        # Chạy file script phụ bằng Python ngầm, sau đó thoát app chính ngay lập tức
-        subprocess.Popen([sys.executable if not getattr(sys, 'frozen', False) else os.path.join(os.path.dirname(sys.executable), "python.exe") if os.path.exists(os.path.join(os.path.dirname(sys.executable), "python.exe")) else "python", updater_script], creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
-    except Exception:
-        # Fallback nếu không gọi được python interpreter riêng thì gọi qua lệnh hệ thống
-        if sys.platform == "win32":
-            os.system(f'start /b python "{updater_script}"')
-            
+        # Kích hoạt updater.exe chạy độc lập bên ngoài, truyền vào 2 tham số: file cũ và file mới
+        subprocess.Popen([updater_exe, current_exe, new_exe_path])
+    except Exception as e:
+        QMessageBox.critical(None, "Lỗi", f"Không thể khởi chạy trình cập nhật: {e}")
+        return
+
     QApplication.instance().quit()
 
 class AutoUpdater:
