@@ -19,7 +19,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.10"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
+APP_VERSION = "1.0.11"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
 
@@ -1062,7 +1062,7 @@ class DownloadUpdateThread(QThread):
             self.error_signal.emit(str(e))
 
 def _apply_update_and_restart(new_exe_path: str):
-    """Ghi file .bat thay thế exe cũ rồi restart (Đã Fix lỗi khóa file)."""
+    """Ghi file .bat thay thế exe cũ rồi restart (Đã Fix triệt để lỗi thiếu DLL)."""
     current_exe = _get_exe_path()
 
     if sys.platform == "win32":
@@ -1070,10 +1070,9 @@ def _apply_update_and_restart(new_exe_path: str):
         bat_content = f'''@echo off
 chcp 65001 >nul
 echo AnhStudio - Dang cap nhat phien ban moi...
-echo Vui long doi vai giay de he thong xep xep file...
 
-:: Cho 2 giay de tien trinh Bootloader cua PyInstaller tat han
-timeout /t 2 /nobreak >nul
+:: Chờ tiến trình app cũ đóng hẳn
+timeout /t 3 /nobreak >nul
 
 set /a retry=0
 :COPY_LOOP
@@ -1085,8 +1084,10 @@ if %errorlevel% neq 0 (
     goto COPY_LOOP
 )
 
-:: Copy thanh cong, doi 2 giay cho he thong giai phong thu muc tam
+:: Chờ thêm 2 giây để Windows giải phóng hoàn toàn thư mục tạm _MEI của PyInstaller
 timeout /t 2 /nobreak >nul
+
+:: Khởi động lại app mới
 start "" "{current_exe}"
 goto END
 
@@ -1108,8 +1109,9 @@ exit
     else:
         sh_path = os.path.join(tempfile.gettempdir(), "anhstudio_update.sh")
         sh_content = f'''#!/bin/bash
-sleep 2
+sleep 3
 cp "{new_exe_path}" "{current_exe}" && chmod +x "{current_exe}"
+sleep 2
 "{current_exe}" &
 rm -f "{new_exe_path}" "$0"
 '''
