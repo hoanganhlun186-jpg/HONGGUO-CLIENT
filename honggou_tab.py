@@ -19,7 +19,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.8"  # ← ĐỔI MỖI LẦN BUILD PHIÊN BẢN MỚI
+APP_VERSION = "1.0.9"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
 
@@ -30,7 +30,6 @@ class HotMoviesLoadThread(QThread):
     item_loaded_signal = pyqtSignal(dict) # Bắn tín hiệu TỪNG PHIM MỘT
     finished_signal = pyqtSignal()
     
-    # [CẬP NHẬT]: Thêm biến genre để nhận lệnh lọc từ Tab Thể Loại
     def __init__(self, genre=None):
         super().__init__()
         self.genre = genre
@@ -40,13 +39,12 @@ class HotMoviesLoadThread(QThread):
             url = f"{SERVER_URL}/api/client/hot_movies"
             params = {}
             if self.genre:
-                params["genre"] = self.genre # Đính kèm thể loại để Server lọc
+                params["genre"] = self.genre 
                 
             res = requests.get(url, params=params, timeout=10)
             if res.status_code == 200:
                 movies = res.json()
                 for m in movies:
-                    # --- GIẢI MÃ UNICODE CHO TÊN PHIM VÀ ẢNH ---
                     title = m.get("title", "")
                     if isinstance(title, str) and "\\u" in title:
                         try:
@@ -65,7 +63,6 @@ class HotMoviesLoadThread(QThread):
                         if cover_url.startswith("//"):
                             cover_url = "https:" + cover_url
                             
-                        # --- CƠ CHẾ RETRY TẢI ẢNH TỐI ĐA 3 LẦN ---
                         for attempt in range(3):
                             try:
                                 headers = {
@@ -83,7 +80,6 @@ class HotMoviesLoadThread(QThread):
                                 else:
                                     pass
                     
-                    # QUAN TRỌNG: Tải xong phim nào là ném luôn ra giao diện phim đó
                     self.item_loaded_signal.emit(m)
                     
             self.finished_signal.emit()
@@ -101,7 +97,7 @@ class HonggouScanThread(QThread):
     def __init__(self, url, auth_token=""):
         super().__init__()
         self.url = url
-        self.auth_token = auth_token  # 🔒 JWT token
+        self.auth_token = auth_token  
 
     def _resolve_to_detail_url(self, url):
         if "hongguoduanju.com/detail" in url or "hongguoduanju.com/player" in url:
@@ -224,7 +220,7 @@ class JobStatusMonitorThread(QThread):
     def __init__(self, job_id, auth_token=""):
         super().__init__()
         self.job_id = job_id
-        self.auth_token = auth_token  # 🔒 JWT token
+        self.auth_token = auth_token  
         self.running = True
 
     def run(self):
@@ -245,7 +241,7 @@ class JobStatusMonitorThread(QThread):
         self.running = False
 
 # ==========================================
-# THREAD 4a: LUỒNG TẢI 1 FILE MP4 TỪ GOOGLE DRIVE (Giữ nguyên)
+# THREAD 4a: LUỒNG TẢI 1 FILE MP4 TỪ GOOGLE DRIVE
 # ==========================================
 class SingleDriveDownloadThread(QThread):
     progress_signal = pyqtSignal(int, int, float)  
@@ -309,7 +305,7 @@ class SingleDriveDownloadThread(QThread):
             self.error_signal.emit(ep_num, str(e))
 
 # ==========================================
-# THREAD 4b: QUẢN LÝ TẢI SONG SONG NHIỀU LUỒNG (Giữ nguyên)
+# THREAD 4b: QUẢN LÝ TẢI SONG SONG NHIỀU LUỒNG
 # ==========================================
 class DriveDownloadThread(QThread):
     progress_signal = pyqtSignal(int, int, float)  
@@ -377,7 +373,7 @@ class HonggouWidget(QWidget):
         self.is_first_movie = True 
         self.settings = QSettings("AnhStudio", "HongguoApp")
         
-        self.auth_token = self.settings.value("auth_token", "")  # 🔒 Lấy JWT token
+        self.auth_token = self.settings.value("auth_token", "")
         
         default_folder = os.path.join(os.path.expanduser("~"), "Desktop", "AnhStudio_Downloads")
         self.save_folder = self.settings.value(f"download_folder_{username}", default_folder)
@@ -455,7 +451,6 @@ class HonggouWidget(QWidget):
         
         self.genre_buttons = []
         
-        # Danh sách các Tab cần hiện (Bạn có thể thêm bớt thoải mái)
         genres = [
             ("🔥 Phổ Biến", None), 
             ("💖 Ngọt Sủng", "Ngọt sủng"), 
@@ -475,10 +470,9 @@ class HonggouWidget(QWidget):
             genre_layout.addWidget(btn)
             self.genre_buttons.append(btn)
             
-        genre_layout.addStretch() # Dồn toàn bộ nút sang bên trái
+        genre_layout.addStretch() 
         grid_layout.addWidget(self.genre_container)
         
-        # Cập nhật style mặc định (Tab Phổ Biến sáng lên)
         self._update_genre_styles(self.genre_buttons[0])
 
         self.hot_list = QListWidget()
@@ -601,26 +595,21 @@ class HonggouWidget(QWidget):
 
         self.content_stack.addWidget(self.page_detail)
 
-    # --- HÀM STYLE & SỰ KIỆN TAB THỂ LOẠI ---
     def _update_genre_styles(self, active_btn):
         for btn in self.genre_buttons:
             if btn == active_btn:
-                # NÚT ĐANG CHỌN (Màu Vàng Nổi Bật)
                 btn.setStyleSheet("""
                     QPushButton { background-color: #f59e0b; color: #ffffff; font-weight: bold; font-size: 14px; border-radius: 16px; padding: 8px 20px; border: none; }
                     QPushButton:hover { background-color: #d97706; }
                 """)
             else:
-                # NÚT CHƯA CHỌN (Màu Xanh Cyan Sáng mượt mà)
                 btn.setStyleSheet("""
                     QPushButton { background-color: #0ea5e9; color: #ffffff; font-weight: bold; font-size: 13px; border-radius: 16px; padding: 8px 18px; border: none; }
                     QPushButton:hover { background-color: #38bdf8; }
                 """)
 
     def _on_genre_clicked(self, clicked_btn):
-        # 1. Đổi màu nút
         self._update_genre_styles(clicked_btn)
-        # 2. Lấy thể loại và nạp lại phim
         genre_tag = clicked_btn.property("genre_tag")
         self.load_hot_movies_shelf(genre_tag)
 
@@ -638,7 +627,6 @@ class HonggouWidget(QWidget):
         
         self.is_first_movie = True 
         
-        # Bắn lệnh quét ngầm kèm filter thể loại
         self.hot_thread = HotMoviesLoadThread(genre)
         self.hot_thread.item_loaded_signal.connect(self._render_single_hot_movie)
         self.hot_thread.start()
@@ -971,7 +959,6 @@ class HonggouWidget(QWidget):
             self.lbl_folder.setText(f"📂 Lưu vào: {self.save_folder}")
 
     def _auth_headers(self):
-        """🔒 Header xác thực JWT cho mọi request tới Server."""
         return {"Authorization": f"Bearer {self.auth_token}"}
 
     def _on_scan_error(self, error_msg):
@@ -984,7 +971,7 @@ class HonggouWidget(QWidget):
         self.url_input.setText(resolved_url)
 
 # ==========================================
-# AUTO-UPDATER: KIỂM TRA & CẬP NHẬT PHIÊN BẢN MỚI TỪ GITHUB
+# AUTO-UPDATER: KIỂM TRA & CẬP NHẬT PHIÊN BẢN MỚI
 # ==========================================
 def _compare_versions(current: str, latest: str) -> bool:
     try:
@@ -1001,8 +988,7 @@ def _get_exe_path() -> str:
         return os.path.abspath(sys.argv[0])
 
 class UpdateCheckThread(QThread):
-    """Chạy ngầm khi app khởi động, kiểm tra có bản mới không."""
-    update_available = pyqtSignal(str, str, str, bool)  # version, url, changelog, force
+    update_available = pyqtSignal(str, str, str, bool) 
     no_update = pyqtSignal()
 
     def run(self):
@@ -1030,7 +1016,6 @@ class UpdateCheckThread(QThread):
             pass
 
 class DownloadUpdateThread(QThread):
-    """Tải file .exe mới từ GitHub về thư mục tạm, báo tiến trình %."""
     progress_signal = pyqtSignal(int)
     done_signal = pyqtSignal(str)
     error_signal = pyqtSignal(str)
@@ -1041,9 +1026,20 @@ class DownloadUpdateThread(QThread):
 
     def run(self):
         try:
-            # TẢI TRỰC TIẾP TỪ GITHUB - KHÔNG CẦN VƯỢT RÀO COOKIE NỮA
-            resp = requests.get(self.download_url, stream=True, timeout=30)
-            resp.raise_for_status()
+            url = self.download_url
+            session = requests.Session()
+            resp = session.get(url, stream=True, timeout=30)
+
+            for key, value in resp.cookies.items():
+                if key.startswith('download_warning'):
+                    url = f"{url}&confirm={value}"
+                    resp = session.get(url, stream=True, timeout=30)
+                    break
+
+            content_type = resp.headers.get('Content-Type', '')
+            if 'text/html' in content_type and 'drive.google.com' in url:
+                url = url + ("&" if "?" in url else "?") + "confirm=t"
+                resp = session.get(url, stream=True, timeout=30)
 
             total_size = int(resp.headers.get('content-length', 0))
             downloaded = 0
@@ -1057,41 +1053,48 @@ class DownloadUpdateThread(QThread):
                         if total_size > 0:
                             self.progress_signal.emit(int(downloaded * 100 / total_size))
 
+            if os.path.getsize(temp_path) < 1_000_000:
+                self.error_signal.emit("File tải về bị lỗi hoặc quá nhỏ. Vui lòng báo cho Admin!")
+                return
+
             self.done_signal.emit(temp_path)
         except Exception as e:
             self.error_signal.emit(str(e))
 
 def _apply_update_and_restart(new_exe_path: str):
-    """Ghi file .bat thay thế exe cũ rồi restart."""
+    """Ghi file .bat thay thế exe cũ rồi restart (Đã Fix lỗi khóa file)."""
     current_exe = _get_exe_path()
 
     if sys.platform == "win32":
         bat_path = os.path.join(tempfile.gettempdir(), "anhstudio_update.bat")
         bat_content = f'''@echo off
 chcp 65001 >nul
-echo AnhStudio - Dang cap nhat...
+echo AnhStudio - Dang cap nhat phien ban moi...
+echo Vui long doi vai giay de he thong xep xep file...
 
-set /a count=0
-:WAIT_LOOP
-tasklist /FI "PID eq {os.getpid()}" 2>NUL | find /I "{os.getpid()}" >NUL
-if errorlevel 1 goto DO_UPDATE
-timeout /t 1 /nobreak >nul
-set /a count+=1
-if %count% GEQ 30 goto DO_UPDATE
-goto WAIT_LOOP
+:: Cho 2 giay de tien trinh Bootloader cua PyInstaller tat han
+timeout /t 2 /nobreak >nul
 
-:DO_UPDATE
-if exist "{current_exe}" copy /Y "{current_exe}" "{current_exe}.bak" >nul 2>&1
-copy /Y "{new_exe_path}" "{current_exe}"
-if errorlevel 1 (
-    if exist "{current_exe}.bak" copy /Y "{current_exe}.bak" "{current_exe}" >nul 2>&1
-    pause
-    goto END
+set /a retry=0
+:COPY_LOOP
+if %retry% GEQ 20 goto END_FAIL
+copy /Y "{new_exe_path}" "{current_exe}" >nul 2>&1
+if %errorlevel% neq 0 (
+    timeout /t 1 /nobreak >nul
+    set /a retry+=1
+    goto COPY_LOOP
 )
-del /f /q "{current_exe}.bak" >nul 2>&1
-del /f /q "{new_exe_path}" >nul 2>&1
+
+:: Copy thanh cong, khoi dong lai
 start "" "{current_exe}"
+goto END
+
+:END_FAIL
+echo Loi: Khong the xoa file cu. Vui long tat app va copy thu cong.
+pause
+
 :END
+del /f /q "{new_exe_path}" >nul 2>&1
 del /f /q "%~f0" >nul 2>&1
 exit
 '''
@@ -1104,12 +1107,10 @@ exit
     else:
         sh_path = os.path.join(tempfile.gettempdir(), "anhstudio_update.sh")
         sh_content = f'''#!/bin/bash
-for i in $(seq 1 30); do kill -0 {os.getpid()} 2>/dev/null || break; sleep 1; done
-cp "{current_exe}" "{current_exe}.bak" 2>/dev/null
+sleep 2
 cp "{new_exe_path}" "{current_exe}" && chmod +x "{current_exe}"
-rm -f "{current_exe}.bak" "{new_exe_path}"
 "{current_exe}" &
-rm -f "$0"
+rm -f "{new_exe_path}" "$0"
 '''
         with open(sh_path, 'w') as f:
             f.write(sh_content)
@@ -1119,7 +1120,6 @@ rm -f "$0"
     QApplication.instance().quit()
 
 class AutoUpdater:
-    """Gắn vào header_layout, tự kiểm tra & ÉP cập nhật."""
     def __init__(self, header_layout: QHBoxLayout, parent_widget=None):
         self.parent = parent_widget
         self._download_url = ""
@@ -1129,7 +1129,7 @@ class AutoUpdater:
         self.btn_update = QPushButton()
         self.btn_update.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_update.setVisible(False)
-        self.btn_update.clicked.connect(lambda: self._on_update_clicked(is_forced=False))
+        self.btn_update.clicked.connect(self._on_update_clicked)
         self.btn_update.setStyleSheet("""
             QPushButton { padding: 8px 16px; background-color: #f59e0b; color: #000; border-radius: 6px; font-weight: bold; font-size: 13px; border: none; }
             QPushButton:hover { background-color: #d97706; }
@@ -1149,34 +1149,25 @@ class AutoUpdater:
         self._changelog = changelog
         self.btn_update.setText(f"🔄 Cập nhật v{version}")
         self.btn_update.setVisible(True)
-        
-        # NẾU CÓ CỜ BẮT BUỘC TỪ SERVER -> ÉP KHÁCH CẬP NHẬT
         if force:
-            QMessageBox.critical(
-                self.parent, 
-                "BẮT BUỘC CẬP NHẬT",
-                f"Phát hiện phiên bản mới: v{version}\nĐây là bản cập nhật bắt buộc để tối ưu hệ thống.\n\nPhần mềm sẽ tiến hành tải và cài đặt ngay lập tức!\n\nChi tiết thay đổi: {changelog}"
-            )
-            self._on_update_clicked(is_forced=True)
+            QMessageBox.warning(self.parent, "Bắt buộc cập nhật",
+                f"Phiên bản {version} là bản cập nhật bắt buộc.\nVui lòng cập nhật để tiếp tục sử dụng.\n\n{changelog}")
 
-    def _on_update_clicked(self, is_forced=False):
-        # Nếu không bắt buộc thì mới hỏi ý kiến
-        if not is_forced:
-            msg = f"Phiên bản mới: v{self._latest_version}\nHiện tại: v{APP_VERSION}\n\n"
-            if self._changelog:
-                msg += f"Thay đổi:\n{self._changelog}\n\n"
-            msg += "Nhấn OK để tải bản mới.\nApp sẽ tự tắt → cập nhật → mở lại."
+    def _on_update_clicked(self):
+        msg = f"Phiên bản mới: v{self._latest_version}\nHiện tại: v{APP_VERSION}\n\n"
+        if self._changelog:
+            msg += f"Thay đổi:\n{self._changelog}\n\n"
+        msg += "Nhấn OK để tải bản mới.\nApp sẽ tự tắt → cập nhật → mở lại."
 
-            if QMessageBox.question(self.parent, "Cập nhật phần mềm", msg,
-                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
-            ) != QMessageBox.StandardButton.Ok:
-                return
+        if QMessageBox.question(self.parent, "Cập nhật phần mềm", msg,
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+        ) != QMessageBox.StandardButton.Ok:
+            return
 
-        # Khóa nút Hủy, ép chạy tiến trình tải
         self.progress = QProgressDialog("Đang tải phiên bản mới...", None, 0, 100, self.parent)
         self.progress.setWindowTitle("Cập nhật AnhStudio")
         self.progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self.progress.setCancelButton(None) 
+        self.progress.setCancelButton(None)
         self.progress.setMinimumDuration(0)
         self.progress.setValue(0)
         self.progress.setStyleSheet("""
@@ -1288,7 +1279,7 @@ class LoginScreen(QWidget):
             if data.get("status") == "success":
                 self.settings.setValue("username", user)
                 self.settings.setValue("password", pwd)
-                self.settings.setValue("auth_token", data.get("token", ""))  # 🔒 Lưu JWT token
+                self.settings.setValue("auth_token", data.get("token", "")) 
                 
                 self.login_success.emit(user, data.get("expiry", "Vô thời hạn"))
             else:
@@ -1378,7 +1369,6 @@ class MainWindow(QMainWindow):
         header_layout.addSpacing(20)
         header_layout.addWidget(btn_logout)
 
-        # === AUTO-UPDATER: Tự kiểm tra & hiện nút cập nhật trên header ===
         self.updater = AutoUpdater(header_layout, parent_widget=self)
 
         main_layout.addWidget(header)
