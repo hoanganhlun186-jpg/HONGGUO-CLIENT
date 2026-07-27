@@ -19,7 +19,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.6"  # ← ĐỔI MỖI LẦN BUILD PHIÊN BẢN MỚI
+APP_VERSION = "1.0.7"  # ← ĐỔI MỖI LẦN BUILD PHIÊN BẢN MỚI
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
 
