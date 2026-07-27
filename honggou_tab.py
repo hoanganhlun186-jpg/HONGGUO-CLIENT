@@ -19,7 +19,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.9"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
+APP_VERSION = "1.0.10"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
 
@@ -1085,7 +1085,8 @@ if %errorlevel% neq 0 (
     goto COPY_LOOP
 )
 
-:: Copy thanh cong, khoi dong lai
+:: Copy thanh cong, doi 2 giay cho he thong giai phong thu muc tam
+timeout /t 2 /nobreak >nul
 start "" "{current_exe}"
 goto END
 
