@@ -1,3 +1,4 @@
+import base64 as _base64
 import sys
 import time
 import json
@@ -13,13 +14,13 @@ from PyQt6.QtWidgets import (
     QHeaderView, QListWidget, QListWidgetItem, QApplication, QMainWindow, QStackedWidget,
     QFileDialog, QProgressDialog
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QSettings
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QSettings, QTimer
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.17"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
+APP_VERSION = "1.0.18"  # ← BẠN HÃY ĐỔI SỐ NÀY KHI PHÁT HÀNH
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
 
@@ -27,61 +28,50 @@ MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
 # THREAD 1: TẢI DANH SÁCH PHIM HOT NGẦM (CUỐN CHIẾU)
 # ==========================================
 class HotMoviesLoadThread(QThread):
-    item_loaded_signal = pyqtSignal(dict) # Bắn tín hiệu TỪNG PHIM MỘT
+    item_loaded_signal = pyqtSignal(dict)  # Bắn từng phim (đã có ảnh nếu server cache sẵn)
     finished_signal = pyqtSignal()
-    
+
     def __init__(self, genre=None):
         super().__init__()
         self.genre = genre
-        
+
     def run(self):
         try:
             url = f"{SERVER_URL}/api/client/hot_movies"
             params = {}
             if self.genre:
-                params["genre"] = self.genre 
-                
+                params["genre"] = self.genre
+
             res = requests.get(url, params=params, timeout=10)
             if res.status_code == 200:
                 movies = res.json()
+                seen_titles = set()
                 for m in movies:
+                    # Fix unicode
                     title = m.get("title", "")
                     if isinstance(title, str) and "\\u" in title:
                         try:
                             title = title.encode('utf-8').decode('unicode_escape')
                             m["title"] = title
                         except: pass
-                    
-                    cover_url = m.get("cover_url", "")
-                    if isinstance(cover_url, str) and "\\u" in cover_url:
+
+                    # Dedupe theo title
+                    key = (m.get("title") or "").strip()
+                    if key and key in seen_titles:
+                        continue
+                    if key:
+                        seen_titles.add(key)
+
+                    # ✅ MỚI: Nếu server gửi cover_base64 → decode thành img_data luôn
+                    cover_b64 = m.get("cover_base64")
+                    if cover_b64:
                         try:
-                            cover_url = cover_url.encode('utf-8').decode('unicode_escape')
-                        except: pass
-                    
-                    if cover_url:
-                        cover_url = cover_url.replace("\\/", "/").replace("\\", "")
-                        if cover_url.startswith("//"):
-                            cover_url = "https:" + cover_url
-                            
-                        for attempt in range(3):
-                            try:
-                                headers = {
-                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                                    "Referer": "https://hongguoduanju.com/"
-                                }
-                                img_res = requests.get(cover_url, headers=headers, timeout=5)
-                                
-                                if img_res.status_code == 200:
-                                    m["img_data"] = img_res.content
-                                    break
-                            except Exception:
-                                if attempt < 2:
-                                    time.sleep(0.5)
-                                else:
-                                    pass
-                    
+                            m["img_data"] = _base64.b64decode(cover_b64)
+                        except Exception:
+                            pass
+
                     self.item_loaded_signal.emit(m)
-                    
+
             self.finished_signal.emit()
         except Exception:
             self.finished_signal.emit()
@@ -1355,6 +1345,13 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(main_widget)
         
         self._fetch_balance(username)
+
+        # === HEARTBEAT: Báo server mỗi 20 giây ===
+        self._hb_username = username
+        self._hb_timer = QTimer(self)
+        self._hb_timer.timeout.connect(self._send_heartbeat)
+        self._hb_timer.start(20000)  # 20 giây
+        self._send_heartbeat()  # Gửi ngay lần đầu
     
     def _fetch_balance(self, username):
         try:
@@ -1369,10 +1366,48 @@ class MainWindow(QMainWindow):
     def _update_balance_display(self, balance):
         self.lbl_balance.setText(f"💰 Số dư: {balance:,} đ".replace(",", "."))
 
+    def _send_heartbeat(self):
+        """Gửi heartbeat lên server để dashboard biết khách đang online."""
+        try:
+            token = QSettings("AnhStudio", "HongguoApp").value("auth_token", "")
+            if not token:
+                return
+            payload = {
+                "current_job_id": "",
+                "series_id": "",
+                "action": ""
+            }
+            # Lấy thông tin phim đang xem từ HonggouWidget
+            if hasattr(self, 'honggou_tab'):
+                tab = self.honggou_tab
+                if tab.current_job_id:
+                    payload["current_job_id"] = str(tab.current_job_id)
+                if tab.current_series_id:
+                    payload["series_id"] = str(tab.current_series_id)
+                # Mô tả hành động
+                if tab.monitor_thread and tab.monitor_thread.isRunning():
+                    payload["action"] = "Dang cho tai phim"
+                elif tab.current_episodes:
+                    payload["action"] = "Dang xem danh sach tap"
+                else:
+                    payload["action"] = "Dang luot kho phim"
+            requests.post(
+                f"{SERVER_URL}/api/client/heartbeat",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5
+            )
+        except Exception:
+            pass
+
     def logout(self):
         reply = QMessageBox.question(self, "Đăng xuất", "Bạn có chắc chắn muốn đăng xuất không?\n(Sẽ xóa thông tin tài khoản đã ghi nhớ)", 
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
+            # Dừng heartbeat
+            if hasattr(self, '_hb_timer'):
+                self._hb_timer.stop()
+
             settings = QSettings("AnhStudio", "HongguoApp")
             settings.remove("username")
             settings.remove("password")
