@@ -15,13 +15,13 @@ from PyQt6.QtWidgets import (
     QHeaderView, QListWidget, QListWidgetItem, QApplication, QMainWindow, QStackedWidget,
     QFileDialog, QProgressDialog
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QSettings, QTimer
+from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize, QSettings, QTimer
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.19"
+APP_VERSION = "1.0.20"
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
 
@@ -324,37 +324,28 @@ class SingleDriveDownloadThread(QThread):
                 return
 
 # ==========================================
-# THREAD 4b: QUẢN LÝ TẢI SONG SONG NHIỀU LUỒNG
+# THREAD 4b: QUẢN LÝ TẢI SONG SONG NHIỀU LUỒNG (QObject - main thread)
 # ==========================================
-class DriveDownloadThread(QThread):
+class DriveDownloadManager(QObject):
+    """Quản lý download queue ở main thread — signal delivery không bị treo."""
     progress_signal = pyqtSignal(int, int, float)  
     done_signal = pyqtSignal(int, str)              
     error_signal = pyqtSignal(int, str)             
     all_done_signal = pyqtSignal(int)               
 
-    def __init__(self, episodes, save_folder):
-        super().__init__()
-        self.episodes = list(episodes)
+    def __init__(self, episodes, save_folder, parent=None):
+        super().__init__(parent)
+        self._pending = list(episodes)
         self.save_folder = save_folder
         self._workers = []         
-        self._pending = []         
         self._success_count = 0
         self._finished_count = 0
         self._total = len(episodes)
 
-    def run(self):
-        self._pending = list(self.episodes)
-        self._workers = []
-        self._success_count = 0
-        self._finished_count = 0
-
+    def start(self):
+        """Bắt đầu tải — gọi từ main thread, không cần QThread.run()."""
         for _ in range(min(MAX_CONCURRENT_DOWNLOADS, len(self._pending))):
             self._launch_next()
-
-        while self._finished_count < self._total:
-            time.sleep(0.2)
-
-        self.all_done_signal.emit(self._success_count)
 
     def _launch_next(self):
         if not self._pending:
@@ -372,11 +363,15 @@ class DriveDownloadThread(QThread):
         self._finished_count += 1
         self.done_signal.emit(ep_num, file_path)
         self._launch_next()
+        if self._finished_count >= self._total:
+            self.all_done_signal.emit(self._success_count)
 
     def _on_worker_error(self, ep_num, error_msg):
         self._finished_count += 1
         self.error_signal.emit(ep_num, error_msg)
         self._launch_next()
+        if self._finished_count >= self._total:
+            self.all_done_signal.emit(self._success_count)
 
 # ==========================================
 # MODULE CHÍNH: HONGGOU WIDGET
@@ -516,13 +511,18 @@ class HonggouWidget(QWidget):
         detail_layout.addWidget(self.lbl_status)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Chọn Tập", "Tên File", "Trạng Thái Link"])
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Chọn Tập", "", "Tên File", "Trạng Thái Link"])
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 90)
+        self.table.setColumnWidth(1, 50)   # Cột thumbnail nhỏ
+        self.table.setColumnWidth(3, 150)
         self.table.verticalHeader().setVisible(False) 
         self.table.setShowGrid(False) 
         self.table.setAlternatingRowColors(True) 
-        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus) 
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)  # Chống sửa cell
+        self.table.setIconSize(QSize(40, 50))  # Kích thước thumbnail
         
         self.table.setStyleSheet("""
             QTableWidget { background-color: #111827; alternate-background-color: #1f2937; color: #e2e8f0; border: 1px solid #374151; border-radius: 8px; outline: none; margin-top: 10px; font-size: 13px; }
@@ -704,6 +704,23 @@ class HonggouWidget(QWidget):
         total_eps = data.get("total_episodes", 0)
         self.current_episodes = data.get("episodes", [])
         
+        # Tải ảnh bìa phim để hiển thị thumbnail
+        self.current_cover_pixmap = None
+        cover_url = data.get("cover_url", "")
+        if cover_url:
+            try:
+                resp = requests.get(cover_url, timeout=8)
+                if resp.status_code == 200:
+                    pix = QPixmap()
+                    pix.loadFromData(resp.content)
+                    if not pix.isNull():
+                        self.current_cover_pixmap = pix.scaled(
+                            40, 50, Qt.AspectRatioMode.KeepAspectRatio, 
+                            Qt.TransformationMode.SmoothTransformation
+                        )
+            except Exception:
+                pass
+        
         if status == "cache_hit":
             self.lbl_status.setText(f"✅ Phim đã có sẵn trên Server! (Tổng: {total_eps} tập). Bạn có thể chọn tập và tải ngay.")
             self.btn_download.setEnabled(True)
@@ -750,39 +767,54 @@ class HonggouWidget(QWidget):
 
         if self.table.rowCount() != total_eps:
             self.table.setRowCount(total_eps)
+        
+        # Flags chống sửa cho cell thường (chỉ hiển thị, không edit)
+        readonly_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
             
         for i in range(total_eps):
             ep_num = i + 1
             ep_data = next((e for e in episodes if e.get("episode_number") == ep_num), None)
             
+            # Cột 0: Checkbox
             ep_item = QTableWidgetItem(f" Tập {ep_num}")
             ep_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             ep_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-            
             if i in checked_eps: ep_item.setCheckState(Qt.CheckState.Checked)
             else: ep_item.setCheckState(Qt.CheckState.Unchecked)
-                
             self.table.setItem(i, 0, ep_item)
-            self.table.setRowHeight(i, 45) 
+            self.table.setRowHeight(i, 55)
             
+            # Cột 1: Thumbnail ảnh bìa
+            thumb_item = QTableWidgetItem()
+            thumb_item.setFlags(readonly_flags)
+            if hasattr(self, 'current_cover_pixmap') and self.current_cover_pixmap:
+                thumb_item.setIcon(QIcon(self.current_cover_pixmap))
+            self.table.setItem(i, 1, thumb_item)
+            
+            # Cột 2: Tên File
             if ep_data and ep_data.get("drive_link"):
                 file_item = QTableWidgetItem(ep_data.get("file_name", f"Tap_{ep_num}.mp4"))
+                file_item.setFlags(readonly_flags)
                 file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(i, 1, file_item)
+                self.table.setItem(i, 2, file_item)
                 
+                # Cột 3: Trạng thái
                 link_item = QTableWidgetItem("✅ Sẵn sàng")
+                link_item.setFlags(readonly_flags)
                 link_item.setForeground(QColor("#10b981")) 
                 link_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(i, 2, link_item)
+                self.table.setItem(i, 3, link_item)
             else:
                 file_item = QTableWidgetItem("---")
+                file_item.setFlags(readonly_flags)
                 file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(i, 1, file_item)
+                self.table.setItem(i, 2, file_item)
                 
                 wait_item = QTableWidgetItem("⏳ Đang đợi")
+                wait_item.setFlags(readonly_flags)
                 wait_item.setForeground(QColor("#f59e0b")) 
                 wait_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(i, 2, wait_item)
+                self.table.setItem(i, 3, wait_item)
 
     def _toggle_select_all(self):
         all_checked = True
@@ -826,12 +858,12 @@ class HonggouWidget(QWidget):
                 self.lbl_status.setText(f"⏳ Đang tải {num_eps} tập về máy...")
                 self._refresh_balance()
                 
-                self.download_thread = DriveDownloadThread(selected_eps, final_save_path)
-                self.download_thread.progress_signal.connect(self._on_download_progress)
-                self.download_thread.done_signal.connect(self._on_episode_downloaded)
-                self.download_thread.error_signal.connect(self._on_download_error)
-                self.download_thread.all_done_signal.connect(self._on_all_downloads_done)
-                self.download_thread.start()
+                self.download_manager = DriveDownloadManager(selected_eps, final_save_path, parent=self)
+                self.download_manager.progress_signal.connect(self._on_download_progress)
+                self.download_manager.done_signal.connect(self._on_episode_downloaded)
+                self.download_manager.error_signal.connect(self._on_download_error)
+                self.download_manager.all_done_signal.connect(self._on_all_downloads_done)
+                self.download_manager.start()
             else:
                 QMessageBox.critical(self, "Không đủ số dư", data.get("message", "Vui lòng nạp thêm tiền!"))
         except Exception as e:
@@ -850,29 +882,31 @@ class HonggouWidget(QWidget):
         row = ep_num - 1
         if row < self.table.rowCount():
             status_item = QTableWidgetItem(f"⬇️ {percent}% ({speed_mb:.1f} MB/s)")
+            status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             status_item.setForeground(QColor("#38bdf8")) 
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-            self.table.setItem(row, 2, status_item)
+            self.table.setItem(row, 3, status_item)
 
     def _on_episode_downloaded(self, ep_num, file_path):
         row = ep_num - 1
         if row < self.table.rowCount():
             done_item = QTableWidgetItem("✅ Đã xong")
+            done_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             done_item.setForeground(QColor("#10b981"))
             done_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-            self.table.setItem(row, 2, done_item)
+            self.table.setItem(row, 3, done_item)
 
     # ✅ KHẮC PHỤC 3: Hiện đầy đủ thông báo lỗi dưới dạng Tooltip khi đưa chuột vào
     def _on_download_error(self, ep_num, error_msg):
         row = ep_num - 1
         if row < self.table.rowCount():
-            # Rút gọn để không bị tràn bảng, nhưng gắn đầy đủ vào ToolTip
             short_msg = error_msg[:25] + "..." if len(error_msg) > 25 else error_msg
             err_item = QTableWidgetItem(f"❌ {short_msg}")
+            err_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             err_item.setForeground(QColor("#ef4444"))
-            err_item.setToolTip(str(error_msg))  # <--- BẠN CÓ THỂ DI CHUỘT VÀO ĐỂ ĐỌC LỖI GÌ
+            err_item.setToolTip(str(error_msg))
             err_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-            self.table.setItem(row, 2, err_item)
+            self.table.setItem(row, 3, err_item)
 
     def _on_all_downloads_done(self, total_downloaded):
         self.btn_download.setEnabled(True)
