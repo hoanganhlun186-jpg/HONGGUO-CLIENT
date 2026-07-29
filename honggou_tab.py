@@ -21,7 +21,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.21"
+APP_VERSION = "1.0.22"
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
 
@@ -313,7 +313,7 @@ class SingleDriveDownloadThread(QThread):
         file_id = self._extract_file_id(drive_link)
         
         if not file_id:
-            self.error_signal.emit(ep_num, "Link Drive rỗng hoặc sai định dạng")
+            self.error_signal.emit(ep_num, "Link rỗng hoặc sai định dạng")
             return
 
         max_retries = 3
@@ -653,7 +653,6 @@ class HonggouWidget(QWidget):
         self.hot_list.clear()
         self.content_stack.setCurrentWidget(self.page_grid)
 
-        # Hiện thanh loading bar
         self.loading_bar.show()
 
         msg = "⏳ Đang kết nối máy chủ để tải kệ phim...\nVui lòng chờ trong giây lát."
@@ -668,7 +667,6 @@ class HonggouWidget(QWidget):
         
         self.hot_thread = HotMoviesLoadThread(genre)
         self.hot_thread.item_loaded_signal.connect(self._render_single_hot_movie)
-        # Ẩn thanh loading bar khi tải xong
         self.hot_thread.finished_signal.connect(self.loading_bar.hide)
         self.hot_thread.start()
 
@@ -776,8 +774,8 @@ class HonggouWidget(QWidget):
 
         self.content_stack.setCurrentWidget(self.page_detail)
         self.btn_scan.setEnabled(False)
-        self.btn_scan.setText("⏳ Đang quét ngầm...")
-        self.lbl_status.setText("Trạng thái: Đang kết nối bóc tách dữ liệu...")
+        self.btn_scan.setText("⏳ Đang xử lý yêu cầu...")
+        self.lbl_status.setText("Trạng thái: Đang kết nối phân tích dữ liệu...")
         self.table.setRowCount(0)
 
         self.scan_thread = HonggouScanThread(url, self.auth_token)
@@ -799,7 +797,6 @@ class HonggouWidget(QWidget):
         loading_item.setFlags(Qt.ItemFlag.NoItemFlags) 
         self.hot_list.addItem(loading_item)
 
-        # Hiện thanh loading bar
         self.loading_bar.show()
 
         if hasattr(self, 'search_thread') and self.search_thread:
@@ -832,7 +829,6 @@ class HonggouWidget(QWidget):
             title = m.get("title", "Không rõ tên")
             eps = m.get("total_episodes", 0)
             
-            # ẨN DẤU VẾT HỆ THỐNG MÁY CHỦ BẰNG TỪ NGỮ THƯƠNG MẠI
             source_tag = "🚀 Đường truyền Ưu tiên" if m.get("is_local") else "🌐 Đường truyền Phổ thông"
             
             item.setText(f"{title}\n({eps} Tập)\n[{source_tag}]")
@@ -843,7 +839,6 @@ class HonggouWidget(QWidget):
             
             self._load_image_for_item(item, m.get("cover_url", ""))
 
-    # FIX LỖI TÀNG HÌNH ẢNH: Sử dụng luồng tải ảnh đã được khai báo bên ngoài
     def _load_image_for_item(self, item, url):
         if not url: return
         
@@ -896,17 +891,18 @@ class HonggouWidget(QWidget):
             except Exception:
                 pass
         
+        # ĐÃ THAY ĐỔI TOÀN BỘ TỪ NGỮ BỊ LỘ
         if status == "cache_hit":
-            self.lbl_status.setText(f"✅ Phim đã có sẵn trên Server! (Tổng: {total_eps} tập). Bạn có thể chọn tập và tải ngay.")
+            self.lbl_status.setText(f"✅ Trích xuất thành công từ Nguồn VIP! (Tổng: {total_eps} tập). Bạn có thể chọn tập và lưu ngay.")
             self.btn_download.setEnabled(True)
         elif status == "retrying":
-            self.lbl_status.setText(f"⚠️ Worker đang tiến hành tải bổ sung.")
+            self.lbl_status.setText(f"⚠️ Hệ thống đang tiến hành trích xuất bổ sung.")
             self.btn_download.setEnabled(True) 
         elif status == "processing":
-            self.lbl_status.setText("⏳ Worker đang tiến hành tải. Link sẽ tự động cập nhật khi có!")
+            self.lbl_status.setText("⏳ Hệ thống đang xử lý phân tích. Link sẽ tự động cập nhật khi có!")
             self.btn_download.setEnabled(True)
         else:
-            self.lbl_status.setText(f"🕒 Đã lên đơn! Chờ Worker nhận việc tải {total_eps} tập.")
+            self.lbl_status.setText(f"🕒 Đã tiếp nhận yêu cầu! Hệ thống chuẩn bị trích xuất {total_eps} tập.")
             self.btn_download.setEnabled(False)
 
         self._render_table(total_eps, self.current_episodes)
@@ -921,14 +917,15 @@ class HonggouWidget(QWidget):
         total_eps = data.get("total_episodes", self.table.rowCount())
         self.current_episodes = data.get("episodes", [])
 
+        # ĐÃ THAY ĐỔI TOÀN BỘ TỪ NGỮ BỊ LỘ
         if status == "completed":
-            self.lbl_status.setText(f"✅ Quá trình tải đã hoàn tất! Phim đã có sẵn (Tổng: {total_eps} tập).")
+            self.lbl_status.setText(f"✅ Quá trình phân tích hoàn tất! Nguồn VIP đã sẵn sàng (Tổng: {total_eps} tập).")
             self.btn_download.setEnabled(True)
         elif status == "partial":
-            self.lbl_status.setText(f"⚠️ Worker đã tải xong một phần. (Hiện có: {len(self.current_episodes)} tập).")
+            self.lbl_status.setText(f"⚠️ Hệ thống đã trích xuất được một phần. (Hiện có: {len(self.current_episodes)} tập).")
             self.btn_download.setEnabled(True)
         elif status == "processing":
-            self.lbl_status.setText(f"⏳ Đang tải... Đã lên Drive {len(self.current_episodes)}/{total_eps} tập.")
+            self.lbl_status.setText(f"⏳ Đang xử lý... Đã trích xuất {len(self.current_episodes)}/{total_eps} tập.")
             self.btn_download.setEnabled(True)
 
         self._render_table(total_eps, self.current_episodes)
@@ -1010,7 +1007,7 @@ class HonggouWidget(QWidget):
                     selected_eps.append(ep_data)
 
         if not selected_eps:
-            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn (tích) ít nhất 1 tập đã tải xong!")
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn (tích) ít nhất 1 tập đã xử lý xong!")
             return
             
         num_eps = len(selected_eps)
@@ -1024,8 +1021,8 @@ class HonggouWidget(QWidget):
             
             if data.get("status") == "success":
                 self.btn_download.setEnabled(False)
-                self.btn_download.setText("⏳ Đang tải xuống...")
-                self.lbl_status.setText(f"⏳ Đang tải {num_eps} tập về máy...")
+                self.btn_download.setText("⏳ Đang lưu về máy...")
+                self.lbl_status.setText(f"⏳ Đang lưu {num_eps} tập về máy...")
                 self._refresh_balance()
                 
                 self.download_manager = DriveDownloadManager(selected_eps, final_save_path, parent=self)
@@ -1037,7 +1034,7 @@ class HonggouWidget(QWidget):
             else:
                 QMessageBox.critical(self, "Không đủ số dư", data.get("message", "Vui lòng nạp thêm tiền!"))
         except Exception as e:
-            QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Server: {e}")
+            QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Hệ thống: {e}")
 
     def _refresh_balance(self):
         try:
@@ -1080,9 +1077,9 @@ class HonggouWidget(QWidget):
     def _on_all_downloads_done(self, total_downloaded):
         self.btn_download.setEnabled(True)
         self.btn_download.setText("📥 Tải đã chọn")
-        self.lbl_status.setText(f"✅ Hoàn tất! Đã tải {total_downloaded} tập về máy.")
+        self.lbl_status.setText(f"✅ Hoàn tất! Đã lưu {total_downloaded} tập về máy.")
         self._refresh_balance()
-        QMessageBox.information(self, "Thành công", f"Đã tải xong {total_downloaded} tập MP4 về máy bạn!")
+        QMessageBox.information(self, "Thành công", f"Đã lưu thành công {total_downloaded} tập phim về máy bạn!")
 
     def _change_folder(self):
         new_folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục lưu phim", self.save_folder)
@@ -1098,7 +1095,7 @@ class HonggouWidget(QWidget):
         self.btn_scan.setEnabled(True)
         self.btn_scan.setText("🔍 Tìm / Quét Phim")
         self.lbl_status.setText("Trạng thái: Sẵn sàng phục vụ...")
-        QMessageBox.critical(self, "Lỗi Quét Phim", error_msg)
+        QMessageBox.critical(self, "Lỗi Hệ Thống", error_msg)
 
     def _on_url_resolved(self, resolved_url):
         self.url_input.setText(resolved_url)
@@ -1344,7 +1341,7 @@ class LoginScreen(QWidget):
                 self.settings.setValue("auth_token", data.get("token", "")) 
                 self.login_success.emit(user, data.get("expiry", "Vô thời hạn"))
             else: QMessageBox.critical(self, "Lỗi", data.get("message", "Đăng nhập thất bại"))
-        except Exception as e: QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Server:\n{e}")
+        except Exception as e: QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Hệ thống:\n{e}")
         
         self.btn_login.setText("Đăng Nhập")
         self.btn_login.setEnabled(True)
@@ -1364,7 +1361,7 @@ class LoginScreen(QWidget):
             data = res.json()
             if data.get("status") == "success": QMessageBox.information(self, "Thành công", data.get("message", "Đăng ký thành công!"))
             else: QMessageBox.critical(self, "Lỗi", data.get("message", "Đăng ký thất bại"))
-        except Exception as e: QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Server:\n{e}")
+        except Exception as e: QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Hệ thống:\n{e}")
         
         self.btn_register.setText("Tạo Tài Khoản Mới")
         self.btn_register.setEnabled(True)
