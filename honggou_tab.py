@@ -8,6 +8,7 @@ import re
 import tempfile
 import subprocess
 import uuid
+from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, 
@@ -21,12 +22,12 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.22"
+APP_VERSION = "1.0.23"
 SERVER_URL = "http://163.61.182.119:8000"
-MAX_CONCURRENT_DOWNLOADS = 3  # Số luồng tải song song từ Google Drive
+MAX_CONCURRENT_DOWNLOADS = 3  
 
 # ==========================================
-# THREAD 1: TẢI DANH SÁCH PHIM HOT NGẦM (CUỐN CHIẾU)
+# THREAD 1: TẢI DANH SÁCH PHIM HOT NGẦM
 # ==========================================
 class HotMoviesLoadThread(QThread):
     item_loaded_signal = pyqtSignal(dict)
@@ -40,8 +41,7 @@ class HotMoviesLoadThread(QThread):
         try:
             url = f"{SERVER_URL}/api/client/hot_movies"
             params = {}
-            if self.genre:
-                params["genre"] = self.genre
+            if self.genre: params["genre"] = self.genre
 
             res = requests.get(url, params=params, timeout=10)
             if res.status_code == 200:
@@ -56,20 +56,15 @@ class HotMoviesLoadThread(QThread):
                         except: pass
 
                     key = (m.get("title") or "").strip()
-                    if key and key in seen_titles:
-                        continue
-                    if key:
-                        seen_titles.add(key)
+                    if key and key in seen_titles: continue
+                    if key: seen_titles.add(key)
 
                     cover_b64 = m.get("cover_base64")
                     if cover_b64:
-                        try:
-                            m["img_data"] = _base64.b64decode(cover_b64)
-                        except Exception:
-                            pass
+                        try: m["img_data"] = _base64.b64decode(cover_b64)
+                        except: pass
 
                     self.item_loaded_signal.emit(m)
-
             self.finished_signal.emit()
         except Exception:
             self.finished_signal.emit()
@@ -94,40 +89,13 @@ class SearchMoviesThread(QThread):
             res = requests.get(url, params=params, headers=headers, timeout=15)
             if res.status_code == 200:
                 data = res.json()
-                if data.get("status") == "success":
-                    self.results_signal.emit(data.get("data", []))
-                else:
-                    self.error_signal.emit(data.get("message", "Lỗi tìm kiếm"))
-            else:
-                self.error_signal.emit(f"Máy chủ trả về mã lỗi: {res.status_code}")
-        except Exception as e:
-            self.error_signal.emit(str(e))
+                if data.get("status") == "success": self.results_signal.emit(data.get("data", []))
+                else: self.error_signal.emit(data.get("message", "Lỗi tìm kiếm"))
+            else: self.error_signal.emit(f"Máy chủ trả về mã lỗi: {res.status_code}")
+        except Exception as e: self.error_signal.emit(str(e))
 
 # ==========================================
-# THREAD MỚI: TẢI ẢNH BÌA CHO TÍNH NĂNG TÌM KIẾM (FIX LỖI)
-# ==========================================
-class CoverImageLoader(QThread):
-    done = pyqtSignal(bytes)
-    
-    def __init__(self, url):
-        super().__init__()
-        self.url = url if url.startswith("http") else f"https:{url}"
-        
-    def run(self):
-        try:
-            # Giả lập người dùng để không bị server Trung Quốc chặn ảnh
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://hongguoduanju.com/"
-            }
-            resp = requests.get(self.url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                # Gửi dữ liệu thô (bytes) để Luồng Chính vẽ ra ảnh, không bị sập phần mềm
-                self.done.emit(resp.content)
-        except: pass
-
-# ==========================================
-# THREAD 3: MÁY KHÁCH TỰ QUÉT LINK (PLAYWRIGHT NGẦM)
+# THREAD 3: MÁY KHÁCH TỰ QUÉT LINK
 # ==========================================
 class HonggouScanThread(QThread):
     scan_result = pyqtSignal(dict)
@@ -140,32 +108,26 @@ class HonggouScanThread(QThread):
         self.auth_token = auth_token  
 
     def _resolve_to_detail_url(self, url):
-        if "hongguoduanju.com/detail" in url or "hongguoduanju.com/player" in url:
-            return url
-
+        if "hongguoduanju.com/detail" in url or "hongguoduanju.com/player" in url: return url
         if re.search(r'novelquickapp\.com/s/', url):
             try:
                 headers = {"User-Agent": "Mozilla/5.0"}
                 resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
                 url = resp.url
-            except Exception:
-                pass 
+            except: pass 
 
         decoded = url
         for _ in range(4):
             new_decoded = unquote(decoded)
-            if new_decoded == decoded:
-                break
+            if new_decoded == decoded: break
             decoded = new_decoded
 
         match = re.search(r'"video_series_id"\s*:\s*"(\d+)"', decoded)
-        if match:
-            return f"https://hongguoduanju.com/detail?series_id={match.group(1)}"
+        if match: return f"https://hongguoduanju.com/detail?series_id={match.group(1)}"
 
         try:
             parsed = urlparse(url)
             params = parse_qs(parsed.query)
-            
             zlink = params.get("zlink", [None])[0]
             if zlink:
                 zlink_decoded = unquote(zlink)
@@ -175,15 +137,11 @@ class HonggouScanThread(QThread):
                 if scheme_raw:
                     scheme_json = json.loads(unquote(scheme_raw))
                     vid = str(scheme_json.get("video_series_id", ""))
-                    if vid:
-                        return f"https://hongguoduanju.com/detail?series_id={vid}"
-        except Exception:
-            pass
+                    if vid: return f"https://hongguoduanju.com/detail?series_id={vid}"
+        except: pass
 
         match = re.search(r'video_series_id[=%22":]+(\d{15,25})', decoded)
-        if match:
-            return f"https://hongguoduanju.com/detail?series_id={match.group(1)}"
-
+        if match: return f"https://hongguoduanju.com/detail?series_id={match.group(1)}"
         return url  
 
     def run(self):
@@ -191,9 +149,7 @@ class HonggouScanThread(QThread):
             self.url = self._resolve_to_detail_url(self.url)
             self.url_resolved_signal.emit(self.url) 
 
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
+            headers = {"User-Agent": "Mozilla/5.0"}
             resp = requests.get(self.url, headers=headers, timeout=30)
             resp.raise_for_status()
             html = resp.text
@@ -204,8 +160,7 @@ class HonggouScanThread(QThread):
                 try:
                     data = json.loads(json_match.group(1))
                     detail = data.get("loaderData", {}).get("detail_page", {}).get("seriesDetail", None)
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError: pass
 
             if not detail:
                 self.error_signal.emit("Không bóc tách được dữ liệu. Vui lòng kiểm tra lại link.")
@@ -219,21 +174,16 @@ class HonggouScanThread(QThread):
             right_text = detail.get("episode_right_text", "")
             if right_text:
                 num_match = re.search(r'(\d+)', right_text)
-                if num_match:
-                    total_episodes = int(num_match.group(1))
+                if num_match: total_episodes = int(num_match.group(1))
             if total_episodes == 0:
                 vid_list = detail.get("vid_list", [])
-                if isinstance(vid_list, list) and len(vid_list) > 0:
-                    total_episodes = len(vid_list)
+                if isinstance(vid_list, list) and len(vid_list) > 0: total_episodes = len(vid_list)
             if total_episodes == 0:
                 total_episodes = int(detail.get("episode_cnt", 0))
 
             payload = {
-                "url": self.url,
-                "series_id": series_id,
-                "expected_total": total_episodes,
-                "title": title,
-                "cover_url": cover_url
+                "url": self.url, "series_id": series_id, "expected_total": total_episodes,
+                "title": title, "cover_url": cover_url
             }
             res = requests.post(f"{SERVER_URL}/api/client/add_job", json=payload, headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=10)
             
@@ -243,13 +193,10 @@ class HonggouScanThread(QThread):
                 data["cover_url"] = cover_url
                 data["total_episodes"] = total_episodes
                 self.scan_result.emit(data)
-            else:
-                self.error_signal.emit("Lỗi kết nối đến máy chủ điều phối!")
+            else: self.error_signal.emit("Lỗi kết nối đến máy chủ điều phối!")
 
-        except requests.exceptions.RequestException as e:
-            self.error_signal.emit(f"Lỗi kết nối web: {str(e)}")
-        except Exception as e:
-            self.error_signal.emit(f"Lỗi quét link: {str(e)}")
+        except requests.exceptions.RequestException as e: self.error_signal.emit(f"Lỗi kết nối web: {str(e)}")
+        except Exception as e: self.error_signal.emit(f"Lỗi quét link: {str(e)}")
 
 # ==========================================
 # THREAD 4: THEO DÕI TRẠNG THÁI REAL-TIME
@@ -273,15 +220,13 @@ class JobStatusMonitorThread(QThread):
                     if data.get("status") in ["completed", "error"]:
                         self.running = False
                         break
-            except Exception:
-                pass
+            except: pass
             time.sleep(3)
 
-    def stop(self):
-        self.running = False
+    def stop(self): self.running = False
 
 # ==========================================
-# THREAD 5a: LUỒNG TẢI 1 FILE MP4 TỪ GOOGLE DRIVE
+# THREAD 5: LUỒNG TẢI 1 FILE MP4 TỪ GOOGLE DRIVE
 # ==========================================
 class SingleDriveDownloadThread(QThread):
     progress_signal = pyqtSignal(int, int, float)  
@@ -295,55 +240,134 @@ class SingleDriveDownloadThread(QThread):
 
     def _extract_file_id(self, drive_link):
         match_web = re.search(r'/d/([a-zA-Z0-9_-]+)', drive_link)
-        if match_web:
-            return match_web.group(1)
+        if match_web: return match_web.group(1)
         match_dl = re.search(r'id=([a-zA-Z0-9_-]+)', drive_link)
-        if match_dl:
-            return match_dl.group(1)
+        if match_dl: return match_dl.group(1)
         return None
+
+    def _download_direct(self, ep_num, url, save_path):
+        """Tải thẳng qua HTTP (dùng cho presigned URL từ R2). Thử tối đa 3 lần."""
+        for attempt in range(3):
+            try:
+                with requests.get(url, stream=True, timeout=30) as resp:
+                    if resp.status_code == 403:
+                        self.error_signal.emit(ep_num, "Link tải đã hết hạn - hãy quét lại phim")
+                        return
+                    resp.raise_for_status()
+                    total_size = int(resp.headers.get('content-length', 0))
+                    downloaded = 0
+                    start_time = time.time()
+                    with open(save_path, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=1024 * 512):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                elapsed = time.time() - start_time
+                                speed = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                                percent = int(downloaded * 100 / total_size) if total_size > 0 else 0
+                                self.progress_signal.emit(ep_num, percent, speed)
+                self.done_signal.emit(ep_num, save_path)
+                return
+            except Exception as e:
+                if attempt < 2: time.sleep(2); continue
+                self.error_signal.emit(ep_num, f"Lỗi: {str(e)}")
+
+    def _is_quota_page(self, text):
+        # Các câu Google thực sự dùng trong trang báo hết quota (Anh + Việt)
+        markers = [
+            "Too many users have viewed or downloaded",
+            "quá nhiều người dùng đã xem hoặc tải",
+            "downloadQuotaExceeded",
+            "exceeded the download quota",
+        ]
+        return any(m in text for m in markers)
 
     def run(self):
         ep_num = self.ep_data["episode_number"]
         raw_file_name = self.ep_data.get("file_name", f"Tap_{ep_num}.mp4")
-        
         safe_file_name = re.sub(r'[\\/*?:"<>|]', "", raw_file_name)
         save_path = os.path.join(self.save_folder, safe_file_name)
 
         drive_link = self.ep_data.get("drive_link", "")
+
+        # LINK R2/HTTP TRỰC TIẾP (presigned URL từ server): tải thẳng, không cần confirm gì
+        if drive_link.startswith("http") and "drive.google.com" not in drive_link:
+            self._download_direct(ep_num, drive_link, save_path)
+            return
+
         file_id = self._extract_file_id(drive_link)
         
         if not file_id:
             self.error_signal.emit(ep_num, "Link rỗng hoặc sai định dạng")
             return
 
-        max_retries = 3
-        for attempt in range(max_retries):
+        for attempt in range(3):
             try:
-                url = f"https://drive.google.com/uc?export=download&id={file_id}"
+                URL = "https://drive.google.com/uc?export=download"
                 session = requests.Session()
 
-                resp = session.get(url, stream=True, timeout=20)
+                # Ngụy trang thành trình duyệt Chrome thật để không bị Google block bot
+                session.headers.update({
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                })
 
-                for key, value in resp.cookies.items():
-                    if key.startswith('download_warning'):
-                        url = f"https://drive.google.com/uc?export=download&confirm={value}&id={file_id}"
-                        resp = session.get(url, stream=True, timeout=20)
-                        break
+                # 1. Gửi request đầu tiên
+                resp = session.get(URL, params={'id': file_id}, stream=True, timeout=30)
 
-                content_type = resp.headers.get('Content-Type', '')
-                if 'text/html' in content_type:
-                    url = f"https://drive.google.com/uc?export=download&confirm=t&id={file_id}"
-                    resp = session.get(url, stream=True, timeout=20)
+                # 2. Nếu Google trả về trang HTML (trang xác nhận hoặc trang lỗi)
+                if 'text/html' in resp.headers.get('Content-Type', ''):
+                    text = resp.text
+
+                    # Chỉ báo quota khi có đúng dấu hiệu quota thật của Google
+                    # (tránh bắt nhầm chữ "giới hạn"/"quota" chung chung trong trang xác nhận)
+                    if self._is_quota_page(text):
+                        self.error_signal.emit(ep_num, "Lỗi: Quá giới hạn lượt tải 24h của Drive")
+                        return
+
+                    # FLOW MỚI CỦA DRIVE: trang xác nhận file lớn là 1 <form>
+                    # trỏ tới drive.usercontent.google.com/download kèm các input ẩn
+                    m_action = re.search(r'<form[^>]+action="([^"]+)"', text)
+                    hidden_inputs = dict(re.findall(
+                        r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', text))
+                    if m_action and hidden_inputs.get("id"):
+                        form_url = m_action.group(1).replace("&amp;", "&")
+                        resp = session.get(form_url, params=hidden_inputs, stream=True, timeout=30)
+                    else:
+                        # FLOW CŨ: token trong cookie hoặc confirm= trong HTML
+                        token = None
+                        for key, value in resp.cookies.items():
+                            if key.startswith('download_warning'):
+                                token = value
+                                break
+                        if not token:
+                            match = re.search(r'confirm=([0-9A-Za-z_-]+)', text)
+                            token = match.group(1) if match else 't'
+                        resp = session.get(URL, params={'id': file_id, 'confirm': token}, stream=True, timeout=30)
+
+                # 3. CHỐT CHẶN: Ngăn lưu HTML thành file MP4
+                final_content_type = resp.headers.get('Content-Type', '')
+                if 'text/html' in final_content_type:
+                    text = resp.text
+                    # Lưu trang lỗi ra file để chẩn đoán khi khách báo lỗi
+                    try:
+                        debug_path = save_path + ".error.html"
+                        with open(debug_path, 'w', encoding='utf-8') as df:
+                            df.write(text)
+                    except Exception:
+                        pass
+                    if self._is_quota_page(text):
+                        self.error_signal.emit(ep_num, "Lỗi: Quá giới hạn lượt tải 24h của Drive")
+                    else:
+                        self.error_signal.emit(ep_num, "Bị Google Drive chặn (xem file .error.html trong thư mục tải)")
+                    return
 
                 resp.raise_for_status()
-
                 total_size = int(resp.headers.get('content-length', 0))
                 downloaded = 0
-                chunk_size = 1024 * 512  
                 start_time = time.time()
 
                 with open(save_path, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                    for chunk in resp.iter_content(chunk_size=1024 * 512):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
@@ -354,23 +378,12 @@ class SingleDriveDownloadThread(QThread):
 
                 self.done_signal.emit(ep_num, save_path)
                 return 
-
-            except requests.exceptions.RequestException as e:
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
-                else:
-                    self.error_signal.emit(ep_num, f"Lỗi Mạng/Đường truyền: {str(e)}")
-                    return
-            except OSError as e:
-                self.error_signal.emit(ep_num, f"Lỗi Ghi File: {str(e)}")
-                return
             except Exception as e:
-                self.error_signal.emit(ep_num, f"Lỗi Hệ thống: {str(e)}")
-                return
+                if attempt < 2: time.sleep(2); continue
+                self.error_signal.emit(ep_num, f"Lỗi: {str(e)}")
 
 # ==========================================
-# THREAD 5b: QUẢN LÝ TẢI SONG SONG
+# TRÌNH QUẢN LÝ TẢI SONG SONG
 # ==========================================
 class DriveDownloadManager(QObject):
     progress_signal = pyqtSignal(int, int, float)  
@@ -392,8 +405,7 @@ class DriveDownloadManager(QObject):
             self._launch_next()
 
     def _launch_next(self):
-        if not self._pending:
-            return
+        if not self._pending: return
         ep_data = self._pending.pop(0)
         worker = SingleDriveDownloadThread(ep_data, self.save_folder)
         worker.progress_signal.connect(self.progress_signal.emit)
@@ -407,18 +419,16 @@ class DriveDownloadManager(QObject):
         self._finished_count += 1
         self.done_signal.emit(ep_num, file_path)
         self._launch_next()
-        if self._finished_count >= self._total:
-            self.all_done_signal.emit(self._success_count)
+        if self._finished_count >= self._total: self.all_done_signal.emit(self._success_count)
 
     def _on_worker_error(self, ep_num, error_msg):
         self._finished_count += 1
         self.error_signal.emit(ep_num, error_msg)
         self._launch_next()
-        if self._finished_count >= self._total:
-            self.all_done_signal.emit(self._success_count)
+        if self._finished_count >= self._total: self.all_done_signal.emit(self._success_count)
 
 # ==========================================
-# MODULE CHÍNH: HONGGOU WIDGET
+# GIAO DIỆN CHÍNH: HONGGOU WIDGET
 # ==========================================
 class HonggouWidget(QWidget):
     def __init__(self, username):
@@ -426,19 +436,46 @@ class HonggouWidget(QWidget):
         self.username = username
         self.current_job_id = None
         self.current_series_id = "" 
+        self.current_title = ""     
+        self.current_cover_url = "" 
         self.current_episodes = []
         self.monitor_thread = None
         self.is_first_movie = True 
-        self._img_loaders = [] 
+        
         self.settings = QSettings("HongguoDownloader", "ClientApp")
-        
+        self._cached_history_ids = set() 
         self.auth_token = self.settings.value("auth_token", "")
-        
         default_folder = os.path.join(os.path.expanduser("~"), "Desktop", "Hongguo_Downloads")
         self.save_folder = self.settings.value(f"download_folder_{username}", default_folder)
         os.makedirs(self.save_folder, exist_ok=True)
         self._setup_ui()
         self.load_hot_movies_shelf()
+
+    def _get_history_file(self): return os.path.join(os.path.expanduser("~"), f".hongguo_history_{self.username}.json")
+
+    def _load_history(self):
+        history_file = self._get_history_file()
+        if os.path.exists(history_file):
+            try:
+                with open(history_file, 'r', encoding='utf-8') as f: return json.load(f)
+            except: return []
+        return []
+
+    def _save_to_history(self, series_id, title, cover_url):
+        if not series_id: return
+        history_file = self._get_history_file()
+        history = self._load_history()
+        history = [h for h in history if h.get('series_id') != series_id]
+        history.insert(0, {
+            "series_id": series_id,
+            "title": title if title else "Phim không rõ tên",
+            "cover_url": cover_url,
+            "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M")
+        })
+        try:
+            with open(history_file, 'w', encoding='utf-8') as f: json.dump(history, f, ensure_ascii=False, indent=2)
+            self._cached_history_ids.add(str(series_id))
+        except: pass
 
     def _setup_ui(self):
         master_layout = QVBoxLayout(self)
@@ -448,40 +485,23 @@ class HonggouWidget(QWidget):
         top_bar = QHBoxLayout()
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("Dán Link phim HOẶC Nhập Tên Phim vào đây rồi nhấn Enter...")
-        self.url_input.setStyleSheet("""
-            QLineEdit { padding: 12px; font-size: 14px; border-radius: 8px; border: 1px solid #374151; background: #1f2937; color: #f8fafc; }
-            QLineEdit:focus { border: 1px solid #3b82f6; background: #1e293b; }
-        """)
+        self.url_input.setStyleSheet("QLineEdit { padding: 12px; font-size: 14px; border-radius: 8px; border: 1px solid #374151; background: #1f2937; color: #f8fafc; } QLineEdit:focus { border: 1px solid #3b82f6; background: #1e293b; }")
         self.url_input.returnPressed.connect(self._scan)
-        
         self.btn_scan = QPushButton("🔍 Tìm / Quét Phim")
         self.btn_scan.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_scan.setStyleSheet("""
-            QPushButton { padding: 12px 24px; font-size: 14px; background-color: #2563eb; color: white; border-radius: 8px; font-weight: bold; border: none; }
-            QPushButton:hover { background-color: #1d4ed8; }
-            QPushButton:disabled { background-color: #374151; color: #64748b; }
-        """)
+        self.btn_scan.setStyleSheet("QPushButton { padding: 12px 24px; font-size: 14px; background-color: #2563eb; color: white; border-radius: 8px; font-weight: bold; border: none; } QPushButton:hover { background-color: #1d4ed8; } QPushButton:disabled { background-color: #374151; color: #64748b; }")
         self.btn_scan.clicked.connect(self._scan)
-        
-        top_bar.addWidget(self.url_input)
-        top_bar.addWidget(self.btn_scan)
+        top_bar.addWidget(self.url_input); top_bar.addWidget(self.btn_scan)
         master_layout.addLayout(top_bar)
 
         folder_bar = QHBoxLayout()
         self.lbl_folder = QLabel(f"📂 Lưu vào: {self.save_folder}")
         self.lbl_folder.setStyleSheet("color: #94a3b8; font-size: 12px; padding: 4px;")
-        
         btn_change_folder = QPushButton("Đổi thư mục")
         btn_change_folder.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_change_folder.setStyleSheet("""
-            QPushButton { padding: 6px 14px; font-size: 12px; background-color: transparent; color: #3b82f6; border: 1px solid #374151; border-radius: 6px; }
-            QPushButton:hover { background-color: #1e293b; border: 1px solid #3b82f6; }
-        """)
+        btn_change_folder.setStyleSheet("QPushButton { padding: 6px 14px; font-size: 12px; background-color: transparent; color: #3b82f6; border: 1px solid #374151; border-radius: 6px; } QPushButton:hover { background-color: #1e293b; border: 1px solid #3b82f6; }")
         btn_change_folder.clicked.connect(self._change_folder)
-        
-        folder_bar.addWidget(self.lbl_folder)
-        folder_bar.addStretch()
-        folder_bar.addWidget(btn_change_folder)
+        folder_bar.addWidget(self.lbl_folder); folder_bar.addStretch(); folder_bar.addWidget(btn_change_folder)
         master_layout.addLayout(folder_bar)
 
         self.content_stack = QStackedWidget()
@@ -490,21 +510,13 @@ class HonggouWidget(QWidget):
         self.page_grid = QWidget()
         grid_layout = QVBoxLayout(self.page_grid)
         grid_layout.setContentsMargins(0, 0, 0, 0)
-        
         self.genre_container = QWidget()
         genre_layout = QHBoxLayout(self.genre_container)
         genre_layout.setContentsMargins(0, 5, 0, 10)
         genre_layout.setSpacing(10)
         
         self.genre_buttons = []
-        genres = [
-            ("🔥 Tất Cả", None), 
-            ("👍 BXH Đề Cử", "BXH Đề Cử"), 
-            ("📈 BXH Lượt Xem", "BXH Lượt Xem"), 
-            ("🆕 BXH Phim Mới", "BXH Phim Mới"),
-            ("🐼 BXH Hoạt Hình", "BXH Hoạt Hình")
-        ]
-        
+        genres = [("🔥 Tất Cả", None), ("👍 BXH Đề Cử", "BXH Đề Cử"), ("📈 BXH Lượt Xem", "BXH Lượt Xem"), ("🆕 BXH Phim Mới", "BXH Phim Mới"), ("🐼 BXH Hoạt Hình", "BXH Hoạt Hình"), ("🕒 Lịch Sử Tải", "HISTORY")]
         for name, tag in genres:
             btn = QPushButton(name)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -512,23 +524,14 @@ class HonggouWidget(QWidget):
             btn.clicked.connect(lambda checked, b=btn: self._on_genre_clicked(b))
             genre_layout.addWidget(btn)
             self.genre_buttons.append(btn)
-            
         genre_layout.addStretch() 
         grid_layout.addWidget(self.genre_container)
         self._update_genre_styles(self.genre_buttons[0])
 
-        # === TÍNH NĂNG MỚI: THANH LOADING BAR ===
         self.loading_bar = QProgressBar()
-        self.loading_bar.setRange(0, 0) 
-        self.loading_bar.setTextVisible(False)
-        self.loading_bar.setFixedHeight(4)
-        self.loading_bar.setStyleSheet("""
-            QProgressBar { background-color: #1e293b; border: none; border-radius: 2px; }
-            QProgressBar::chunk { background-color: #38bdf8; border-radius: 2px; }
-        """)
-        self.loading_bar.hide()
-        grid_layout.addWidget(self.loading_bar)
-        # ========================================
+        self.loading_bar.setRange(0, 0); self.loading_bar.setTextVisible(False); self.loading_bar.setFixedHeight(4)
+        self.loading_bar.setStyleSheet("QProgressBar { background-color: #1e293b; border: none; border-radius: 2px; } QProgressBar::chunk { background-color: #38bdf8; border-radius: 2px; }")
+        self.loading_bar.hide(); grid_layout.addWidget(self.loading_bar)
 
         self.hot_list = QListWidget()
         self.hot_list.setViewMode(QListWidget.ViewMode.IconMode)
@@ -536,17 +539,9 @@ class HonggouWidget(QWidget):
         self.hot_list.setGridSize(QSize(180, 280))
         self.hot_list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.hot_list.setWordWrap(True)
-        self.hot_list.setStyleSheet("""
-            QListWidget { background-color: transparent; border: none; outline: none; }
-            QListWidget::item { color: #e2e8f0; font-weight: bold; font-size: 13px; padding-top: 5px; border-radius: 10px; }
-            QListWidget::item:hover { background-color: #1e293b; }
-            QScrollBar:vertical { border: none; background: #111827; width: 8px; margin: 0px; }
-            QScrollBar::handle:vertical { background: #374151; border-radius: 4px; min-height: 20px; }
-            QScrollBar::handle:vertical:hover { background: #4b5563; }
-        """)
+        self.hot_list.setStyleSheet("QListWidget { background-color: transparent; border: none; outline: none; } QListWidget::item { color: #e2e8f0; font-weight: bold; font-size: 13px; padding-top: 5px; border-radius: 10px; } QListWidget::item:hover { background-color: #1e293b; } QScrollBar:vertical { border: none; background: #111827; width: 8px; margin: 0px; } QScrollBar::handle:vertical { background: #374151; border-radius: 4px; min-height: 20px; } QScrollBar::handle:vertical:hover { background: #4b5563; }")
         self.hot_list.itemClicked.connect(self._on_hot_movie_clicked)
         grid_layout.addWidget(self.hot_list)
-        
         self.content_stack.addWidget(self.page_grid)
 
         self.page_detail = QWidget()
@@ -555,80 +550,39 @@ class HonggouWidget(QWidget):
 
         self.btn_back = QPushButton("⬅ Quay lại danh sách phim")
         self.btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_back.setStyleSheet("""
-            QPushButton { padding: 8px 15px; background-color: transparent; color: #94a3b8; border: 1px solid #374151; border-radius: 6px; font-weight: bold; text-align: left; }
-            QPushButton:hover { background-color: #1e293b; color: #f8fafc; border: 1px solid #4b5563; }
-        """)
+        self.btn_back.setStyleSheet("QPushButton { padding: 8px 15px; background-color: transparent; color: #94a3b8; border: 1px solid #374151; border-radius: 6px; font-weight: bold; text-align: left; } QPushButton:hover { background-color: #1e293b; color: #f8fafc; border: 1px solid #4b5563; }")
         self.btn_back.clicked.connect(self._go_back)
-        
-        btn_back_layout = QHBoxLayout()
-        btn_back_layout.addWidget(self.btn_back)
-        btn_back_layout.addStretch()
-        detail_layout.addLayout(btn_back_layout)
+        btn_back_layout = QHBoxLayout(); btn_back_layout.addWidget(self.btn_back); btn_back_layout.addStretch(); detail_layout.addLayout(btn_back_layout)
 
         self.lbl_status = QLabel("Trạng thái: Sẵn sàng phục vụ...")
         self.lbl_status.setStyleSheet("color: #10b981; font-size: 14px; font-weight: bold; margin-top: 10px;")
         detail_layout.addWidget(self.lbl_status)
 
-        self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Chọn Tập", "", "Tên File", "Trạng Thái Link"])
+        self.table = QTableWidget(); self.table.setColumnCount(4); self.table.setHorizontalHeaderLabels(["Chọn Tập", "", "Tên File", "Trạng Thái Link"])
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(0, 90)
-        self.table.setColumnWidth(1, 50)   
-        self.table.setColumnWidth(3, 150)
-        self.table.verticalHeader().setVisible(False) 
-        self.table.setShowGrid(False) 
-        self.table.setAlternatingRowColors(True) 
-        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)  
-        self.table.setIconSize(QSize(40, 50))  
-        
-        self.table.setStyleSheet("""
-            QTableWidget { background-color: #111827; alternate-background-color: #1f2937; color: #e2e8f0; border: 1px solid #374151; border-radius: 8px; outline: none; margin-top: 10px; font-size: 13px; }
-            QHeaderView::section { background-color: #0f172a; color: #94a3b8; padding: 12px; font-weight: bold; border: none; border-bottom: 1px solid #374151; }
-            QTableWidget::item { padding: 6px; border-bottom: 1px solid transparent; }
-            QTableWidget::item:hover { background-color: #334155; }
-            QTableWidget::indicator { width: 18px; height: 18px; border: 2px solid #475569; border-radius: 4px; }
-            QTableWidget::indicator:checked { background-color: #10b981; border-color: #10b981; }
-            QScrollBar:vertical { border: none; background: #111827; width: 8px; margin: 0px; }
-            QScrollBar::handle:vertical { background: #374151; border-radius: 4px; min-height: 20px; }
-            QScrollBar::handle:vertical:hover { background: #4b5563; }
-        """)
+        self.table.setColumnWidth(0, 90); self.table.setColumnWidth(1, 50); self.table.setColumnWidth(3, 150)
+        self.table.verticalHeader().setVisible(False); self.table.setShowGrid(False); self.table.setAlternatingRowColors(True); self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus); self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.table.setIconSize(QSize(40, 50))  
+        self.table.setStyleSheet("QTableWidget { background-color: #111827; alternate-background-color: #1f2937; color: #e2e8f0; border: 1px solid #374151; border-radius: 8px; outline: none; margin-top: 10px; font-size: 13px; } QHeaderView::section { background-color: #0f172a; color: #94a3b8; padding: 12px; font-weight: bold; border: none; border-bottom: 1px solid #374151; } QTableWidget::item { padding: 6px; border-bottom: 1px solid transparent; } QTableWidget::item:hover { background-color: #334155; } QTableWidget::indicator { width: 18px; height: 18px; border: 2px solid #475569; border-radius: 4px; } QTableWidget::indicator:checked { background-color: #10b981; border-color: #10b981; } QScrollBar:vertical { border: none; background: #111827; width: 8px; margin: 0px; } QScrollBar::handle:vertical { background: #374151; border-radius: 4px; min-height: 20px; } QScrollBar::handle:vertical:hover { background: #4b5563; }")
         detail_layout.addWidget(self.table)
 
         bottom_layout = QHBoxLayout()
-        
         self.btn_select_all = QPushButton("☑ Chọn / Bỏ chọn tất cả")
         self.btn_select_all.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_select_all.setStyleSheet("""
-            QPushButton { padding: 14px; background-color: #4b5563; color: white; border-radius: 8px; font-weight: bold; font-size: 14px; margin-top: 10px; border: none;}
-            QPushButton:hover { background-color: #64748b; }
-        """)
+        self.btn_select_all.setStyleSheet("QPushButton { padding: 14px; background-color: #4b5563; color: white; border-radius: 8px; font-weight: bold; font-size: 14px; margin-top: 10px; border: none;} QPushButton:hover { background-color: #64748b; }")
         self.btn_select_all.clicked.connect(self._toggle_select_all)
-        
         self.btn_download = QPushButton("📥 Tải đã chọn")
         self.btn_download.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_download.setStyleSheet("""
-            QPushButton { padding: 14px 30px; background-color: #10b981; color: white; border-radius: 8px; font-weight: bold; font-size: 15px; margin-top: 10px; border: none; }
-            QPushButton:hover { background-color: #059669; }
-            QPushButton:disabled { background-color: #374151; color: #64748b; }
-        """)
+        self.btn_download.setStyleSheet("QPushButton { padding: 14px 30px; background-color: #10b981; color: white; border-radius: 8px; font-weight: bold; font-size: 15px; margin-top: 10px; border: none; } QPushButton:hover { background-color: #059669; } QPushButton:disabled { background-color: #374151; color: #64748b; }")
         self.btn_download.setEnabled(False)
         self.btn_download.clicked.connect(self._download_selected)
-        
-        bottom_layout.addWidget(self.btn_select_all)
-        bottom_layout.addWidget(self.btn_download)
+        bottom_layout.addWidget(self.btn_select_all); bottom_layout.addWidget(self.btn_download)
         detail_layout.addLayout(bottom_layout)
-
         self.content_stack.addWidget(self.page_detail)
 
     def _update_genre_styles(self, active_btn):
         for btn in self.genre_buttons:
-            if btn == active_btn:
-                btn.setStyleSheet("""QPushButton { background-color: #f59e0b; color: #ffffff; font-weight: bold; font-size: 14px; border-radius: 16px; padding: 8px 20px; border: none; } QPushButton:hover { background-color: #d97706; }""")
-            else:
-                btn.setStyleSheet("""QPushButton { background-color: #0ea5e9; color: #ffffff; font-weight: bold; font-size: 13px; border-radius: 16px; padding: 8px 18px; border: none; } QPushButton:hover { background-color: #38bdf8; }""")
+            if btn == active_btn: btn.setStyleSheet("QPushButton { background-color: #f59e0b; color: #ffffff; font-weight: bold; font-size: 14px; border-radius: 16px; padding: 8px 20px; border: none; } QPushButton:hover { background-color: #d97706; }")
+            else: btn.setStyleSheet("QPushButton { background-color: #0ea5e9; color: #ffffff; font-weight: bold; font-size: 13px; border-radius: 16px; padding: 8px 18px; border: none; } QPushButton:hover { background-color: #38bdf8; }")
 
     def _on_genre_clicked(self, clicked_btn):
         self._update_genre_styles(clicked_btn)
@@ -638,31 +592,41 @@ class HonggouWidget(QWidget):
 
     def load_hot_movies_shelf(self, genre=None):
         if hasattr(self, 'hot_thread') and self.hot_thread:
-            try:
-                self.hot_thread.item_loaded_signal.disconnect()
-            except Exception:
-                pass
-        
+            try: self.hot_thread.item_loaded_signal.disconnect()
+            except: pass
         if hasattr(self, 'search_thread') and self.search_thread:
-            try:
-                self.search_thread.results_signal.disconnect()
-            except Exception:
-                pass
+            try: self.search_thread.results_signal.disconnect()
+            except: pass
 
-        self._img_loaders.clear()
         self.hot_list.clear()
         self.content_stack.setCurrentWidget(self.page_grid)
+        self._cached_history_ids = {str(h.get('series_id', '')) for h in self._load_history()}
+
+        if genre == "HISTORY":
+            self.loading_bar.hide()
+            history = self._load_history()
+            if not history:
+                empty = QListWidgetItem("📭 Bạn chưa tải bộ phim nào.")
+                empty.setTextAlignment(Qt.AlignmentFlag.AlignCenter); empty.setFlags(Qt.ItemFlag.NoItemFlags)
+                self.hot_list.addItem(empty); return
+                
+            for h in history:
+                item = QListWidgetItem()
+                title = h.get("title", "Không rõ tên")
+                time_str = h.get("timestamp", "")
+                item.setText(f"{title}\n[Đã Tải: {time_str}]")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setData(Qt.ItemDataRole.UserRole, f"https://hongguoduanju.com/detail?series_id={h.get('series_id')}")
+                self.hot_list.addItem(item)
+            return
 
         self.loading_bar.show()
-
         msg = "⏳ Đang kết nối máy chủ để tải kệ phim...\nVui lòng chờ trong giây lát."
         if genre: msg = f"⏳ Đang lọc phim theo danh mục [{genre}]...\nVui lòng chờ trong giây lát."
             
         loading_item = QListWidgetItem(msg)
-        loading_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        loading_item.setFlags(Qt.ItemFlag.NoItemFlags) 
+        loading_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter); loading_item.setFlags(Qt.ItemFlag.NoItemFlags) 
         self.hot_list.addItem(loading_item)
-        
         self.is_first_movie = True 
         
         self.hot_thread = HotMoviesLoadThread(genre)
@@ -678,14 +642,17 @@ class HonggouWidget(QWidget):
         item = QListWidgetItem()
         title = m.get("title", "Phim Hot Gợi Ý")
         eps = m.get("total_episodes", 0)
-        item.setText(f"{title}\n({eps} Tập)")
+        series_id = str(m.get("series_id", ""))
+        
+        downloaded_tag = "\n[✅ Đã tải trong bộ nhớ]" if series_id in self._cached_history_ids else ""
+        item.setText(f"{title}\n({eps} Tập){downloaded_tag}")
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         
+        # Chỉ dựa vào Server để vẽ ảnh. Không có = vẽ chữ. Bất tử, không văng app.
         img_data = m.get("img_data")
         if img_data:
             pixmap = QPixmap()
-            success = pixmap.loadFromData(img_data)
-            if success and not pixmap.isNull():
+            if pixmap.loadFromData(img_data) and not pixmap.isNull():
                 pixmap = pixmap.scaled(160, 220, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
                 item.setIcon(QIcon(pixmap))
         
@@ -717,25 +684,18 @@ class HonggouWidget(QWidget):
 
         if not video_series_id:
             try:
-                parsed = urlparse(raw_url)
-                params = parse_qs(parsed.query)
+                parsed = urlparse(raw_url); params = parse_qs(parsed.query)
                 zlink = params.get("zlink", [None])[0]
                 if zlink:
-                    zlink_decoded = unquote(zlink)
-                    zlink_parsed = urlparse(zlink_decoded)
-                    zlink_params = parse_qs(zlink_parsed.query)
+                    zlink_decoded = unquote(zlink); zlink_parsed = urlparse(zlink_decoded); zlink_params = parse_qs(zlink_parsed.query)
                     scheme_params_raw = zlink_params.get("schemeParams", [None])[0]
                     if scheme_params_raw:
-                        try:
-                            scheme_json = json.loads(unquote(scheme_params_raw))
-                            video_series_id = str(scheme_json.get("video_series_id", ""))
+                        try: scheme_json = json.loads(unquote(scheme_params_raw)); video_series_id = str(scheme_json.get("video_series_id", ""))
                         except: pass
                 if not video_series_id:
                     scheme_params_raw = params.get("schemeParams", [None])[0]
                     if scheme_params_raw:
-                        try:
-                            scheme_json = json.loads(unquote(scheme_params_raw))
-                            video_series_id = str(scheme_json.get("video_series_id", ""))
+                        try: scheme_json = json.loads(unquote(scheme_params_raw)); video_series_id = str(scheme_json.get("video_series_id", ""))
                         except: pass
             except: pass
 
@@ -750,9 +710,6 @@ class HonggouWidget(QWidget):
         match = re.search(r'(https?://\S+)', text)
         return match.group(1) if match else text
 
-    # ==========================================
-    # LOGIC: QUÉT LINK HOẶC TÌM KIẾM
-    # ==========================================
     def _scan(self):
         raw_text = self.url_input.text().strip()
         if not raw_text:
@@ -760,8 +717,7 @@ class HonggouWidget(QWidget):
             return
             
         is_url = False
-        if re.search(r'https?://', raw_text) or "hongguoduanju.com" in raw_text:
-            is_url = True
+        if re.search(r'https?://', raw_text) or "hongguoduanju.com" in raw_text: is_url = True
 
         if not is_url:
             self._search_keyword(raw_text)
@@ -784,30 +740,23 @@ class HonggouWidget(QWidget):
         self.scan_thread.url_resolved_signal.connect(self._on_url_resolved)
         self.scan_thread.start()
 
-    # --- HÀM TÌM KIẾM THÔNG MINH ---
     def _search_keyword(self, keyword):
         self.content_stack.setCurrentWidget(self.page_grid)
-        
-        for btn in self.genre_buttons:
-            btn.setStyleSheet("""QPushButton { background-color: #0ea5e9; color: #ffffff; font-weight: bold; font-size: 13px; border-radius: 16px; padding: 8px 18px; border: none; } QPushButton:hover { background-color: #38bdf8; }""")
-
+        for btn in self.genre_buttons: btn.setStyleSheet("QPushButton { background-color: #0ea5e9; color: #ffffff; font-weight: bold; font-size: 13px; border-radius: 16px; padding: 8px 18px; border: none; } QPushButton:hover { background-color: #38bdf8; }")
         self.hot_list.clear()
         loading_item = QListWidgetItem(f"🔍 Đang tìm kiếm phim: '{keyword}'...")
-        loading_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        loading_item.setFlags(Qt.ItemFlag.NoItemFlags) 
+        loading_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter); loading_item.setFlags(Qt.ItemFlag.NoItemFlags) 
         self.hot_list.addItem(loading_item)
-
         self.loading_bar.show()
 
         if hasattr(self, 'search_thread') and self.search_thread:
             try: self.search_thread.results_signal.disconnect()
-            except Exception: pass
-
+            except: pass
         if hasattr(self, 'hot_thread') and self.hot_thread:
             try: self.hot_thread.item_loaded_signal.disconnect()
-            except Exception: pass
+            except: pass
 
-        self._img_loaders.clear()
+        self._cached_history_ids = {str(h.get('series_id', '')) for h in self._load_history()}
 
         self.search_thread = SearchMoviesThread(keyword, self.auth_token)
         self.search_thread.results_signal.connect(self._on_search_results)
@@ -819,51 +768,30 @@ class HonggouWidget(QWidget):
         self.hot_list.clear()
         if not results:
             empty_item = QListWidgetItem("❌ Không tìm thấy bộ phim nào phù hợp.")
-            empty_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty_item.setFlags(Qt.ItemFlag.NoItemFlags) 
-            self.hot_list.addItem(empty_item)
-            return
+            empty_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter); empty_item.setFlags(Qt.ItemFlag.NoItemFlags) 
+            self.hot_list.addItem(empty_item); return
 
         for m in results:
             item = QListWidgetItem()
             title = m.get("title", "Không rõ tên")
             eps = m.get("total_episodes", 0)
+            series_id = str(m.get("series_id", ""))
+            source_tag = "🚀 Nguồn VIP" if m.get("is_local") else "🌐 Nguồn Web"
             
-            source_tag = "🚀 Đường truyền Ưu tiên" if m.get("is_local") else "🌐 Đường truyền Phổ thông"
+            if series_id in getattr(self, '_cached_history_ids', set()):
+                source_tag += "\n[✅ Đã tải trong bộ nhớ]"
             
             item.setText(f"{title}\n({eps} Tập)\n[{source_tag}]")
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            
-            item.setData(Qt.ItemDataRole.UserRole, f"https://hongguoduanju.com/detail?series_id={m.get('series_id')}") 
+            item.setData(Qt.ItemDataRole.UserRole, f"https://hongguoduanju.com/detail?series_id={series_id}") 
             self.hot_list.addItem(item)
-            
-            self._load_image_for_item(item, m.get("cover_url", ""))
-
-    def _load_image_for_item(self, item, url):
-        if not url: return
-        
-        loader = CoverImageLoader(url)
-        self._img_loaders.append(loader)
-        
-        def set_icon(image_data):
-            pix = QPixmap()
-            pix.loadFromData(image_data)
-            if not pix.isNull():
-                pix = pix.scaled(160, 220, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-                item.setIcon(QIcon(pix))
-        
-        loader.done.connect(set_icon)
-        loader.start()
 
     def _on_search_error(self, error_msg):
         self.loading_bar.hide() 
         self.hot_list.clear()
         empty_item = QListWidgetItem(f"❌ Lỗi tìm kiếm: {error_msg}")
-        empty_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        empty_item.setFlags(Qt.ItemFlag.NoItemFlags) 
+        empty_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter); empty_item.setFlags(Qt.ItemFlag.NoItemFlags) 
         self.hot_list.addItem(empty_item)
-
-    # ------------------------------------------
 
     def _on_scan_result(self, data):
         self.btn_scan.setEnabled(True)
@@ -872,26 +800,21 @@ class HonggouWidget(QWidget):
         status = data.get("status")
         self.current_job_id = data.get("job_id")
         self.current_series_id = str(data.get("series_id", "")) 
+        self.current_title = data.get("title", "Không rõ tên")
+        self.current_cover_url = data.get("cover_url", "")
         total_eps = data.get("total_episodes", 0)
         self.current_episodes = data.get("episodes", [])
         
         self.current_cover_pixmap = None
-        cover_url = data.get("cover_url", "")
-        if cover_url:
+        if self.current_cover_url:
             try:
-                resp = requests.get(cover_url, timeout=8)
+                resp = requests.get(self.current_cover_url, timeout=8)
                 if resp.status_code == 200:
                     pix = QPixmap()
-                    pix.loadFromData(resp.content)
-                    if not pix.isNull():
-                        self.current_cover_pixmap = pix.scaled(
-                            40, 50, Qt.AspectRatioMode.KeepAspectRatio, 
-                            Qt.TransformationMode.SmoothTransformation
-                        )
-            except Exception:
-                pass
+                    if pix.loadFromData(resp.content) and not pix.isNull():
+                        self.current_cover_pixmap = pix.scaled(40, 50, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            except: pass
         
-        # ĐÃ THAY ĐỔI TOÀN BỘ TỪ NGỮ BỊ LỘ
         if status == "cache_hit":
             self.lbl_status.setText(f"✅ Trích xuất thành công từ Nguồn VIP! (Tổng: {total_eps} tập). Bạn có thể chọn tập và lưu ngay.")
             self.btn_download.setEnabled(True)
@@ -917,7 +840,6 @@ class HonggouWidget(QWidget):
         total_eps = data.get("total_episodes", self.table.rowCount())
         self.current_episodes = data.get("episodes", [])
 
-        # ĐÃ THAY ĐỔI TOÀN BỘ TỪ NGỮ BỊ LỘ
         if status == "completed":
             self.lbl_status.setText(f"✅ Quá trình phân tích hoàn tất! Nguồn VIP đã sẵn sàng (Tổng: {total_eps} tập).")
             self.btn_download.setEnabled(True)
@@ -934,12 +856,9 @@ class HonggouWidget(QWidget):
         checked_eps = set()
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
-            if item and item.checkState() == Qt.CheckState.Checked:
-                checked_eps.add(row)
+            if item and item.checkState() == Qt.CheckState.Checked: checked_eps.add(row)
 
-        if self.table.rowCount() != total_eps:
-            self.table.setRowCount(total_eps)
-        
+        if self.table.rowCount() != total_eps: self.table.setRowCount(total_eps)
         readonly_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
             
         for i in range(total_eps):
@@ -956,41 +875,25 @@ class HonggouWidget(QWidget):
             
             thumb_item = QTableWidgetItem()
             thumb_item.setFlags(readonly_flags)
-            if hasattr(self, 'current_cover_pixmap') and self.current_cover_pixmap:
-                thumb_item.setIcon(QIcon(self.current_cover_pixmap))
+            if hasattr(self, 'current_cover_pixmap') and self.current_cover_pixmap: thumb_item.setIcon(QIcon(self.current_cover_pixmap))
             self.table.setItem(i, 1, thumb_item)
             
             if ep_data and ep_data.get("drive_link"):
                 file_item = QTableWidgetItem(ep_data.get("file_name", f"Tap_{ep_num}.mp4"))
-                file_item.setFlags(readonly_flags)
-                file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(i, 2, file_item)
-                
+                file_item.setFlags(readonly_flags); file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 2, file_item)
                 link_item = QTableWidgetItem("✅ Sẵn sàng")
-                link_item.setFlags(readonly_flags)
-                link_item.setForeground(QColor("#10b981")) 
-                link_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(i, 3, link_item)
+                link_item.setFlags(readonly_flags); link_item.setForeground(QColor("#10b981")); link_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 3, link_item)
             else:
                 file_item = QTableWidgetItem("---")
-                file_item.setFlags(readonly_flags)
-                file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(i, 2, file_item)
-                
+                file_item.setFlags(readonly_flags); file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 2, file_item)
                 wait_item = QTableWidgetItem("⏳ Đang đợi")
-                wait_item.setFlags(readonly_flags)
-                wait_item.setForeground(QColor("#f59e0b")) 
-                wait_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(i, 3, wait_item)
+                wait_item.setFlags(readonly_flags); wait_item.setForeground(QColor("#f59e0b")); wait_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 3, wait_item)
 
     def _toggle_select_all(self):
         all_checked = True
         for i in range(self.table.rowCount()):
             item = self.table.item(i, 0)
-            if item and item.checkState() != Qt.CheckState.Checked:
-                all_checked = False
-                break
-                
+            if item and item.checkState() != Qt.CheckState.Checked: all_checked = False; break
         new_state = Qt.CheckState.Unchecked if all_checked else Qt.CheckState.Checked
         for i in range(self.table.rowCount()):
             item = self.table.item(i, 0)
@@ -1003,23 +906,26 @@ class HonggouWidget(QWidget):
             if item and item.checkState() == Qt.CheckState.Checked:
                 ep_num = i + 1
                 ep_data = next((e for e in self.current_episodes if e.get("episode_number") == ep_num), None)
-                if ep_data and ep_data.get("drive_link"):
-                    selected_eps.append(ep_data)
+                if ep_data and ep_data.get("drive_link"): selected_eps.append(ep_data)
 
         if not selected_eps:
             QMessageBox.warning(self, "Lỗi", "Vui lòng chọn (tích) ít nhất 1 tập đã xử lý xong!")
             return
             
+        if self.current_series_id in getattr(self, '_cached_history_ids', set()):
+            reply = QMessageBox.question(self, "Cảnh báo tải trùng", "Bộ phim này bạn ĐÃ TẢI VỀ máy trước đó rồi!\nBạn có chắc chắn muốn TẢI LẠI và BỊ TRỪ TIỀN không?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No: return
+
         num_eps = len(selected_eps)
         folder_name = self.current_series_id if self.current_series_id else "Phim_Khong_Ro_ID"
         final_save_path = os.path.join(self.save_folder, folder_name)
         os.makedirs(final_save_path, exist_ok=True)
 
         try:
-            res = requests.post(f"{SERVER_URL}/api/client/pay_for_download", json={"username": self.username, "num_episodes": num_eps}, headers=self._auth_headers(), timeout=10)
+            res = requests.post(f"{SERVER_URL}/api/client/pay_for_download", json={"username": self.username, "num_episodes": num_eps}, headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=10)
             data = res.json()
-            
             if data.get("status") == "success":
+                self._save_to_history(self.current_series_id, self.current_title, self.current_cover_url)
                 self.btn_download.setEnabled(False)
                 self.btn_download.setText("⏳ Đang lưu về máy...")
                 self.lbl_status.setText(f"⏳ Đang lưu {num_eps} tập về máy...")
@@ -1031,36 +937,29 @@ class HonggouWidget(QWidget):
                 self.download_manager.error_signal.connect(self._on_download_error)
                 self.download_manager.all_done_signal.connect(self._on_all_downloads_done)
                 self.download_manager.start()
-            else:
-                QMessageBox.critical(self, "Không đủ số dư", data.get("message", "Vui lòng nạp thêm tiền!"))
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Hệ thống: {e}")
+            else: QMessageBox.critical(self, "Không đủ số dư", data.get("message", "Vui lòng nạp thêm tiền!"))
+        except Exception as e: QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Hệ thống: {e}")
 
     def _refresh_balance(self):
         try:
-            res = requests.get(f"{SERVER_URL}/api/client/balance/{self.username}", headers=self._auth_headers(), timeout=5)
+            res = requests.get(f"{SERVER_URL}/api/client/balance/{self.username}", headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=5)
             if res.status_code == 200:
                 balance = res.json().get("balance", 0)
-                if hasattr(self, 'balance_changed') and self.balance_changed:
-                    self.balance_changed(balance)
-        except Exception: pass
+                if hasattr(self, 'balance_changed') and self.balance_changed: self.balance_changed(balance)
+        except: pass
 
     def _on_download_progress(self, ep_num, percent, speed_mb):
         row = ep_num - 1
         if row < self.table.rowCount():
             status_item = QTableWidgetItem(f"⬇️ {percent}% ({speed_mb:.1f} MB/s)")
-            status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            status_item.setForeground(QColor("#38bdf8")) 
-            status_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
+            status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable); status_item.setForeground(QColor("#38bdf8")); status_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
             self.table.setItem(row, 3, status_item)
 
     def _on_episode_downloaded(self, ep_num, file_path):
         row = ep_num - 1
         if row < self.table.rowCount():
             done_item = QTableWidgetItem("✅ Đã xong")
-            done_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            done_item.setForeground(QColor("#10b981"))
-            done_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
+            done_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable); done_item.setForeground(QColor("#10b981")); done_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
             self.table.setItem(row, 3, done_item)
 
     def _on_download_error(self, ep_num, error_msg):
@@ -1068,10 +967,7 @@ class HonggouWidget(QWidget):
         if row < self.table.rowCount():
             short_msg = error_msg[:25] + "..." if len(error_msg) > 25 else error_msg
             err_item = QTableWidgetItem(f"❌ {short_msg}")
-            err_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            err_item.setForeground(QColor("#ef4444"))
-            err_item.setToolTip(str(error_msg))
-            err_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
+            err_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable); err_item.setForeground(QColor("#ef4444")); err_item.setToolTip(str(error_msg)); err_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
             self.table.setItem(row, 3, err_item)
 
     def _on_all_downloads_done(self, total_downloaded):
@@ -1088,9 +984,6 @@ class HonggouWidget(QWidget):
             self.settings.setValue(f"download_folder_{self.username}", new_folder)
             self.lbl_folder.setText(f"📂 Lưu vào: {self.save_folder}")
 
-    def _auth_headers(self):
-        return {"Authorization": f"Bearer {self.auth_token}"}
-
     def _on_scan_error(self, error_msg):
         self.btn_scan.setEnabled(True)
         self.btn_scan.setText("🔍 Tìm / Quét Phim")
@@ -1104,12 +997,8 @@ class HonggouWidget(QWidget):
 # AUTO-UPDATER: KIỂM TRA & CẬP NHẬT PHIÊN BẢN MỚI
 # ==========================================
 def _compare_versions(current: str, latest: str) -> bool:
-    try:
-        cur = [int(x) for x in current.split(".")]
-        lat = [int(x) for x in latest.split(".")]
-        return lat > cur
-    except Exception:
-        return False
+    try: return [int(x) for x in latest.split(".")] > [int(x) for x in current.split(".")]
+    except: return False
 
 def _get_exe_path() -> str:
     if getattr(sys, 'frozen', False): return sys.executable
@@ -1125,11 +1014,10 @@ class UpdateCheckThread(QThread):
             if res.status_code == 200:
                 data = res.json()
                 latest = data.get("latest_version", APP_VERSION)
-                if _compare_versions(APP_VERSION, latest):
-                    self.update_available.emit(latest, data.get("download_url", ""), data.get("changelog", ""), data.get("force_update", False))
+                if _compare_versions(APP_VERSION, latest): self.update_available.emit(latest, data.get("download_url", ""), data.get("changelog", ""), data.get("force_update", False))
                 else: self.no_update.emit()
             else: self.no_update.emit()
-        except Exception: pass
+        except: pass
 
 class DownloadUpdateThread(QThread):
     progress_signal = pyqtSignal(int)
@@ -1140,20 +1028,52 @@ class DownloadUpdateThread(QThread):
         super().__init__()
         self.download_url = download_url
 
+    def _extract_file_id(self, drive_link):
+        match_web = re.search(r'/d/([a-zA-Z0-9_-]+)', drive_link)
+        if match_web: return match_web.group(1)
+        match_dl = re.search(r'id=([a-zA-Z0-9_-]+)', drive_link)
+        if match_dl: return match_dl.group(1)
+        return None
+
     def run(self):
         try:
             url = self.download_url
             session = requests.Session()
-            resp = session.get(url, stream=True, timeout=30)
-            for key, value in resp.cookies.items():
-                if key.startswith('download_warning'):
-                    url = f"{url}&confirm={value}"
+            
+            # Xử lý đặc biệt nếu link update cũng là Google Drive
+            if 'drive.google.com' in url:
+                file_id = self._extract_file_id(url)
+                if file_id:
+                    URL_BASE = "https://drive.google.com/uc?export=download"
+                    resp = session.get(URL_BASE, params={'id': file_id}, stream=True, timeout=30)
+                    
+                    token = None
+                    for key, value in resp.cookies.items():
+                        if key.startswith('download_warning'):
+                            token = value
+                            break
+                    
+                    if token:
+                        resp = session.get(URL_BASE, params={'id': file_id, 'confirm': token}, stream=True, timeout=30)
+                    else:
+                        content_type = resp.headers.get('Content-Type', '')
+                        if 'text/html' in content_type:
+                            match = re.search(r'confirm=([0-9A-Za-z_-]+)', resp.text)
+                            if match:
+                                token = match.group(1)
+                                resp = session.get(URL_BASE, params={'id': file_id, 'confirm': token}, stream=True, timeout=30)
+                            else:
+                                resp = session.get(URL_BASE, params={'id': file_id, 'confirm': 't'}, stream=True, timeout=30)
+                else:
                     resp = session.get(url, stream=True, timeout=30)
-                    break
-            content_type = resp.headers.get('Content-Type', '')
-            if 'text/html' in content_type and 'drive.google.com' in url:
-                url = url + ("&" if "?" in url else "?") + "confirm=t"
+            else:
+                # Tải bình thường từ host khác
                 resp = session.get(url, stream=True, timeout=30)
+
+            # CHỐT CHẶN: Đảm bảo không lưu nhầm file HTML thành file EXE cập nhật
+            if 'text/html' in resp.headers.get('Content-Type', '') and 'drive.google.com' in url:
+                self.error_signal.emit("Lỗi: Không thể tải bản cập nhật (Bị chặn bởi Google Drive).")
+                return
 
             total_size = int(resp.headers.get('content-length', 0))
             downloaded = 0
@@ -1167,7 +1087,7 @@ class DownloadUpdateThread(QThread):
                         if total_size > 0: self.progress_signal.emit(int(downloaded * 100 / total_size))
 
             if os.path.getsize(temp_path) < 1_000_000:
-                self.error_signal.emit("File tải về bị lỗi hoặc quá nhỏ. Vui lòng báo cho Admin!")
+                self.error_signal.emit("File tải về bị lỗi. Vui lòng báo cho Admin!")
                 return
             self.done_signal.emit(temp_path)
         except Exception as e: self.error_signal.emit(str(e))
@@ -1210,7 +1130,7 @@ class AutoUpdater:
         self.btn_update.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_update.setVisible(False)
         self.btn_update.clicked.connect(self._on_update_clicked)
-        self.btn_update.setStyleSheet("""QPushButton { padding: 8px 16px; background-color: #f59e0b; color: #000; border-radius: 6px; font-weight: bold; font-size: 13px; border: none; } QPushButton:hover { background-color: #d97706; }""")
+        self.btn_update.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #f59e0b; color: #000; border-radius: 6px; font-weight: bold; font-size: 13px; border: none; } QPushButton:hover { background-color: #d97706; }")
 
         logout_index = header_layout.count() - 1
         header_layout.insertWidget(logout_index, self.btn_update)
@@ -1221,11 +1141,8 @@ class AutoUpdater:
         self._check_thread.start()
 
     def _on_update_found(self, version, url, changelog, force):
-        self._latest_version = version
-        self._download_url = url
-        self._changelog = changelog
-        self.btn_update.setText(f"🔄 Cập nhật v{version}")
-        self.btn_update.setVisible(True)
+        self._latest_version = version; self._download_url = url; self._changelog = changelog
+        self.btn_update.setText(f"🔄 Cập nhật v{version}"); self.btn_update.setVisible(True)
         if force: QMessageBox.warning(self.parent, "Bắt buộc cập nhật", f"Phiên bản {version} là bản cập nhật bắt buộc.\nVui lòng cập nhật để tiếp tục sử dụng.\n\n{changelog}")
 
     def _on_update_clicked(self):
@@ -1237,13 +1154,10 @@ class AutoUpdater:
         self.progress = QProgressDialog("Đang tải phiên bản mới...", None, 0, 100, self.parent)
         self.progress.setWindowTitle("Cập nhật Hongguo Downloader")
         self.progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self.progress.setCancelButton(None)
-        self.progress.setMinimumDuration(0)
-        self.progress.setValue(0)
-        self.progress.setStyleSheet("""QProgressDialog { background: #1e293b; color: white; } QProgressBar { border: 1px solid #374151; border-radius: 6px; background: #111827; text-align: center; color: white; } QProgressBar::chunk { background-color: #10b981; border-radius: 5px; }""")
+        self.progress.setCancelButton(None); self.progress.setMinimumDuration(0); self.progress.setValue(0)
+        self.progress.setStyleSheet("QProgressDialog { background: #1e293b; color: white; } QProgressBar { border: 1px solid #374151; border-radius: 6px; background: #111827; text-align: center; color: white; } QProgressBar::chunk { background-color: #10b981; border-radius: 5px; }")
         self.progress.show()
-        self.btn_update.setEnabled(False)
-        self.btn_update.setText("⏳ Đang tải...")
+        self.btn_update.setEnabled(False); self.btn_update.setText("⏳ Đang tải...")
 
         self._dl_thread = DownloadUpdateThread(self._download_url)
         self._dl_thread.progress_signal.connect(lambda p: (self.progress.setValue(p), self.progress.setLabelText(f"Đang tải... {p}%")))
@@ -1257,9 +1171,7 @@ class AutoUpdater:
         _apply_update_and_restart(new_exe_path)
 
     def _on_dl_error(self, error_msg):
-        self.progress.close()
-        self.btn_update.setEnabled(True)
-        self.btn_update.setText(f"🔄 Cập nhật v{self._latest_version}")
+        self.progress.close(); self.btn_update.setEnabled(True); self.btn_update.setText(f"🔄 Cập nhật v{self._latest_version}")
         QMessageBox.critical(self.parent, "Lỗi cập nhật", f"Không thể tải bản mới:\n{error_msg}")
 
 # ==========================================
@@ -1275,96 +1187,67 @@ class LoginScreen(QWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.settings = QSettings("HongguoDownloader", "ClientApp")
 
-        login_box = QWidget()
-        login_box.setFixedWidth(400)
+        login_box = QWidget(); login_box.setFixedWidth(400)
         login_box.setStyleSheet("background-color: #1e293b; border-radius: 12px; border: 1px solid #334155;")
-        box_layout = QVBoxLayout(login_box)
-        box_layout.setContentsMargins(30, 40, 30, 40)
-        box_layout.setSpacing(15)
+        box_layout = QVBoxLayout(login_box); box_layout.setContentsMargins(30, 40, 30, 40); box_layout.setSpacing(15)
 
         title = QLabel("ĐĂNG NHẬP HỆ THỐNG")
-        title.setFont(QFont("Arial", 18, QFont.Weight.Bold))
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setFont(QFont("Arial", 18, QFont.Weight.Bold)); title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet("color: #38bdf8; border: none; margin-bottom: 15px;")
         box_layout.addWidget(title)
 
-        self.inp_user = QLineEdit()
-        self.inp_user.setPlaceholderText("Tên đăng nhập")
+        self.inp_user = QLineEdit(); self.inp_user.setPlaceholderText("Tên đăng nhập")
         self.inp_user.setStyleSheet("padding: 14px; border-radius: 8px; border: 1px solid #475569; background: #0f172a;")
         box_layout.addWidget(self.inp_user)
 
-        self.inp_pass = QLineEdit()
-        self.inp_pass.setPlaceholderText("Mật khẩu")
-        self.inp_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self.inp_pass = QLineEdit(); self.inp_pass.setPlaceholderText("Mật khẩu"); self.inp_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self.inp_pass.setStyleSheet("padding: 14px; border-radius: 8px; border: 1px solid #475569; background: #0f172a;")
         box_layout.addWidget(self.inp_pass)
 
-        saved_user = self.settings.value("username", "")
-        saved_pwd = self.settings.value("password", "")
-        if saved_user:
-            self.inp_user.setText(saved_user)
-            self.inp_pass.setText(saved_pwd)
+        saved_user = self.settings.value("username", ""); saved_pwd = self.settings.value("password", "")
+        if saved_user: self.inp_user.setText(saved_user); self.inp_pass.setText(saved_pwd)
 
         self.btn_login = QPushButton("Đăng Nhập")
         self.btn_login.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_login.setStyleSheet("""QPushButton { padding: 14px; background-color: #2563eb; color: white; border-radius: 8px; font-weight: bold; font-size: 14px; margin-top: 10px; border: none;} QPushButton:hover { background-color: #1d4ed8; }""")
+        self.btn_login.setStyleSheet("QPushButton { padding: 14px; background-color: #2563eb; color: white; border-radius: 8px; font-weight: bold; font-size: 14px; margin-top: 10px; border: none;} QPushButton:hover { background-color: #1d4ed8; }")
         self.btn_login.clicked.connect(self._handle_login)
         box_layout.addWidget(self.btn_login)
 
         self.btn_register = QPushButton("Tạo Tài Khoản Mới")
         self.btn_register.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_register.setStyleSheet("""QPushButton { padding: 14px; background-color: #10b981; color: white; border-radius: 8px; font-weight: bold; font-size: 14px; border: none;} QPushButton:hover { background-color: #059669; }""")
+        self.btn_register.setStyleSheet("QPushButton { padding: 14px; background-color: #10b981; color: white; border-radius: 8px; font-weight: bold; font-size: 14px; border: none;} QPushButton:hover { background-color: #059669; }")
         self.btn_register.clicked.connect(self._handle_register)
         box_layout.addWidget(self.btn_register)
-
         layout.addWidget(login_box)
 
     def _handle_login(self):
-        user = self.inp_user.text().strip()
-        pwd = self.inp_pass.text().strip()
-        if not user or not pwd:
-            QMessageBox.warning(self, "Lỗi", "Vui lòng nhập đủ thông tin!")
-            return
-
-        self.btn_login.setText("Đang kết nối...")
-        self.btn_login.setEnabled(False)
-        
+        user = self.inp_user.text().strip(); pwd = self.inp_pass.text().strip()
+        if not user or not pwd: QMessageBox.warning(self, "Lỗi", "Vui lòng nhập đủ thông tin!"); return
+        self.btn_login.setText("Đang kết nối..."); self.btn_login.setEnabled(False)
         try: real_hwid = str(uuid.getnode())
-        except Exception: real_hwid = "unknown_hwid"
+        except: real_hwid = "unknown_hwid"
 
         try:
-            res = requests.post(f"{SERVER_URL}/api/login", json={"username": user, "password": pwd, "hwid": real_hwid}, timeout=10)
+            res = requests.post(f"{SERVER_URL}/api/login", json={"username": user, "password": pwd, "hwid": real_hwid, "platform": "honggou"}, timeout=10)
             data = res.json()
             if data.get("status") == "success":
-                self.settings.setValue("username", user)
-                self.settings.setValue("password", pwd)
-                self.settings.setValue("auth_token", data.get("token", "")) 
+                self.settings.setValue("username", user); self.settings.setValue("password", pwd); self.settings.setValue("auth_token", data.get("token", "")) 
                 self.login_success.emit(user, data.get("expiry", "Vô thời hạn"))
             else: QMessageBox.critical(self, "Lỗi", data.get("message", "Đăng nhập thất bại"))
         except Exception as e: QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Hệ thống:\n{e}")
-        
-        self.btn_login.setText("Đăng Nhập")
-        self.btn_login.setEnabled(True)
+        self.btn_login.setText("Đăng Nhập"); self.btn_login.setEnabled(True)
 
     def _handle_register(self):
-        user = self.inp_user.text().strip()
-        pwd = self.inp_pass.text().strip()
-        if not user or not pwd:
-            QMessageBox.warning(self, "Lỗi", "Vui lòng nhập Tên đăng nhập và Mật khẩu bạn muốn tạo vào 2 ô trên, sau đó bấm Đăng Ký!")
-            return
-
-        self.btn_register.setText("Đang xử lý...")
-        self.btn_register.setEnabled(False)
-
+        user = self.inp_user.text().strip(); pwd = self.inp_pass.text().strip()
+        if not user or not pwd: QMessageBox.warning(self, "Lỗi", "Vui lòng nhập Tên đăng nhập và Mật khẩu bạn muốn tạo vào 2 ô trên, sau đó bấm Đăng Ký!"); return
+        self.btn_register.setText("Đang xử lý..."); self.btn_register.setEnabled(False)
         try:
-            res = requests.post(f"{SERVER_URL}/api/register", json={"username": user, "password": pwd, "zalo": ""}, timeout=10)
+            res = requests.post(f"{SERVER_URL}/api/register", json={"username": user, "password": pwd, "zalo": "", "platform": "honggou"}, timeout=10)
             data = res.json()
             if data.get("status") == "success": QMessageBox.information(self, "Thành công", data.get("message", "Đăng ký thành công!"))
             else: QMessageBox.critical(self, "Lỗi", data.get("message", "Đăng ký thất bại"))
         except Exception as e: QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Hệ thống:\n{e}")
-        
-        self.btn_register.setText("Tạo Tài Khoản Mới")
-        self.btn_register.setEnabled(True)
+        self.btn_register.setText("Tạo Tài Khoản Mới"); self.btn_register.setEnabled(True)
 
 # ==========================================
 # CỬA SỔ CHÍNH
@@ -1373,32 +1256,23 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Hongguo Downloader Pro v{APP_VERSION}")
-        self.resize(1050, 780)
-        self.setStyleSheet("background-color: #0f172a;")
-
+        self.resize(1050, 780); self.setStyleSheet("background-color: #0f172a;")
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
-
         self.login_screen = LoginScreen()
         self.login_screen.login_success.connect(self.show_main_app)
         self.stack.addWidget(self.login_screen)
 
     def show_main_app(self, username, expiry):
-        main_widget = QWidget()
-        main_layout = QVBoxLayout(main_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+        main_widget = QWidget(); main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0); main_layout.setSpacing(0)
 
-        header = QWidget()
-        header.setFixedHeight(65)
+        header = QWidget(); header.setFixedHeight(65)
         header.setStyleSheet("background-color: #1e293b; border-bottom: 1px solid #334155;")
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(25, 0, 25, 0)
+        header_layout = QHBoxLayout(header); header_layout.setContentsMargins(25, 0, 25, 0)
 
         lbl_logo = QLabel("👑 Hongguo Downloader Pro")
-        lbl_logo.setFont(QFont("Arial", 16, QFont.Weight.Bold))
-        lbl_logo.setStyleSheet("color: #38bdf8;")
-        
+        lbl_logo.setFont(QFont("Arial", 16, QFont.Weight.Bold)); lbl_logo.setStyleSheet("color: #38bdf8;")
         lbl_user_info = QLabel(f"👤 Khách hàng: <b>{username}</b>  |  ⏳ Hạn VIP: {expiry}")
         lbl_user_info.setStyleSheet("color: #cbd5e1; font-size: 14px;")
 
@@ -1407,16 +1281,11 @@ class MainWindow(QMainWindow):
 
         btn_logout = QPushButton("🚪 Đăng Xuất")
         btn_logout.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_logout.setStyleSheet("""QPushButton { padding: 8px 16px; background-color: #ef4444; color: white; border-radius: 6px; font-weight: bold; border: none; } QPushButton:hover { background-color: #dc2626; }""")
+        btn_logout.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #ef4444; color: white; border-radius: 6px; font-weight: bold; border: none; } QPushButton:hover { background-color: #dc2626; }")
         btn_logout.clicked.connect(self.logout)
 
-        header_layout.addWidget(lbl_logo)
-        header_layout.addStretch()
-        header_layout.addWidget(lbl_user_info)
-        header_layout.addSpacing(20)
-        header_layout.addWidget(self.lbl_balance)
-        header_layout.addSpacing(20)
-        header_layout.addWidget(btn_logout)
+        header_layout.addWidget(lbl_logo); header_layout.addStretch(); header_layout.addWidget(lbl_user_info)
+        header_layout.addSpacing(20); header_layout.addWidget(self.lbl_balance); header_layout.addSpacing(20); header_layout.addWidget(btn_logout)
 
         self.updater = AutoUpdater(header_layout, parent_widget=self)
         main_layout.addWidget(header)
@@ -1425,16 +1294,10 @@ class MainWindow(QMainWindow):
         self.honggou_tab.balance_changed = self._update_balance_display
         main_layout.addWidget(self.honggou_tab)
 
-        self.stack.addWidget(main_widget)
-        self.stack.setCurrentWidget(main_widget)
-        
+        self.stack.addWidget(main_widget); self.stack.setCurrentWidget(main_widget)
         self._fetch_balance(username)
-
         self._hb_username = username
-        self._hb_timer = QTimer(self)
-        self._hb_timer.timeout.connect(self._send_heartbeat)
-        self._hb_timer.start(20000)
-        self._send_heartbeat()
+        self._hb_timer = QTimer(self); self._hb_timer.timeout.connect(self._send_heartbeat); self._hb_timer.start(20000); self._send_heartbeat()
     
     def _fetch_balance(self, username):
         try:
@@ -1443,10 +1306,9 @@ class MainWindow(QMainWindow):
             if res.status_code == 200:
                 balance = res.json().get("balance", 0)
                 self._update_balance_display(balance)
-        except Exception: pass
+        except: pass
 
-    def _update_balance_display(self, balance):
-        self.lbl_balance.setText(f"💰 Số dư: {balance:,} đ".replace(",", "."))
+    def _update_balance_display(self, balance): self.lbl_balance.setText(f"💰 Số dư: {balance:,} đ".replace(",", "."))
 
     def _send_heartbeat(self):
         try:
@@ -1461,17 +1323,15 @@ class MainWindow(QMainWindow):
                 elif tab.current_episodes: payload["action"] = "Đang xem danh sách tập"
                 else: payload["action"] = "Đang lướt kho phim"
             requests.post(f"{SERVER_URL}/api/client/heartbeat", json=payload, headers={"Authorization": f"Bearer {token}"}, timeout=5)
-        except Exception: pass
+        except: pass
 
     def logout(self):
         reply = QMessageBox.question(self, "Đăng xuất", "Bạn có chắc chắn muốn đăng xuất không?\n(Sẽ xóa thông tin tài khoản đã ghi nhớ)", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             if hasattr(self, '_hb_timer'): self._hb_timer.stop()
             settings = QSettings("HongguoDownloader", "ClientApp")
-            settings.remove("username")
-            settings.remove("password")
-            self.login_screen.inp_user.clear()
-            self.login_screen.inp_pass.clear() 
+            settings.remove("username"); settings.remove("password")
+            self.login_screen.inp_user.clear(); self.login_screen.inp_pass.clear() 
             if hasattr(self, 'honggou_tab') and self.honggou_tab.monitor_thread: self.honggou_tab.monitor_thread.stop()
             self.stack.setCurrentWidget(self.login_screen)
 
