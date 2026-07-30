@@ -22,7 +22,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.23"
+APP_VERSION = "1.0.24"
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  
 
