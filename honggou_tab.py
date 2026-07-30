@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, 
     QTableWidget, QTableWidgetItem, QLabel, QMessageBox, 
     QHeaderView, QListWidget, QListWidgetItem, QApplication, QMainWindow, QStackedWidget,
-    QFileDialog, QProgressDialog, QProgressBar
+    QFileDialog, QProgressDialog, QProgressBar, QComboBox
 )
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize, QSettings, QTimer
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
@@ -68,6 +68,30 @@ class HotMoviesLoadThread(QThread):
             self.finished_signal.emit()
         except Exception:
             self.finished_signal.emit()
+
+# ==========================================
+# THREAD 1B: TẢI BỔ SUNG ẢNH BÌA CHO LỊCH SỬ (chạy nền, không đứng UI)
+# ==========================================
+class HistoryCoverThread(QThread):
+    cover_ready = pyqtSignal(int, bytes)
+
+    def __init__(self, jobs, covers_dir):
+        super().__init__()
+        self.jobs = jobs  # list các (row, series_id, cover_url) còn thiếu ảnh
+        self.covers_dir = covers_dir
+
+    def run(self):
+        for row, sid, url in self.jobs:
+            if not url: continue
+            if url.startswith('//'): url = 'https:' + url
+            try:
+                r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://hongguoduanju.com/"})
+                if r.status_code == 200 and r.content:
+                    try:
+                        with open(os.path.join(self.covers_dir, f"{sid}.img"), 'wb') as f: f.write(r.content)
+                    except Exception: pass
+                    self.cover_ready.emit(row, r.content)
+            except Exception: pass
 
 # ==========================================
 # THREAD 2: TÌM KIẾM PHIM THEO TÊN
@@ -391,7 +415,7 @@ class DriveDownloadManager(QObject):
     error_signal = pyqtSignal(int, str)             
     all_done_signal = pyqtSignal(int)               
 
-    def __init__(self, episodes, save_folder, parent=None):
+    def __init__(self, episodes, save_folder, parent=None, max_concurrent=None):
         super().__init__(parent)
         self._pending = list(episodes)
         self.save_folder = save_folder
@@ -399,9 +423,10 @@ class DriveDownloadManager(QObject):
         self._success_count = 0
         self._finished_count = 0
         self._total = len(episodes)
+        self.max_concurrent = max_concurrent or MAX_CONCURRENT_DOWNLOADS
 
     def start(self):
-        for _ in range(min(MAX_CONCURRENT_DOWNLOADS, len(self._pending))):
+        for _ in range(min(self.max_concurrent, len(self._pending))):
             self._launch_next()
 
     def _launch_next(self):
@@ -461,21 +486,111 @@ class HonggouWidget(QWidget):
             except: return []
         return []
 
-    def _save_to_history(self, series_id, title, cover_url):
+    def _keep_thread_alive(self, t):
+        """Giữ tham chiếu thread nền tới khi nó tự chạy xong.
+        Nếu gán đè biến khi thread cũ còn chạy, Python dọn rác thread đang chạy -> Qt sập cả app."""
+        if not hasattr(self, '_bg_threads'): self._bg_threads = []
+        self._bg_threads.append(t)
+        def _cleanup():
+            try: self._bg_threads.remove(t)
+            except ValueError: pass
+        t.finished.connect(_cleanup)
+
+    def _get_covers_dir(self):
+        d = os.path.join(os.path.expanduser("~"), ".hongguo_covers")
+        try: os.makedirs(d, exist_ok=True)
+        except Exception: pass
+        return d
+
+    def _save_to_history(self, series_id, title, cover_url, total_eps=0, cover_bytes=None):
         if not series_id: return
+        # Lưu ảnh bìa xuống máy 1 lần -> lịch sử luôn có hình, kể cả offline
+        try:
+            cover_path = os.path.join(self._get_covers_dir(), f"{series_id}.img")
+            if not os.path.exists(cover_path):
+                if not cover_bytes and cover_url:
+                    try:
+                        u = 'https:' + cover_url if cover_url.startswith('//') else cover_url
+                        r = requests.get(u, timeout=6, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://hongguoduanju.com/"})
+                        if r.status_code == 200: cover_bytes = r.content
+                    except Exception: pass
+                if cover_bytes:
+                    with open(cover_path, 'wb') as f: f.write(cover_bytes)
+        except Exception: pass
         history_file = self._get_history_file()
         history = self._load_history()
+        old_entry = next((h for h in history if h.get('series_id') == series_id), None)
         history = [h for h in history if h.get('series_id') != series_id]
+        if not total_eps and old_entry: total_eps = old_entry.get('total_episodes', 0)
         history.insert(0, {
             "series_id": series_id,
             "title": title if title else "Phim không rõ tên",
             "cover_url": cover_url,
+            "total_episodes": total_eps,
             "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M")
         })
         try:
             with open(history_file, 'w', encoding='utf-8') as f: json.dump(history, f, ensure_ascii=False, indent=2)
             self._cached_history_ids.add(str(series_id))
         except: pass
+        self._remove_from_scan_history(series_id)
+        try: self._render_history_sidebar()
+        except Exception: pass
+
+    # ==========================================
+    # LỊCH SỬ QUÉT (CHƯA TẢI) - tự xóa sau 30 phút
+    # ==========================================
+    def _get_scan_history_file(self): return os.path.join(os.path.expanduser("~"), f".hongguo_scan_history_{self.username}.json")
+
+    def _load_scan_history(self):
+        f = self._get_scan_history_file()
+        items = []
+        if os.path.exists(f):
+            try:
+                with open(f, 'r', encoding='utf-8') as fh: items = json.load(fh)
+            except Exception: items = []
+        now = time.time()
+        alive = [it for it in items if now - it.get('ts', 0) < 1800]  # 30 phút
+        if len(alive) != len(items):
+            try:
+                with open(f, 'w', encoding='utf-8') as fh: json.dump(alive, fh, ensure_ascii=False, indent=2)
+            except Exception: pass
+        return alive
+
+    def _save_to_scan_history(self, series_id, title, cover_url, total_eps=0, cover_bytes=None):
+        if not series_id: return
+        series_id = str(series_id)
+        # Đã nằm trong lịch sử TẢI rồi thì không cần nhắc "chưa tải"
+        if series_id in getattr(self, '_cached_history_ids', set()): return
+        try:
+            cover_path = os.path.join(self._get_covers_dir(), f"{series_id}.img")
+            if cover_bytes and not os.path.exists(cover_path):
+                with open(cover_path, 'wb') as f: f.write(cover_bytes)
+        except Exception: pass
+        items = self._load_scan_history()
+        items = [it for it in items if str(it.get('series_id')) != series_id]
+        items.insert(0, {
+            "series_id": series_id,
+            "title": title if title else "Phim không rõ tên",
+            "cover_url": cover_url,
+            "total_episodes": total_eps,
+            "ts": time.time(),
+            "timestamp": datetime.now().strftime("%H:%M")
+        })
+        items = items[:20]
+        try:
+            with open(self._get_scan_history_file(), 'w', encoding='utf-8') as fh: json.dump(items, fh, ensure_ascii=False, indent=2)
+        except Exception: pass
+        try: self._render_history_sidebar()
+        except Exception: pass
+
+    def _remove_from_scan_history(self, series_id):
+        try:
+            items = self._load_scan_history()
+            new_items = [it for it in items if str(it.get('series_id')) != str(series_id)]
+            if len(new_items) != len(items):
+                with open(self._get_scan_history_file(), 'w', encoding='utf-8') as fh: json.dump(new_items, fh, ensure_ascii=False, indent=2)
+        except Exception: pass
 
     def _setup_ui(self):
         master_layout = QVBoxLayout(self)
@@ -505,7 +620,28 @@ class HonggouWidget(QWidget):
         master_layout.addLayout(folder_bar)
 
         self.content_stack = QStackedWidget()
-        master_layout.addWidget(self.content_stack)
+
+        # ===== PANEL LỊCH SỬ TẢI - cột dọc cố định bên phải =====
+        self.history_panel = QWidget()
+        self.history_panel.setFixedWidth(240)
+        hp_layout = QVBoxLayout(self.history_panel)
+        hp_layout.setContentsMargins(10, 0, 0, 0)
+        hp_layout.setSpacing(8)
+        lbl_hp = QLabel("🕒 Lịch Sử Tải")
+        lbl_hp.setStyleSheet("color: #f59e0b; font-size: 15px; font-weight: bold; padding: 4px 2px;")
+        hp_layout.addWidget(lbl_hp)
+        self.history_list = QListWidget()
+        self.history_list.setIconSize(QSize(52, 70))
+        self.history_list.setWordWrap(True)
+        self.history_list.setStyleSheet("QListWidget { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 10px; outline: none; padding: 4px; } QListWidget::item { color: #e2e8f0; font-size: 12px; padding: 6px; border-radius: 8px; border-bottom: 1px solid #1e293b; } QListWidget::item:hover { background-color: #1e293b; } QScrollBar:vertical { border: none; background: #111827; width: 6px; margin: 0px; } QScrollBar::handle:vertical { background: #374151; border-radius: 3px; min-height: 20px; }")
+        self.history_list.itemClicked.connect(self._on_history_item_clicked)
+        hp_layout.addWidget(self.history_list)
+
+        body_layout = QHBoxLayout()
+        body_layout.setSpacing(0)
+        body_layout.addWidget(self.content_stack, 1)
+        body_layout.addWidget(self.history_panel)
+        master_layout.addLayout(body_layout)
 
         self.page_grid = QWidget()
         grid_layout = QVBoxLayout(self.page_grid)
@@ -516,7 +652,7 @@ class HonggouWidget(QWidget):
         genre_layout.setSpacing(10)
         
         self.genre_buttons = []
-        genres = [("🔥 Tất Cả", None), ("👍 BXH Đề Cử", "BXH Đề Cử"), ("📈 BXH Lượt Xem", "BXH Lượt Xem"), ("🆕 BXH Phim Mới", "BXH Phim Mới"), ("🐼 BXH Hoạt Hình", "BXH Hoạt Hình"), ("🕒 Lịch Sử Tải", "HISTORY")]
+        genres = [("🔥 Tất Cả", None), ("👍 BXH Đề Cử", "BXH Đề Cử"), ("📈 BXH Lượt Xem", "BXH Lượt Xem"), ("🆕 BXH Phim Mới", "BXH Phim Mới"), ("🐼 BXH Hoạt Hình", "BXH Hoạt Hình")]
         for name, tag in genres:
             btn = QPushButton(name)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -552,11 +688,43 @@ class HonggouWidget(QWidget):
         self.btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_back.setStyleSheet("QPushButton { padding: 8px 15px; background-color: transparent; color: #94a3b8; border: 1px solid #374151; border-radius: 6px; font-weight: bold; text-align: left; } QPushButton:hover { background-color: #1e293b; color: #f8fafc; border: 1px solid #4b5563; }")
         self.btn_back.clicked.connect(self._go_back)
-        btn_back_layout = QHBoxLayout(); btn_back_layout.addWidget(self.btn_back); btn_back_layout.addStretch(); detail_layout.addLayout(btn_back_layout)
+        btn_back_layout = QHBoxLayout(); btn_back_layout.addWidget(self.btn_back); btn_back_layout.addStretch()
+
+        # Huy hiệu "ĐÃ TẢI RỒI" - chỉ hiện khi bộ phim đã nằm trong lịch sử tải
+        self.lbl_downloaded_badge = QLabel("✅ BỘ NÀY ĐÃ TẢI RỒI")
+        self.lbl_downloaded_badge.setStyleSheet("QLabel { background-color: #064e3b; color: #34d399; font-weight: bold; font-size: 13px; padding: 8px 14px; border-radius: 8px; border: 1px solid #10b981; }")
+        self.lbl_downloaded_badge.hide()
+        btn_back_layout.addWidget(self.lbl_downloaded_badge)
+
+        # Chọn số luồng tải song song (ghi nhớ lựa chọn)
+        lbl_threads = QLabel("⚡ Luồng tải:")
+        lbl_threads.setStyleSheet("color: #94a3b8; font-size: 13px; padding-left: 12px;")
+        btn_back_layout.addWidget(lbl_threads)
+        self.threads_combo = QComboBox()
+        self.threads_combo.addItems(["3", "5", "10"])
+        try: self.threads_combo.setCurrentText(str(self.settings.value("threads_count", "3")))
+        except Exception: pass
+        self.threads_combo.currentTextChanged.connect(lambda v: self.settings.setValue("threads_count", v))
+        self.threads_combo.setStyleSheet("QComboBox { background: #1f2937; color: #f8fafc; border: 1px solid #374151; border-radius: 6px; padding: 6px 12px; font-weight: bold; } QComboBox QAbstractItemView { background: #1f2937; color: #f8fafc; selection-background-color: #2563eb; }")
+        btn_back_layout.addWidget(self.threads_combo)
+
+        # Mở thư mục chứa đúng bộ phim đang xem
+        self.btn_open_folder = QPushButton("📂 Thư mục phim")
+        self.btn_open_folder.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_folder.setStyleSheet("QPushButton { padding: 8px 15px; background-color: transparent; color: #38bdf8; border: 1px solid #374151; border-radius: 6px; font-weight: bold; } QPushButton:hover { background-color: #1e293b; border: 1px solid #38bdf8; }")
+        self.btn_open_folder.clicked.connect(self._open_movie_folder)
+        btn_back_layout.addWidget(self.btn_open_folder)
+        detail_layout.addLayout(btn_back_layout)
 
         self.lbl_status = QLabel("Trạng thái: Sẵn sàng phục vụ...")
         self.lbl_status.setStyleSheet("color: #10b981; font-size: 14px; font-weight: bold; margin-top: 10px;")
         detail_layout.addWidget(self.lbl_status)
+
+        self.total_progress = QProgressBar()
+        self.total_progress.setFormat("Đã tải %v/%m tập  (%p%)")
+        self.total_progress.setStyleSheet("QProgressBar { background: #1f2937; border: 1px solid #374151; border-radius: 8px; color: #f8fafc; font-weight: bold; text-align: center; min-height: 22px; } QProgressBar::chunk { background-color: #10b981; border-radius: 7px; }")
+        self.total_progress.hide()
+        detail_layout.addWidget(self.total_progress)
 
         self.table = QTableWidget(); self.table.setColumnCount(4); self.table.setHorizontalHeaderLabels(["Chọn Tập", "", "Tên File", "Trạng Thái Link"])
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -578,6 +746,11 @@ class HonggouWidget(QWidget):
         bottom_layout.addWidget(self.btn_select_all); bottom_layout.addWidget(self.btn_download)
         detail_layout.addLayout(bottom_layout)
         self.content_stack.addWidget(self.page_detail)
+        self._render_history_sidebar()
+        # Mỗi 60s kiểm tra: mục "chưa tải" quá 30 phút sẽ tự biến mất khỏi panel
+        self._history_timer = QTimer(self)
+        self._history_timer.timeout.connect(self._render_history_sidebar)
+        self._history_timer.start(60000)
 
     def _update_genre_styles(self, active_btn):
         for btn in self.genre_buttons:
@@ -599,6 +772,7 @@ class HonggouWidget(QWidget):
             except: pass
 
         self.hot_list.clear()
+        self.current_genre = genre
         self.content_stack.setCurrentWidget(self.page_grid)
         self._cached_history_ids = {str(h.get('series_id', '')) for h in self._load_history()}
 
@@ -609,15 +783,41 @@ class HonggouWidget(QWidget):
                 empty = QListWidgetItem("📭 Bạn chưa tải bộ phim nào.")
                 empty.setTextAlignment(Qt.AlignmentFlag.AlignCenter); empty.setFlags(Qt.ItemFlag.NoItemFlags)
                 self.hot_list.addItem(empty); return
-                
-            for h in history:
+
+            covers_dir = self._get_covers_dir()
+            missing_covers = []
+            for row, h in enumerate(history):
                 item = QListWidgetItem()
                 title = h.get("title", "Không rõ tên")
+                eps = h.get("total_episodes", 0)
                 time_str = h.get("timestamp", "")
-                item.setText(f"{title}\n[Đã Tải: {time_str}]")
+                eps_line = f"\n({eps} Tập)" if eps else ""
+                item.setText(f"{title}{eps_line}\n[✅ Đã tải: {time_str}]")
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                # Ảnh bìa: đọc từ máy (đã lưu lúc tải phim); thiếu thì xếp hàng tải nền
+                img_data = None
+                cover_path = os.path.join(covers_dir, f"{h.get('series_id')}.img")
+                if os.path.exists(cover_path):
+                    try:
+                        with open(cover_path, 'rb') as f: img_data = f.read()
+                    except Exception: pass
+                if img_data:
+                    pixmap = QPixmap()
+                    if pixmap.loadFromData(img_data) and not pixmap.isNull():
+                        pixmap = pixmap.scaled(160, 220, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+                        item.setIcon(QIcon(pixmap))
+                elif h.get('cover_url'):
+                    missing_covers.append((row, str(h.get('series_id')), h.get('cover_url')))
                 item.setData(Qt.ItemDataRole.UserRole, f"https://hongguoduanju.com/detail?series_id={h.get('series_id')}")
                 self.hot_list.addItem(item)
+
+            if missing_covers:
+                if getattr(self, 'history_cover_thread', None) and self.history_cover_thread.isRunning():
+                    return
+                self.history_cover_thread = HistoryCoverThread(missing_covers, covers_dir)
+                self.history_cover_thread.cover_ready.connect(self._on_history_cover_ready)
+                self._keep_thread_alive(self.history_cover_thread)
+                self.history_cover_thread.start()
             return
 
         self.loading_bar.show()
@@ -632,7 +832,102 @@ class HonggouWidget(QWidget):
         self.hot_thread = HotMoviesLoadThread(genre)
         self.hot_thread.item_loaded_signal.connect(self._render_single_hot_movie)
         self.hot_thread.finished_signal.connect(self.loading_bar.hide)
+        self._keep_thread_alive(self.hot_thread)
         self.hot_thread.start()
+
+    def _on_history_cover_ready(self, row, img_bytes):
+        item = self.hot_list.item(row)
+        if not item: return
+        pixmap = QPixmap()
+        if pixmap.loadFromData(img_bytes) and not pixmap.isNull():
+            pixmap = pixmap.scaled(160, 220, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            item.setIcon(QIcon(pixmap))
+
+    def _render_history_sidebar(self):
+        """Vẽ panel Lịch Sử Tải bên phải: ảnh bìa nhỏ + tên + số tập + ngày tải."""
+        if not hasattr(self, 'history_list'): return
+        history = self._load_history()
+        downloaded_ids = {str(h.get('series_id')) for h in history}
+        scanned = [s for s in self._load_scan_history() if str(s.get('series_id')) not in downloaded_ids]
+        # Không có gì đổi -> giữ nguyên panel, không vẽ lại (chống lag)
+        sig = (tuple((s.get('series_id'), s.get('ts')) for s in scanned),
+               tuple((h.get('series_id'), h.get('timestamp'), h.get('total_episodes')) for h in history))
+        if sig == getattr(self, '_history_sig', None) and self.history_list.count() > 0:
+            return
+        self._history_sig = sig
+        if not hasattr(self, '_sidebar_icon_cache'): self._sidebar_icon_cache = {}
+        self.history_list.clear()
+        if not history and not scanned:
+            empty = QListWidgetItem("📭 Chưa tải phim nào")
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.history_list.addItem(empty)
+            return
+        covers_dir = self._get_covers_dir()
+        missing = []
+        # ⏳ Phim ĐÃ QUÉT nhưng CHƯA TẢI (nằm trên cùng, chữ cam, tự xóa sau 30 phút)
+        merged = [("scan", s) for s in scanned] + [("done", h) for h in history]
+        for row, (kind, h) in enumerate(merged):
+            item = QListWidgetItem()
+            title = h.get("title", "Không rõ tên")
+            eps = h.get("total_episodes", 0)
+            time_str = h.get("timestamp", "")
+            eps_line = f" • {eps} Tập" if eps else ""
+            if kind == "scan":
+                item.setText(f"{title}{eps_line}\n⏳ Chưa tải • quét lúc {time_str}")
+                item.setForeground(QColor("#f59e0b"))
+            else:
+                item.setText(f"{title}{eps_line}\n✅ {time_str}")
+            sid = str(h.get('series_id'))
+            icon = self._sidebar_icon_cache.get(sid)
+            if icon is None:
+                cover_path = os.path.join(covers_dir, f"{sid}.img")
+                if os.path.exists(cover_path):
+                    try:
+                        pixmap = QPixmap()
+                        with open(cover_path, 'rb') as f:
+                            if pixmap.loadFromData(f.read()) and not pixmap.isNull():
+                                icon = QIcon(pixmap.scaled(52, 70, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
+                                self._sidebar_icon_cache[sid] = icon
+                    except Exception: pass
+            if icon:
+                item.setIcon(icon)
+            elif h.get('cover_url'):
+                missing.append((row, sid, h.get('cover_url')))
+            item.setData(Qt.ItemDataRole.UserRole, f"https://hongguoduanju.com/detail?series_id={h.get('series_id')}")
+            self.history_list.addItem(item)
+        if missing:
+            # Thread cũ còn đang tải thì thôi - ảnh sẽ vào cache, lần vẽ sau tự có
+            if getattr(self, 'sidebar_cover_thread', None) and self.sidebar_cover_thread.isRunning():
+                return
+            self.sidebar_cover_thread = HistoryCoverThread(missing, covers_dir)
+            self.sidebar_cover_thread.cover_ready.connect(self._on_sidebar_cover_ready)
+            self._keep_thread_alive(self.sidebar_cover_thread)
+            self.sidebar_cover_thread.start()
+
+    def _on_sidebar_cover_ready(self, row, img_bytes):
+        item = self.history_list.item(row)
+        if not item: return
+        pixmap = QPixmap()
+        if pixmap.loadFromData(img_bytes) and not pixmap.isNull():
+            icon = QIcon(pixmap.scaled(52, 70, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
+            item.setIcon(icon)
+            # Nạp vào cache để lần vẽ sau không phải đọc lại
+            url = item.data(Qt.ItemDataRole.UserRole) or ""
+            sid = url.split("series_id=")[-1] if "series_id=" in url else ""
+            if sid and hasattr(self, '_sidebar_icon_cache'): self._sidebar_icon_cache[sid] = icon
+
+    def _on_history_item_clicked(self, item):
+        url = item.data(Qt.ItemDataRole.UserRole)
+        if not url: return
+        # Đang quét dở 1 bộ thì bỏ qua click mới (chống spam tạo thread)
+        if getattr(self, 'scan_thread', None) and self.scan_thread.isRunning(): return
+        # Đúng bộ đang mở sẵn -> nhảy thẳng vào trang tập, khỏi quét lại (chống lag)
+        sid = url.split("series_id=")[-1] if "series_id=" in url else ""
+        if sid and sid == str(getattr(self, 'current_series_id', '')) and self.table.rowCount() > 0:
+            self.content_stack.setCurrentWidget(self.page_detail)
+            return
+        self.url_input.setText(url)
+        self._scan()
 
     def _render_single_hot_movie(self, m):
         if self.is_first_movie:
@@ -661,14 +956,23 @@ class HonggouWidget(QWidget):
 
     def _on_hot_movie_clicked(self, item):
         url = item.data(Qt.ItemDataRole.UserRole)
-        if url:
-            self.url_input.setText(url)
-            self._scan()
+        if not url: return
+        if getattr(self, 'scan_thread', None) and self.scan_thread.isRunning(): return
+        sid = url.split("series_id=")[-1] if "series_id=" in url else ""
+        if sid and sid == str(getattr(self, 'current_series_id', '')) and self.table.rowCount() > 0:
+            self.content_stack.setCurrentWidget(self.page_detail)
+            return
+        self.url_input.setText(url)
+        self._scan()
 
     def _go_back(self):
         if self.monitor_thread: self.monitor_thread.stop()
-        self.content_stack.setCurrentWidget(self.page_grid)
         self.url_input.clear()
+        # Đang đứng ở tab Lịch Sử Tải -> vẽ lại lịch sử (kèm phim vừa tải xong), không nhảy về kệ phim hot
+        if getattr(self, 'current_genre', None) == "HISTORY":
+            self.load_hot_movies_shelf("HISTORY")
+            return
+        self.content_stack.setCurrentWidget(self.page_grid)
 
     def _normalize_url(self, raw_url):
         if "hongguoduanju.com/detail" in raw_url or "hongguoduanju.com/player" in raw_url: return raw_url
@@ -735,6 +1039,7 @@ class HonggouWidget(QWidget):
         self.table.setRowCount(0)
 
         self.scan_thread = HonggouScanThread(url, self.auth_token)
+        self._keep_thread_alive(self.scan_thread)
         self.scan_thread.scan_result.connect(self._on_scan_result)
         self.scan_thread.error_signal.connect(self._on_scan_error)
         self.scan_thread.url_resolved_signal.connect(self._on_url_resolved)
@@ -759,6 +1064,7 @@ class HonggouWidget(QWidget):
         self._cached_history_ids = {str(h.get('series_id', '')) for h in self._load_history()}
 
         self.search_thread = SearchMoviesThread(keyword, self.auth_token)
+        self._keep_thread_alive(self.search_thread)
         self.search_thread.results_signal.connect(self._on_search_results)
         self.search_thread.error_signal.connect(self._on_search_error)
         self.search_thread.start()
@@ -806,15 +1112,31 @@ class HonggouWidget(QWidget):
         self.current_episodes = data.get("episodes", [])
         
         self.current_cover_pixmap = None
+        self.current_cover_bytes = None
+        self.current_total_eps = total_eps
         if self.current_cover_url:
             try:
-                resp = requests.get(self.current_cover_url, timeout=8)
+                _cu = 'https:' + self.current_cover_url if self.current_cover_url.startswith('//') else self.current_cover_url
+                resp = requests.get(_cu, timeout=8, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://hongguoduanju.com/"})
                 if resp.status_code == 200:
+                    self.current_cover_bytes = resp.content
                     pix = QPixmap()
                     if pix.loadFromData(resp.content) and not pix.isNull():
                         self.current_cover_pixmap = pix.scaled(40, 50, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             except: pass
         
+        # Huy hiệu ĐÃ TẢI RỒI
+        if hasattr(self, 'lbl_downloaded_badge'):
+            if str(self.current_series_id) in getattr(self, '_cached_history_ids', set()): self.lbl_downloaded_badge.show()
+            else: self.lbl_downloaded_badge.hide()
+
+        # Ghi vào lịch sử QUÉT để khách nhớ bộ vừa xem (tự xóa sau 30 phút nếu không tải)
+        try:
+            self._save_to_scan_history(self.current_series_id, self.current_title, self.current_cover_url,
+                                       total_eps=total_eps or len(self.current_episodes),
+                                       cover_bytes=self.current_cover_bytes)
+        except Exception: pass
+
         if status == "cache_hit":
             self.lbl_status.setText(f"✅ Trích xuất thành công từ Nguồn VIP! (Tổng: {total_eps} tập). Bạn có thể chọn tập và lưu ngay.")
             self.btn_download.setEnabled(True)
@@ -832,6 +1154,7 @@ class HonggouWidget(QWidget):
 
         if status not in ["cache_hit", "completed"] and self.current_job_id:
             self.monitor_thread = JobStatusMonitorThread(self.current_job_id, self.auth_token)
+            self._keep_thread_alive(self.monitor_thread)
             self.monitor_thread.update_signal.connect(self._on_monitor_update)
             self.monitor_thread.start()
 
@@ -860,6 +1183,7 @@ class HonggouWidget(QWidget):
 
         if self.table.rowCount() != total_eps: self.table.setRowCount(total_eps)
         readonly_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        movie_folder = os.path.join(self.save_folder, str(getattr(self, 'current_series_id', '') or ''))
             
         for i in range(total_eps):
             ep_num = i + 1
@@ -881,8 +1205,17 @@ class HonggouWidget(QWidget):
             if ep_data and ep_data.get("drive_link"):
                 file_item = QTableWidgetItem(ep_data.get("file_name", f"Tap_{ep_num}.mp4"))
                 file_item.setFlags(readonly_flags); file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 2, file_item)
-                link_item = QTableWidgetItem("✅ Sẵn sàng")
-                link_item.setFlags(readonly_flags); link_item.setForeground(QColor("#10b981")); link_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 3, link_item)
+                # Soi ổ đĩa: tập này đã có file thật trong thư mục phim chưa?
+                safe_name = re.sub(r'[\\/*?:"<>|]', "", ep_data.get("file_name", f"Tap_{ep_num}.mp4"))
+                local_path = os.path.join(movie_folder, safe_name)
+                if os.path.exists(local_path) and os.path.getsize(local_path) > 1024:
+                    link_item = QTableWidgetItem("💾 Đã có trên máy")
+                    link_item.setForeground(QColor("#c084fc"))
+                    _f = link_item.font(); _f.setBold(True); link_item.setFont(_f)
+                else:
+                    link_item = QTableWidgetItem("✅ Sẵn sàng")
+                    link_item.setForeground(QColor("#10b981"))
+                link_item.setFlags(readonly_flags); link_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 3, link_item)
             else:
                 file_item = QTableWidgetItem("---")
                 file_item.setFlags(readonly_flags); file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 2, file_item)
@@ -890,14 +1223,28 @@ class HonggouWidget(QWidget):
                 wait_item.setFlags(readonly_flags); wait_item.setForeground(QColor("#f59e0b")); wait_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 3, wait_item)
 
     def _toggle_select_all(self):
-        all_checked = True
-        for i in range(self.table.rowCount()):
-            item = self.table.item(i, 0)
-            if item and item.checkState() != Qt.CheckState.Checked: all_checked = False; break
+        def _on_disk(i):
+            st = self.table.item(i, 3)
+            return bool(st and "Đã có trên máy" in st.text())
+
+        # Chỉ xét các tập CHƯA có trên máy - tập đã tải rồi không bị chọn theo (khỏi mất tiền oan)
+        selectable = [i for i in range(self.table.rowCount()) if not _on_disk(i)]
+        all_checked = bool(selectable) and all(
+            (self.table.item(i, 0) is not None and self.table.item(i, 0).checkState() == Qt.CheckState.Checked)
+            for i in selectable
+        )
         new_state = Qt.CheckState.Unchecked if all_checked else Qt.CheckState.Checked
+        skipped = 0
         for i in range(self.table.rowCount()):
             item = self.table.item(i, 0)
-            if item: item.setCheckState(new_state)
+            if not item: continue
+            if new_state == Qt.CheckState.Checked and _on_disk(i):
+                item.setCheckState(Qt.CheckState.Unchecked)
+                skipped += 1
+            else:
+                item.setCheckState(new_state)
+        if new_state == Qt.CheckState.Checked and skipped:
+            self.lbl_status.setText(f"☑ Đã chọn {len(selectable)} tập cần tải (bỏ qua {skipped} tập đã có trên máy).")
 
     def _download_selected(self):
         selected_eps = []
@@ -925,13 +1272,19 @@ class HonggouWidget(QWidget):
             res = requests.post(f"{SERVER_URL}/api/client/pay_for_download", json={"username": self.username, "num_episodes": num_eps}, headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=10)
             data = res.json()
             if data.get("status") == "success":
-                self._save_to_history(self.current_series_id, self.current_title, self.current_cover_url)
+                self._save_to_history(self.current_series_id, self.current_title, self.current_cover_url,
+                                      total_eps=len(self.current_episodes) or getattr(self, 'current_total_eps', 0),
+                                      cover_bytes=getattr(self, 'current_cover_bytes', None))
                 self.btn_download.setEnabled(False)
                 self.btn_download.setText("⏳ Đang lưu về máy...")
                 self.lbl_status.setText(f"⏳ Đang lưu {num_eps} tập về máy...")
                 self._refresh_balance()
-                
-                self.download_manager = DriveDownloadManager(selected_eps, final_save_path, parent=self)
+
+                self._dl_finished = 0
+                self.total_progress.setMaximum(num_eps); self.total_progress.setValue(0); self.total_progress.show()
+                try: max_threads = int(self.threads_combo.currentText())
+                except Exception: max_threads = 3
+                self.download_manager = DriveDownloadManager(selected_eps, final_save_path, parent=self, max_concurrent=max_threads)
                 self.download_manager.progress_signal.connect(self._on_download_progress)
                 self.download_manager.done_signal.connect(self._on_episode_downloaded)
                 self.download_manager.error_signal.connect(self._on_download_error)
@@ -939,6 +1292,17 @@ class HonggouWidget(QWidget):
                 self.download_manager.start()
             else: QMessageBox.critical(self, "Không đủ số dư", data.get("message", "Vui lòng nạp thêm tiền!"))
         except Exception as e: QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Hệ thống: {e}")
+
+    def _open_movie_folder(self):
+        folder = os.path.join(self.save_folder, str(getattr(self, 'current_series_id', '') or ''))
+        if not os.path.isdir(folder): folder = self.save_folder
+        try: os.startfile(folder)
+        except Exception as e: QMessageBox.warning(self, "Lỗi", f"Không mở được thư mục: {e}")
+
+    def _bump_total_progress(self):
+        if not hasattr(self, 'total_progress'): return
+        self._dl_finished = getattr(self, '_dl_finished', 0) + 1
+        self.total_progress.setValue(min(self._dl_finished, self.total_progress.maximum()))
 
     def _refresh_balance(self):
         try:
@@ -958,9 +1322,11 @@ class HonggouWidget(QWidget):
     def _on_episode_downloaded(self, ep_num, file_path):
         row = ep_num - 1
         if row < self.table.rowCount():
-            done_item = QTableWidgetItem("✅ Đã xong")
-            done_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable); done_item.setForeground(QColor("#10b981")); done_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
+            done_item = QTableWidgetItem("✔ ĐÃ XONG")
+            done_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable); done_item.setForeground(QColor("#22d3ee")); done_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
+            _f = done_item.font(); _f.setBold(True); done_item.setFont(_f)
             self.table.setItem(row, 3, done_item)
+        self._bump_total_progress()
 
     def _on_download_error(self, ep_num, error_msg):
         row = ep_num - 1
@@ -969,11 +1335,13 @@ class HonggouWidget(QWidget):
             err_item = QTableWidgetItem(f"❌ {short_msg}")
             err_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable); err_item.setForeground(QColor("#ef4444")); err_item.setToolTip(str(error_msg)); err_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
             self.table.setItem(row, 3, err_item)
+        self._bump_total_progress()
 
     def _on_all_downloads_done(self, total_downloaded):
         self.btn_download.setEnabled(True)
         self.btn_download.setText("📥 Tải đã chọn")
         self.lbl_status.setText(f"✅ Hoàn tất! Đã lưu {total_downloaded} tập về máy.")
+        if hasattr(self, 'lbl_downloaded_badge'): self.lbl_downloaded_badge.show()
         self._refresh_balance()
         QMessageBox.information(self, "Thành công", f"Đã lưu thành công {total_downloaded} tập phim về máy bạn!")
 
