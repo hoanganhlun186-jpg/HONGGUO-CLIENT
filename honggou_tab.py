@@ -8,13 +8,14 @@ import re
 import tempfile
 import subprocess
 import uuid
+import shutil
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, 
     QTableWidget, QTableWidgetItem, QLabel, QMessageBox, 
     QHeaderView, QListWidget, QListWidgetItem, QApplication, QMainWindow, QStackedWidget,
-    QFileDialog, QProgressDialog, QProgressBar, QComboBox
+    QFileDialog, QProgressDialog, QProgressBar, QComboBox, QSpinBox
 )
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize, QSettings, QTimer
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
@@ -22,12 +23,123 @@ from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.24"
+APP_VERSION = "1.0.28"
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  
 
 # ==========================================
-# THREAD 1: TẢI DANH SÁCH PHIM HOT NGẦM
+# FFMPEG HELPER VÀ LUỒNG GỘP FILE (MERGE)
+# ==========================================
+def get_ffmpeg_path():
+    """Tìm file ffmpeg trong thư mục chạy tool hoặc trong hệ thống"""
+    if sys.platform == "win32":
+        if os.path.exists("ffmpeg.exe"): 
+            return os.path.abspath("ffmpeg.exe")
+    else:
+        if os.path.exists("ffmpeg"): 
+            return os.path.abspath("ffmpeg")
+    
+    ffmpeg_system = shutil.which("ffmpeg")
+    return ffmpeg_system if ffmpeg_system else None
+
+class HonggouMergeThread(QThread):
+    progress_msg = pyqtSignal(str)
+    finished_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, movie_folder, merge_tasks):
+        super().__init__()
+        self.movie_folder = movie_folder
+        self.merge_tasks = merge_tasks 
+
+    def run(self):
+        ffmpeg_path = get_ffmpeg_path()
+        if not ffmpeg_path:
+            self.error_signal.emit("Không tìm thấy phần mềm FFmpeg để gộp file! Vui lòng tải ffmpeg.exe đặt cùng thư mục app.")
+            return
+
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW 
+
+        total_tasks = len(self.merge_tasks)
+        for i, task in enumerate(self.merge_tasks):
+            out_name = task["output_name"]
+            files_to_merge = task["files"]
+            
+            if len(files_to_merge) <= 1:
+                continue 
+                
+            self.progress_msg.emit(f"⚡ Đang chuẩn bị định dạng file phần {i+1}/{total_tasks}...")
+            
+            # 1. Chuyển MP4 sang định dạng luồng TS tạm thời để ghép không bị vỡ hình
+            temp_ts_files = []
+            for j, fp in enumerate(files_to_merge):
+                self.progress_msg.emit(f"⚙️ Xử lý chống vỡ hình tập {j+1}/{len(files_to_merge)} (Phần {i+1})...")
+                ts_path = fp + ".ts"
+                ts_cmd = [ffmpeg_path, '-y', '-i', fp, '-c', 'copy', '-f', 'mpegts', ts_path]
+                try:
+                    res_ts = subprocess.run(ts_cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    if res_ts.returncode != 0:
+                        # Thử lại với bitstream filter thủ công nếu bản FFmpeg cũ
+                        ts_cmd_fallback = [ffmpeg_path, '-y', '-i', fp, '-c', 'copy', '-bsf:v', 'h264_mp4toannexb', '-f', 'mpegts', ts_path]
+                        res_fallback = subprocess.run(ts_cmd_fallback, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                        if res_fallback.returncode != 0:
+                             raise Exception(res_fallback.stderr.decode('utf-8', errors='ignore'))
+                    temp_ts_files.append(ts_path)
+                except Exception as e:
+                    self.error_signal.emit(f"Lỗi xử lý file {os.path.basename(fp)}: {str(e)}")
+                    # Dọn dẹp nếu lỗi
+                    for t in temp_ts_files:
+                        if os.path.exists(t): os.remove(t)
+                    return
+
+            self.progress_msg.emit(f"⚡ Đang ráp mạch phim phần {i+1}/{total_tasks}: {out_name}...")
+            
+            # 2. Tạo danh sách các file TS để nối
+            list_txt_path = os.path.join(self.movie_folder, f"merge_list_{i}.txt")
+            try:
+                with open(list_txt_path, 'w', encoding='utf-8') as f:
+                    for tp in temp_ts_files:
+                        f.write(f"file '{tp.replace(os.sep, '/')}'\n")
+            except Exception as e:
+                self.error_signal.emit(f"Lỗi tạo file danh sách: {str(e)}")
+                for t in temp_ts_files:
+                    if os.path.exists(t): os.remove(t)
+                return
+
+            # 3. Nối các file TS và xuất ngược ra MP4
+            final_output = os.path.join(self.movie_folder, out_name)
+            # Lưu ý: cần filter -bsf:a aac_adtstoasc để tránh lỗi âm thanh khi từ TS sang MP4
+            cmd = [ffmpeg_path, '-y', '-f', 'concat', '-safe', '0', '-i', list_txt_path, '-c', 'copy', '-bsf:a', 'aac_adtstoasc', final_output]
+
+            try:
+                result = subprocess.run(cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                
+                # 4. Dọn dẹp file danh sách và các file TS tạm
+                if os.path.exists(list_txt_path): 
+                    os.remove(list_txt_path)
+                for t in temp_ts_files:
+                    if os.path.exists(t): os.remove(t)
+                
+                # 5. Nếu gộp thành công, xóa các file MP4 tập lẻ đi
+                if result.returncode == 0:
+                    for fp in files_to_merge:
+                        try:
+                            if os.path.exists(fp): os.remove(fp)
+                        except: pass
+                else:
+                    self.error_signal.emit(f"FFmpeg thất bại ở file {out_name}. Code: {result.returncode}")
+                    return
+            except Exception as e:
+                self.error_signal.emit(str(e))
+                return
+
+        self.finished_signal.emit()
+
+# ==========================================
+# CÁC LUỒNG XỬ LÝ NỀN (THREADS)
 # ==========================================
 class HotMoviesLoadThread(QThread):
     item_loaded_signal = pyqtSignal(dict)
@@ -69,15 +181,12 @@ class HotMoviesLoadThread(QThread):
         except Exception:
             self.finished_signal.emit()
 
-# ==========================================
-# THREAD 1B: TẢI BỔ SUNG ẢNH BÌA CHO LỊCH SỬ (chạy nền, không đứng UI)
-# ==========================================
 class HistoryCoverThread(QThread):
     cover_ready = pyqtSignal(int, bytes)
 
     def __init__(self, jobs, covers_dir):
         super().__init__()
-        self.jobs = jobs  # list các (row, series_id, cover_url) còn thiếu ảnh
+        self.jobs = jobs  
         self.covers_dir = covers_dir
 
     def run(self):
@@ -93,9 +202,6 @@ class HistoryCoverThread(QThread):
                     self.cover_ready.emit(row, r.content)
             except Exception: pass
 
-# ==========================================
-# THREAD 2: TÌM KIẾM PHIM THEO TÊN
-# ==========================================
 class SearchMoviesThread(QThread):
     results_signal = pyqtSignal(list)
     error_signal = pyqtSignal(str)
@@ -118,9 +224,6 @@ class SearchMoviesThread(QThread):
             else: self.error_signal.emit(f"Máy chủ trả về mã lỗi: {res.status_code}")
         except Exception as e: self.error_signal.emit(str(e))
 
-# ==========================================
-# THREAD 3: MÁY KHÁCH TỰ QUÉT LINK
-# ==========================================
 class HonggouScanThread(QThread):
     scan_result = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
@@ -183,32 +286,33 @@ class HonggouScanThread(QThread):
             if json_match:
                 try:
                     data = json.loads(json_match.group(1))
-                    detail = data.get("loaderData", {}).get("detail_page", {}).get("seriesDetail", None)
+                    detail = data.get("loaderData", {}).get("detail_page", {}).get("seriesDetail", {})
                 except json.JSONDecodeError: pass
 
             if not detail:
                 self.error_signal.emit("Không bóc tách được dữ liệu. Vui lòng kiểm tra lại link.")
                 return
 
-            series_id = str(detail.get("series_id", ""))
-            title = detail.get("series_name", "")
-            cover_url = detail.get("series_cover", "")
+            series_id = str(detail.get("series_id") or "")
+            title = detail.get("series_name") or "Phim không rõ tên"
+            cover_url = detail.get("series_cover") or ""
 
             total_episodes = 0
-            right_text = detail.get("episode_right_text", "")
+            right_text = detail.get("episode_right_text") or ""
             if right_text:
                 num_match = re.search(r'(\d+)', right_text)
                 if num_match: total_episodes = int(num_match.group(1))
             if total_episodes == 0:
-                vid_list = detail.get("vid_list", [])
+                vid_list = detail.get("vid_list") or []
                 if isinstance(vid_list, list) and len(vid_list) > 0: total_episodes = len(vid_list)
             if total_episodes == 0:
-                total_episodes = int(detail.get("episode_cnt", 0))
+                total_episodes = int(detail.get("episode_cnt") or 0)
 
             payload = {
                 "url": self.url, "series_id": series_id, "expected_total": total_episodes,
                 "title": title, "cover_url": cover_url
             }
+            
             res = requests.post(f"{SERVER_URL}/api/client/add_job", json=payload, headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=10)
             
             if res.status_code == 200:
@@ -217,14 +321,17 @@ class HonggouScanThread(QThread):
                 data["cover_url"] = cover_url
                 data["total_episodes"] = total_episodes
                 self.scan_result.emit(data)
-            else: self.error_signal.emit("Lỗi kết nối đến máy chủ điều phối!")
+            else: 
+                err_msg = res.text
+                try: err_msg = res.json().get("detail", res.text)
+                except: pass
+                self.error_signal.emit(f"Máy chủ từ chối (Mã {res.status_code}):\n{err_msg}")
 
-        except requests.exceptions.RequestException as e: self.error_signal.emit(f"Lỗi kết nối web: {str(e)}")
-        except Exception as e: self.error_signal.emit(f"Lỗi quét link: {str(e)}")
+        except requests.exceptions.RequestException as e: 
+            self.error_signal.emit(f"Lỗi kết nối web gốc: {str(e)}")
+        except Exception as e: 
+            self.error_signal.emit(f"Lỗi quét link: {str(e)}")
 
-# ==========================================
-# THREAD 4: THEO DÕI TRẠNG THÁI REAL-TIME
-# ==========================================
 class JobStatusMonitorThread(QThread):
     update_signal = pyqtSignal(dict)
 
@@ -245,329 +352,310 @@ class JobStatusMonitorThread(QThread):
                         self.running = False
                         break
             except: pass
-            time.sleep(3)
+            time.sleep(5) 
 
     def stop(self): self.running = False
 
-# ==========================================
-# THREAD 5: LUỒNG TẢI 1 FILE MP4 TỪ GOOGLE DRIVE
-# ==========================================
-class SingleDriveDownloadThread(QThread):
-    progress_signal = pyqtSignal(int, int, float)  
-    done_signal = pyqtSignal(int, str)              
-    error_signal = pyqtSignal(int, str)             
+class StreamDownloadThread(QThread):
+    link_ready_signal = pyqtSignal(dict)  
+    error_signal = pyqtSignal(str)
+    all_done_signal = pyqtSignal()
 
-    def __init__(self, ep_data, save_folder):
+    def __init__(self, payload, auth_token):
+        super().__init__()
+        self.payload = payload
+        self.auth_token = auth_token
+
+    def run(self):
+        try:
+            url = f"{SERVER_URL}/api/client/stream_download_links"
+            headers = {"Authorization": f"Bearer {self.auth_token}", "Content-Type": "application/json"}
+            
+            with requests.post(url, json=self.payload, headers=headers, timeout=180, stream=True) as resp:
+                if resp.status_code != 200:
+                    try: 
+                        err_data = resp.json()
+                        err_msg = err_data.get("message") or err_data.get("detail", "Lỗi thanh toán hoặc lấy link")
+                    except: 
+                        err_msg = f"Máy chủ trả về lỗi: {resp.status_code}"
+                    self.error_signal.emit(err_msg)
+                    return
+
+                for line in resp.iter_lines():
+                    if line:
+                        decoded_line = line.decode('utf-8').strip()
+                        if decoded_line.startswith("data: "):
+                            json_str = decoded_line[6:] 
+                            try:
+                                data = json.loads(json_str)
+                                
+                                if data.get("error"):
+                                    self.error_signal.emit(data.get("error"))
+                                    return
+                                    
+                                if data.get("status") == "stream_finished":
+                                    break
+                                    
+                                if ("url" in data or data.get("status") == "error") and "episode_number" in data:
+                                    self.link_ready_signal.emit(data)
+                            except json.JSONDecodeError:
+                                continue
+                                
+            self.all_done_signal.emit()
+            
+        except Exception as e:
+            self.error_signal.emit(f"Lỗi kết nối lấy link:\n{str(e)}")
+
+# ==========================================
+# THREAD CẦU CỨU LINK CHẾT TỰ ĐỘNG
+# ==========================================
+class RetryDeadLinkThread(QThread):
+    new_link_signal = pyqtSignal(dict)
+    
+    def __init__(self, username, job_id, series_id, episode_number, auth_token):
+        super().__init__()
+        self.username = username
+        self.job_id = job_id
+        self.series_id = series_id
+        self.episode_number = episode_number
+        self.auth_token = auth_token
+        
+    def run(self):
+        try:
+            url = f"{SERVER_URL}/api/client/retry_dead_link"
+            payload = {
+                "username": self.username,
+                "job_id": self.job_id,
+                "series_id": self.series_id,
+                "episode_number": self.episode_number
+            }
+            res = requests.post(url, json=payload, headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=60)
+            if res.status_code == 200:
+                self.new_link_signal.emit(res.json())
+            else:
+                self.new_link_signal.emit({"status": "error", "episode_number": self.episode_number, "message": f"Server lỗi {res.status_code}"})
+        except Exception as e:
+            self.new_link_signal.emit({"status": "error", "episode_number": self.episode_number, "message": str(e)[:30]})
+
+class SingleDriveDownloadThread(QThread):
+    progress_signal = pyqtSignal(int, int, float)
+    done_signal = pyqtSignal(int, str)
+    error_signal = pyqtSignal(int, str)
+    dead_link_signal = pyqtSignal(int)
+
+    def __init__(self, ep_data, save_folder, auth_token, session):
         super().__init__()
         self.ep_data = ep_data
         self.save_folder = save_folder
-
-    def _extract_file_id(self, drive_link):
-        match_web = re.search(r'/d/([a-zA-Z0-9_-]+)', drive_link)
-        if match_web: return match_web.group(1)
-        match_dl = re.search(r'id=([a-zA-Z0-9_-]+)', drive_link)
-        if match_dl: return match_dl.group(1)
-        return None
-
-    def _download_direct(self, ep_num, url, save_path):
-        """Tải thẳng qua HTTP (dùng cho presigned URL từ R2). Thử tối đa 3 lần."""
-        for attempt in range(3):
-            try:
-                with requests.get(url, stream=True, timeout=30) as resp:
-                    if resp.status_code == 403:
-                        self.error_signal.emit(ep_num, "Link tải đã hết hạn - hãy quét lại phim")
-                        return
-                    resp.raise_for_status()
-                    total_size = int(resp.headers.get('content-length', 0))
-                    downloaded = 0
-                    start_time = time.time()
-                    with open(save_path, 'wb') as f:
-                        for chunk in resp.iter_content(chunk_size=1024 * 512):
-                            if chunk:
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                                elapsed = time.time() - start_time
-                                speed = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                                percent = int(downloaded * 100 / total_size) if total_size > 0 else 0
-                                self.progress_signal.emit(ep_num, percent, speed)
-                self.done_signal.emit(ep_num, save_path)
-                return
-            except Exception as e:
-                if attempt < 2: time.sleep(2); continue
-                self.error_signal.emit(ep_num, f"Lỗi: {str(e)}")
-
-    def _is_quota_page(self, text):
-        # Các câu Google thực sự dùng trong trang báo hết quota (Anh + Việt)
-        markers = [
-            "Too many users have viewed or downloaded",
-            "quá nhiều người dùng đã xem hoặc tải",
-            "downloadQuotaExceeded",
-            "exceeded the download quota",
-        ]
-        return any(m in text for m in markers)
+        self.auth_token = auth_token
+        self.session = session  
 
     def run(self):
-        ep_num = self.ep_data["episode_number"]
-        raw_file_name = self.ep_data.get("file_name", f"Tap_{ep_num}.mp4")
-        safe_file_name = re.sub(r'[\\/*?:"<>|]', "", raw_file_name)
-        save_path = os.path.join(self.save_folder, safe_file_name)
-
-        drive_link = self.ep_data.get("drive_link", "")
-
-        # LINK R2/HTTP TRỰC TIẾP (presigned URL từ server): tải thẳng, không cần confirm gì
-        if drive_link.startswith("http") and "drive.google.com" not in drive_link:
-            self._download_direct(ep_num, drive_link, save_path)
-            return
-
-        file_id = self._extract_file_id(drive_link)
+        ep_num = self.ep_data.get("episode_number")
+        try:
+            ep_int = int(ep_num)
+            file_name = self.ep_data.get("file_name", f"Tap_{ep_int:02d}.mp4")
+        except:
+            file_name = self.ep_data.get("file_name", f"Tap_{ep_num}.mp4")
+            
+        url = self.ep_data.get("drive_link")
         
-        if not file_id:
-            self.error_signal.emit(ep_num, "Link rỗng hoặc sai định dạng")
+        if not url or "error" in url.lower() or "status" in url.lower():
+            self.dead_link_signal.emit(ep_num)
             return
+            
+        file_path = os.path.join(self.save_folder, file_name)
+        part_path = file_path + ".part"  
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 1024:
+                self.done_signal.emit(ep_num, file_path)
+                return
 
-        for attempt in range(3):
             try:
-                URL = "https://drive.google.com/uc?export=download"
-                session = requests.Session()
-
-                # Ngụy trang thành trình duyệt Chrome thật để không bị Google block bot
-                session.headers.update({
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                })
-
-                # 1. Gửi request đầu tiên
-                resp = session.get(URL, params={'id': file_id}, stream=True, timeout=30)
-
-                # 2. Nếu Google trả về trang HTML (trang xác nhận hoặc trang lỗi)
-                if 'text/html' in resp.headers.get('Content-Type', ''):
-                    text = resp.text
-
-                    # Chỉ báo quota khi có đúng dấu hiệu quota thật của Google
-                    # (tránh bắt nhầm chữ "giới hạn"/"quota" chung chung trong trang xác nhận)
-                    if self._is_quota_page(text):
-                        self.error_signal.emit(ep_num, "Lỗi: Quá giới hạn lượt tải 24h của Drive")
-                        return
-
-                    # FLOW MỚI CỦA DRIVE: trang xác nhận file lớn là 1 <form>
-                    # trỏ tới drive.usercontent.google.com/download kèm các input ẩn
-                    m_action = re.search(r'<form[^>]+action="([^"]+)"', text)
-                    hidden_inputs = dict(re.findall(
-                        r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', text))
-                    if m_action and hidden_inputs.get("id"):
-                        form_url = m_action.group(1).replace("&amp;", "&")
-                        resp = session.get(form_url, params=hidden_inputs, stream=True, timeout=30)
-                    else:
-                        # FLOW CŨ: token trong cookie hoặc confirm= trong HTML
-                        token = None
-                        for key, value in resp.cookies.items():
-                            if key.startswith('download_warning'):
-                                token = value
-                                break
-                        if not token:
-                            match = re.search(r'confirm=([0-9A-Za-z_-]+)', text)
-                            token = match.group(1) if match else 't'
-                        resp = session.get(URL, params={'id': file_id, 'confirm': token}, stream=True, timeout=30)
-
-                # 3. CHỐT CHẶN: Ngăn lưu HTML thành file MP4
-                final_content_type = resp.headers.get('Content-Type', '')
-                if 'text/html' in final_content_type:
-                    text = resp.text
-                    # Lưu trang lỗi ra file để chẩn đoán khi khách báo lỗi
-                    try:
-                        debug_path = save_path + ".error.html"
-                        with open(debug_path, 'w', encoding='utf-8') as df:
-                            df.write(text)
-                    except Exception:
-                        pass
-                    if self._is_quota_page(text):
-                        self.error_signal.emit(ep_num, "Lỗi: Quá giới hạn lượt tải 24h của Drive")
-                    else:
-                        self.error_signal.emit(ep_num, "Bị Google Drive chặn (xem file .error.html trong thư mục tải)")
-                    return
-
+                if attempt > 0:
+                    self.progress_signal.emit(ep_num, -2, float(attempt))
+                    time.sleep(2)  
+                
+                self.progress_signal.emit(ep_num, 0, 0.0)
+                
+                resp = self.session.get(url, stream=True, timeout=30)
                 resp.raise_for_status()
-                total_size = int(resp.headers.get('content-length', 0))
+                
+                content_type = resp.headers.get('Content-Type', '').lower()
+                if 'video' not in content_type and 'application/octet-stream' not in content_type:
+                    raise Exception(f"Bị chặn/Hết hạn (Content-Type: {content_type})")
+                
+                total = int(resp.headers.get('content-length', 0))
                 downloaded = 0
                 start_time = time.time()
-
-                with open(save_path, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=1024 * 512):
+                
+                with open(part_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=65536):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
-                            elapsed = time.time() - start_time
-                            speed = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                            percent = int(downloaded * 100 / total_size) if total_size > 0 else 0
-                            self.progress_signal.emit(ep_num, percent, speed)
-
-                self.done_signal.emit(ep_num, save_path)
-                return 
+                            if total > 0:
+                                pct = int(downloaded * 100 / total)
+                                elapsed = time.time() - start_time
+                                speed = (downloaded / 1024 / 1024) / elapsed if elapsed > 0 else 0
+                                self.progress_signal.emit(ep_num, pct, speed)
+                
+                if os.path.exists(part_path):
+                    os.rename(part_path, file_path)
+                    self.done_signal.emit(ep_num, file_path)
+                    return
+                else:
+                    raise Exception("Không ghi được file hệ thống")
+                    
             except Exception as e:
-                if attempt < 2: time.sleep(2); continue
-                self.error_signal.emit(ep_num, f"Lỗi: {str(e)}")
+                if os.path.exists(part_path):
+                    try: os.remove(part_path)
+                    except: pass
+                
+                if attempt == max_retries - 1:
+                    self.dead_link_signal.emit(ep_num)
+                    return
 
-# ==========================================
-# TRÌNH QUẢN LÝ TẢI SONG SONG
-# ==========================================
 class DriveDownloadManager(QObject):
     progress_signal = pyqtSignal(int, int, float)  
     done_signal = pyqtSignal(int, str)              
     error_signal = pyqtSignal(int, str)             
     all_done_signal = pyqtSignal(int)               
+    dead_link_signal = pyqtSignal(int)
 
-    def __init__(self, episodes, save_folder, parent=None, max_concurrent=None):
+    def __init__(self, episodes, save_folder, auth_token, parent=None, max_concurrent=None, expected_total=0):
         super().__init__(parent)
         self._pending = list(episodes)
         self.save_folder = save_folder
+        self.auth_token = auth_token
         self._workers = []         
         self._success_count = 0
         self._finished_count = 0
-        self._total = len(episodes)
+        self.expected_total = expected_total  
         self.max_concurrent = max_concurrent or MAX_CONCURRENT_DOWNLOADS
+        
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://hongguoduanju.com/",
+            "Accept": "*/*",
+            "Connection": "keep-alive"
+        })
 
     def start(self):
         for _ in range(min(self.max_concurrent, len(self._pending))):
             self._launch_next()
 
+    def add_and_run_episode(self, ep_data):
+        self._pending.append(ep_data)
+        if len([w for w in self._workers if w.isRunning()]) < self.max_concurrent:
+            self._launch_next()
+
     def _launch_next(self):
         if not self._pending: return
         ep_data = self._pending.pop(0)
-        worker = SingleDriveDownloadThread(ep_data, self.save_folder)
+        worker = SingleDriveDownloadThread(ep_data, self.save_folder, self.auth_token, self.session)
         worker.progress_signal.connect(self.progress_signal.emit)
         worker.done_signal.connect(self._on_worker_done)
         worker.error_signal.connect(self._on_worker_error)
+        worker.dead_link_signal.connect(self._on_worker_dead_link)
         self._workers.append(worker)
         worker.start()
+
+    def _check_all_done(self):
+        if self._finished_count >= self.expected_total:
+            self.all_done_signal.emit(self._success_count)
 
     def _on_worker_done(self, ep_num, file_path):
         self._success_count += 1
         self._finished_count += 1
         self.done_signal.emit(ep_num, file_path)
         self._launch_next()
-        if self._finished_count >= self._total: self.all_done_signal.emit(self._success_count)
+        self._check_all_done()
 
     def _on_worker_error(self, ep_num, error_msg):
         self._finished_count += 1
         self.error_signal.emit(ep_num, error_msg)
         self._launch_next()
-        if self._finished_count >= self._total: self.all_done_signal.emit(self._success_count)
+        self._check_all_done()
+
+    def _on_worker_dead_link(self, ep_num):
+        self.dead_link_signal.emit(ep_num)
+        self._launch_next() 
 
 # ==========================================
 # GIAO DIỆN CHÍNH: HONGGOU WIDGET
 # ==========================================
 class HonggouWidget(QWidget):
-    def __init__(self, username):
-        super().__init__()
+    balance_changed = pyqtSignal(int)
+
+    def __init__(self, username, parent=None):
+        super().__init__(parent)
         self.username = username
-        self.current_job_id = None
-        self.current_series_id = "" 
-        self.current_title = ""     
-        self.current_cover_url = "" 
-        self.current_episodes = []
-        self.monitor_thread = None
-        self.is_first_movie = True 
-        
         self.settings = QSettings("HongguoDownloader", "ClientApp")
-        self._cached_history_ids = set() 
         self.auth_token = self.settings.value("auth_token", "")
-        default_folder = os.path.join(os.path.expanduser("~"), "Desktop", "Hongguo_Downloads")
-        self.save_folder = self.settings.value(f"download_folder_{username}", default_folder)
-        os.makedirs(self.save_folder, exist_ok=True)
+        
+        self.current_series_id = ""
+        self.current_job_id = ""
+        self.current_episodes = []
+        self.current_title = ""
+        self.current_cover_url = ""
+        self.monitor_thread = None
+        self._active_threads = []
+        
+        default_dl = os.path.join(os.path.expanduser("~"), "Downloads")
+        self.save_folder = self.settings.value(f"download_folder_{self.username}", default_dl)
+        if not os.path.exists(self.save_folder):
+            try: os.makedirs(self.save_folder)
+            except: self.save_folder = default_dl
+            
         self._setup_ui()
         self.load_hot_movies_shelf()
 
-    def _get_history_file(self): return os.path.join(os.path.expanduser("~"), f".hongguo_history_{self.username}.json")
-
-    def _load_history(self):
-        history_file = self._get_history_file()
-        if os.path.exists(history_file):
-            try:
-                with open(history_file, 'r', encoding='utf-8') as f: return json.load(f)
-            except: return []
-        return []
-
-    def _keep_thread_alive(self, t):
-        """Giữ tham chiếu thread nền tới khi nó tự chạy xong.
-        Nếu gán đè biến khi thread cũ còn chạy, Python dọn rác thread đang chạy -> Qt sập cả app."""
-        if not hasattr(self, '_bg_threads'): self._bg_threads = []
-        self._bg_threads.append(t)
-        def _cleanup():
-            try: self._bg_threads.remove(t)
-            except ValueError: pass
-        t.finished.connect(_cleanup)
+    def _keep_thread_alive(self, thread):
+        self._active_threads.append(thread)
+        thread.finished.connect(lambda: self._active_threads.remove(thread) if thread in self._active_threads else None)
 
     def _get_covers_dir(self):
         d = os.path.join(os.path.expanduser("~"), ".hongguo_covers")
-        try: os.makedirs(d, exist_ok=True)
-        except Exception: pass
+        os.makedirs(d, exist_ok=True)
         return d
+        
+    def get_covers_dir(self):
+        return self._get_covers_dir()
 
-    def _save_to_history(self, series_id, title, cover_url, total_eps=0, cover_bytes=None):
-        if not series_id: return
-        # Lưu ảnh bìa xuống máy 1 lần -> lịch sử luôn có hình, kể cả offline
-        try:
-            cover_path = os.path.join(self._get_covers_dir(), f"{series_id}.img")
-            if not os.path.exists(cover_path):
-                if not cover_bytes and cover_url:
-                    try:
-                        u = 'https:' + cover_url if cover_url.startswith('//') else cover_url
-                        r = requests.get(u, timeout=6, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://hongguoduanju.com/"})
-                        if r.status_code == 200: cover_bytes = r.content
-                    except Exception: pass
-                if cover_bytes:
-                    with open(cover_path, 'wb') as f: f.write(cover_bytes)
-        except Exception: pass
-        history_file = self._get_history_file()
-        history = self._load_history()
-        old_entry = next((h for h in history if h.get('series_id') == series_id), None)
-        history = [h for h in history if h.get('series_id') != series_id]
-        if not total_eps and old_entry: total_eps = old_entry.get('total_episodes', 0)
-        history.insert(0, {
-            "series_id": series_id,
-            "title": title if title else "Phim không rõ tên",
-            "cover_url": cover_url,
-            "total_episodes": total_eps,
-            "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M")
-        })
-        try:
-            with open(history_file, 'w', encoding='utf-8') as f: json.dump(history, f, ensure_ascii=False, indent=2)
-            self._cached_history_ids.add(str(series_id))
-        except: pass
-        self._remove_from_scan_history(series_id)
-        try: self._render_history_sidebar()
-        except Exception: pass
+    def _get_history_file(self):
+        return os.path.join(os.path.expanduser("~"), f".hongguo_scan_history_{self.username}.json")
 
-    # ==========================================
-    # LỊCH SỬ QUÉT (CHƯA TẢI) - tự xóa sau 30 phút
-    # ==========================================
-    def _get_scan_history_file(self): return os.path.join(os.path.expanduser("~"), f".hongguo_scan_history_{self.username}.json")
-
-    def _load_scan_history(self):
-        f = self._get_scan_history_file()
+    def _load_history(self):
+        f = self._get_history_file()
         items = []
         if os.path.exists(f):
             try:
                 with open(f, 'r', encoding='utf-8') as fh: items = json.load(fh)
             except Exception: items = []
         now = time.time()
-        alive = [it for it in items if now - it.get('ts', 0) < 1800]  # 30 phút
+        # Chỉ xóa các mục chưa tải (không có downloaded=True) sau 30 phút; mục đã tải giữ lại vĩnh viễn
+        alive = [it for it in items if it.get('downloaded') or (now - it.get('ts', 0) < 1800)]
         if len(alive) != len(items):
             try:
                 with open(f, 'w', encoding='utf-8') as fh: json.dump(alive, fh, ensure_ascii=False, indent=2)
             except Exception: pass
         return alive
 
-    def _save_to_scan_history(self, series_id, title, cover_url, total_eps=0, cover_bytes=None):
+    def _save_to_history(self, series_id, title, cover_url, total_eps=0, cover_bytes=None, downloaded=False):
         if not series_id: return
         series_id = str(series_id)
-        # Đã nằm trong lịch sử TẢI rồi thì không cần nhắc "chưa tải"
         if series_id in getattr(self, '_cached_history_ids', set()): return
         try:
-            cover_path = os.path.join(self._get_covers_dir(), f"{series_id}.img")
+            cover_path = os.path.join(self.get_covers_dir(), f"{series_id}.img")
             if cover_bytes and not os.path.exists(cover_path):
                 with open(cover_path, 'wb') as f: f.write(cover_bytes)
         except Exception: pass
-        items = self._load_scan_history()
+        
+        items = self._load_history()
         items = [it for it in items if str(it.get('series_id')) != series_id]
         items.insert(0, {
             "series_id": series_id,
@@ -575,21 +663,22 @@ class HonggouWidget(QWidget):
             "cover_url": cover_url,
             "total_episodes": total_eps,
             "ts": time.time(),
-            "timestamp": datetime.now().strftime("%H:%M")
+            "timestamp": datetime.now().strftime("%H:%M %d/%m/%Y"),
+            "downloaded": downloaded
         })
         items = items[:20]
         try:
-            with open(self._get_scan_history_file(), 'w', encoding='utf-8') as fh: json.dump(items, fh, ensure_ascii=False, indent=2)
+            with open(self._get_history_file(), 'w', encoding='utf-8') as fh: json.dump(items, fh, ensure_ascii=False, indent=2)
         except Exception: pass
         try: self._render_history_sidebar()
         except Exception: pass
 
-    def _remove_from_scan_history(self, series_id):
+    def _remove_from_history(self, series_id):
         try:
-            items = self._load_scan_history()
+            items = self._load_history()
             new_items = [it for it in items if str(it.get('series_id')) != str(series_id)]
             if len(new_items) != len(items):
-                with open(self._get_scan_history_file(), 'w', encoding='utf-8') as fh: json.dump(new_items, fh, ensure_ascii=False, indent=2)
+                with open(self._get_history_file(), 'w', encoding='utf-8') as fh: json.dump(new_items, fh, ensure_ascii=False, indent=2)
         except Exception: pass
 
     def _setup_ui(self):
@@ -621,7 +710,6 @@ class HonggouWidget(QWidget):
 
         self.content_stack = QStackedWidget()
 
-        # ===== PANEL LỊCH SỬ TẢI - cột dọc cố định bên phải =====
         self.history_panel = QWidget()
         self.history_panel.setFixedWidth(240)
         hp_layout = QVBoxLayout(self.history_panel)
@@ -690,13 +778,11 @@ class HonggouWidget(QWidget):
         self.btn_back.clicked.connect(self._go_back)
         btn_back_layout = QHBoxLayout(); btn_back_layout.addWidget(self.btn_back); btn_back_layout.addStretch()
 
-        # Huy hiệu "ĐÃ TẢI RỒI" - chỉ hiện khi bộ phim đã nằm trong lịch sử tải
         self.lbl_downloaded_badge = QLabel("✅ BỘ NÀY ĐÃ TẢI RỒI")
         self.lbl_downloaded_badge.setStyleSheet("QLabel { background-color: #064e3b; color: #34d399; font-weight: bold; font-size: 13px; padding: 8px 14px; border-radius: 8px; border: 1px solid #10b981; }")
         self.lbl_downloaded_badge.hide()
         btn_back_layout.addWidget(self.lbl_downloaded_badge)
 
-        # Chọn số luồng tải song song (ghi nhớ lựa chọn)
         lbl_threads = QLabel("⚡ Luồng tải:")
         lbl_threads.setStyleSheet("color: #94a3b8; font-size: 13px; padding-left: 12px;")
         btn_back_layout.addWidget(lbl_threads)
@@ -708,7 +794,6 @@ class HonggouWidget(QWidget):
         self.threads_combo.setStyleSheet("QComboBox { background: #1f2937; color: #f8fafc; border: 1px solid #374151; border-radius: 6px; padding: 6px 12px; font-weight: bold; } QComboBox QAbstractItemView { background: #1f2937; color: #f8fafc; selection-background-color: #2563eb; }")
         btn_back_layout.addWidget(self.threads_combo)
 
-        # Mở thư mục chứa đúng bộ phim đang xem
         self.btn_open_folder = QPushButton("📂 Thư mục phim")
         self.btn_open_folder.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_open_folder.setStyleSheet("QPushButton { padding: 8px 15px; background-color: transparent; color: #38bdf8; border: 1px solid #374151; border-radius: 6px; font-weight: bold; } QPushButton:hover { background-color: #1e293b; border: 1px solid #38bdf8; }")
@@ -728,12 +813,38 @@ class HonggouWidget(QWidget):
 
         self.table = QTableWidget(); self.table.setColumnCount(4); self.table.setHorizontalHeaderLabels(["Chọn Tập", "", "Tên File", "Trạng Thái Link"])
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(0, 90); self.table.setColumnWidth(1, 50); self.table.setColumnWidth(3, 150)
+        self.table.setColumnWidth(0, 90); self.table.setColumnWidth(1, 50); self.table.setColumnWidth(3, 170)
         self.table.verticalHeader().setVisible(False); self.table.setShowGrid(False); self.table.setAlternatingRowColors(True); self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus); self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.table.setIconSize(QSize(40, 50))  
         self.table.setStyleSheet("QTableWidget { background-color: #111827; alternate-background-color: #1f2937; color: #e2e8f0; border: 1px solid #374151; border-radius: 8px; outline: none; margin-top: 10px; font-size: 13px; } QHeaderView::section { background-color: #0f172a; color: #94a3b8; padding: 12px; font-weight: bold; border: none; border-bottom: 1px solid #374151; } QTableWidget::item { padding: 6px; border-bottom: 1px solid transparent; } QTableWidget::item:hover { background-color: #334155; } QTableWidget::indicator { width: 18px; height: 18px; border: 2px solid #475569; border-radius: 4px; } QTableWidget::indicator:checked { background-color: #10b981; border-color: #10b981; } QScrollBar:vertical { border: none; background: #111827; width: 8px; margin: 0px; } QScrollBar::handle:vertical { background: #374151; border-radius: 4px; min-height: 20px; } QScrollBar::handle:vertical:hover { background: #4b5563; }")
         detail_layout.addWidget(self.table)
 
         bottom_layout = QHBoxLayout()
+
+        # ------------------- TÙY CHỌN GỘP FILE -------------------
+        merge_layout = QVBoxLayout()
+        self.merge_mode_combo = QComboBox()
+        self.merge_mode_combo.addItems([
+            "Không gộp (Từng tập rời)",
+            "Gộp tất cả thành 1 file",
+            "Gộp theo nhóm (Tách nhiều phần)"
+        ])
+        self.merge_mode_combo.setStyleSheet("QComboBox { background: #1f2937; color: #f8fafc; border: 1px solid #374151; border-radius: 6px; padding: 6px; font-weight: bold; }")
+
+        self.chunk_spinbox = QSpinBox()
+        self.chunk_spinbox.setRange(2, 200)
+        self.chunk_spinbox.setValue(10)
+        self.chunk_spinbox.setPrefix("Gộp ")
+        self.chunk_spinbox.setSuffix(" tập / 1 file")
+        self.chunk_spinbox.setStyleSheet("QSpinBox { background: #1f2937; color: #f8fafc; border: 1px solid #374151; border-radius: 6px; padding: 6px; font-weight: bold; }")
+        self.chunk_spinbox.hide()
+
+        self.merge_mode_combo.currentIndexChanged.connect(
+            lambda idx: self.chunk_spinbox.show() if idx == 2 else self.chunk_spinbox.hide()
+        )
+
+        merge_layout.addWidget(self.merge_mode_combo)
+        merge_layout.addWidget(self.chunk_spinbox)
+
         self.btn_select_all = QPushButton("☑ Chọn / Bỏ chọn tất cả")
         self.btn_select_all.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_select_all.setStyleSheet("QPushButton { padding: 14px; background-color: #4b5563; color: white; border-radius: 8px; font-weight: bold; font-size: 14px; margin-top: 10px; border: none;} QPushButton:hover { background-color: #64748b; }")
@@ -743,11 +854,13 @@ class HonggouWidget(QWidget):
         self.btn_download.setStyleSheet("QPushButton { padding: 14px 30px; background-color: #10b981; color: white; border-radius: 8px; font-weight: bold; font-size: 15px; margin-top: 10px; border: none; } QPushButton:hover { background-color: #059669; } QPushButton:disabled { background-color: #374151; color: #64748b; }")
         self.btn_download.setEnabled(False)
         self.btn_download.clicked.connect(self._download_selected)
-        bottom_layout.addWidget(self.btn_select_all); bottom_layout.addWidget(self.btn_download)
+        bottom_layout.addLayout(merge_layout)
+        bottom_layout.addWidget(self.btn_select_all)
+        bottom_layout.addWidget(self.btn_download)
         detail_layout.addLayout(bottom_layout)
         self.content_stack.addWidget(self.page_detail)
         self._render_history_sidebar()
-        # Mỗi 60s kiểm tra: mục "chưa tải" quá 30 phút sẽ tự biến mất khỏi panel
+
         self._history_timer = QTimer(self)
         self._history_timer.timeout.connect(self._render_history_sidebar)
         self._history_timer.start(60000)
@@ -794,7 +907,7 @@ class HonggouWidget(QWidget):
                 eps_line = f"\n({eps} Tập)" if eps else ""
                 item.setText(f"{title}{eps_line}\n[✅ Đã tải: {time_str}]")
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                # Ảnh bìa: đọc từ máy (đã lưu lúc tải phim); thiếu thì xếp hàng tải nền
+                
                 img_data = None
                 cover_path = os.path.join(covers_dir, f"{h.get('series_id')}.img")
                 if os.path.exists(cover_path):
@@ -844,12 +957,11 @@ class HonggouWidget(QWidget):
             item.setIcon(QIcon(pixmap))
 
     def _render_history_sidebar(self):
-        """Vẽ panel Lịch Sử Tải bên phải: ảnh bìa nhỏ + tên + số tập + ngày tải."""
         if not hasattr(self, 'history_list'): return
         history = self._load_history()
         downloaded_ids = {str(h.get('series_id')) for h in history}
-        scanned = [s for s in self._load_scan_history() if str(s.get('series_id')) not in downloaded_ids]
-        # Không có gì đổi -> giữ nguyên panel, không vẽ lại (chống lag)
+        scanned = [s for s in self._load_history() if str(s.get('series_id')) not in downloaded_ids]
+        
         sig = (tuple((s.get('series_id'), s.get('ts')) for s in scanned),
                tuple((h.get('series_id'), h.get('timestamp'), h.get('total_episodes')) for h in history))
         if sig == getattr(self, '_history_sig', None) and self.history_list.count() > 0:
@@ -864,7 +976,7 @@ class HonggouWidget(QWidget):
             return
         covers_dir = self._get_covers_dir()
         missing = []
-        # ⏳ Phim ĐÃ QUÉT nhưng CHƯA TẢI (nằm trên cùng, chữ cam, tự xóa sau 30 phút)
+        
         merged = [("scan", s) for s in scanned] + [("done", h) for h in history]
         for row, (kind, h) in enumerate(merged):
             item = QListWidgetItem()
@@ -896,7 +1008,6 @@ class HonggouWidget(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, f"https://hongguoduanju.com/detail?series_id={h.get('series_id')}")
             self.history_list.addItem(item)
         if missing:
-            # Thread cũ còn đang tải thì thôi - ảnh sẽ vào cache, lần vẽ sau tự có
             if getattr(self, 'sidebar_cover_thread', None) and self.sidebar_cover_thread.isRunning():
                 return
             self.sidebar_cover_thread = HistoryCoverThread(missing, covers_dir)
@@ -911,7 +1022,6 @@ class HonggouWidget(QWidget):
         if pixmap.loadFromData(img_bytes) and not pixmap.isNull():
             icon = QIcon(pixmap.scaled(52, 70, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
             item.setIcon(icon)
-            # Nạp vào cache để lần vẽ sau không phải đọc lại
             url = item.data(Qt.ItemDataRole.UserRole) or ""
             sid = url.split("series_id=")[-1] if "series_id=" in url else ""
             if sid and hasattr(self, '_sidebar_icon_cache'): self._sidebar_icon_cache[sid] = icon
@@ -919,9 +1029,7 @@ class HonggouWidget(QWidget):
     def _on_history_item_clicked(self, item):
         url = item.data(Qt.ItemDataRole.UserRole)
         if not url: return
-        # Đang quét dở 1 bộ thì bỏ qua click mới (chống spam tạo thread)
         if getattr(self, 'scan_thread', None) and self.scan_thread.isRunning(): return
-        # Đúng bộ đang mở sẵn -> nhảy thẳng vào trang tập, khỏi quét lại (chống lag)
         sid = url.split("series_id=")[-1] if "series_id=" in url else ""
         if sid and sid == str(getattr(self, 'current_series_id', '')) and self.table.rowCount() > 0:
             self.content_stack.setCurrentWidget(self.page_detail)
@@ -943,7 +1051,6 @@ class HonggouWidget(QWidget):
         item.setText(f"{title}\n({eps} Tập){downloaded_tag}")
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         
-        # Chỉ dựa vào Server để vẽ ảnh. Không có = vẽ chữ. Bất tử, không văng app.
         img_data = m.get("img_data")
         if img_data:
             pixmap = QPixmap()
@@ -966,9 +1073,8 @@ class HonggouWidget(QWidget):
         self._scan()
 
     def _go_back(self):
-        if self.monitor_thread: self.monitor_thread.stop()
+        if getattr(self, 'monitor_thread', None): self.monitor_thread.stop()
         self.url_input.clear()
-        # Đang đứng ở tab Lịch Sử Tải -> vẽ lại lịch sử (kèm phim vừa tải xong), không nhảy về kệ phim hot
         if getattr(self, 'current_genre', None) == "HISTORY":
             self.load_hot_movies_shelf("HISTORY")
             return
@@ -1027,7 +1133,7 @@ class HonggouWidget(QWidget):
             self._search_keyword(raw_text)
             return
 
-        if self.monitor_thread: self.monitor_thread.stop()
+        if getattr(self, 'monitor_thread', None): self.monitor_thread.stop()
         raw_url = self._extract_url_from_text(raw_text)
         url = self._normalize_url(raw_url)
         if url != raw_text: self.url_input.setText(url) 
@@ -1125,30 +1231,22 @@ class HonggouWidget(QWidget):
                         self.current_cover_pixmap = pix.scaled(40, 50, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             except: pass
         
-        # Huy hiệu ĐÃ TẢI RỒI
         if hasattr(self, 'lbl_downloaded_badge'):
             if str(self.current_series_id) in getattr(self, '_cached_history_ids', set()): self.lbl_downloaded_badge.show()
             else: self.lbl_downloaded_badge.hide()
 
-        # Ghi vào lịch sử QUÉT để khách nhớ bộ vừa xem (tự xóa sau 30 phút nếu không tải)
         try:
-            self._save_to_scan_history(self.current_series_id, self.current_title, self.current_cover_url,
+            self._save_to_history(self.current_series_id, self.current_title, self.current_cover_url,
                                        total_eps=total_eps or len(self.current_episodes),
                                        cover_bytes=self.current_cover_bytes)
         except Exception: pass
 
         if status == "cache_hit":
-            self.lbl_status.setText(f"✅ Trích xuất thành công từ Nguồn VIP! (Tổng: {total_eps} tập). Bạn có thể chọn tập và lưu ngay.")
-            self.btn_download.setEnabled(True)
-        elif status == "retrying":
-            self.lbl_status.setText(f"⚠️ Hệ thống đang tiến hành trích xuất bổ sung.")
-            self.btn_download.setEnabled(True) 
-        elif status == "processing":
-            self.lbl_status.setText("⏳ Hệ thống đang xử lý phân tích. Link sẽ tự động cập nhật khi có!")
+            self.lbl_status.setText(f"✅ Đã tìm thấy phim trong bộ nhớ tạm! (Tổng: {total_eps} tập).")
             self.btn_download.setEnabled(True)
         else:
-            self.lbl_status.setText(f"🕒 Đã tiếp nhận yêu cầu! Hệ thống chuẩn bị trích xuất {total_eps} tập.")
-            self.btn_download.setEnabled(False)
+            self.lbl_status.setText(f"✅ Quét thành công (Tổng: {total_eps} tập). Bạn có thể chọn tập và tải ngay!")
+            self.btn_download.setEnabled(True)
 
         self._render_table(total_eps, self.current_episodes)
 
@@ -1161,18 +1259,11 @@ class HonggouWidget(QWidget):
     def _on_monitor_update(self, data):
         status = data.get("status")
         total_eps = data.get("total_episodes", self.table.rowCount())
+        # Chốt chặn bảo vệ: Nếu Server trả về 0 tập do lỗi, giữ nguyên số hàng hiện tại
+        if total_eps == 0 and self.table.rowCount() > 0:
+            total_eps = self.table.rowCount()
+            
         self.current_episodes = data.get("episodes", [])
-
-        if status == "completed":
-            self.lbl_status.setText(f"✅ Quá trình phân tích hoàn tất! Nguồn VIP đã sẵn sàng (Tổng: {total_eps} tập).")
-            self.btn_download.setEnabled(True)
-        elif status == "partial":
-            self.lbl_status.setText(f"⚠️ Hệ thống đã trích xuất được một phần. (Hiện có: {len(self.current_episodes)} tập).")
-            self.btn_download.setEnabled(True)
-        elif status == "processing":
-            self.lbl_status.setText(f"⏳ Đang xử lý... Đã trích xuất {len(self.current_episodes)}/{total_eps} tập.")
-            self.btn_download.setEnabled(True)
-
         self._render_table(total_eps, self.current_episodes)
 
     def _render_table(self, total_eps, episodes):
@@ -1189,6 +1280,9 @@ class HonggouWidget(QWidget):
             ep_num = i + 1
             ep_data = next((e for e in episodes if e.get("episode_number") == ep_num), None)
             
+            # Ép tên file hiển thị trên UI chuẩn có số 0
+            file_name = f"Tap_{ep_num:02d}.mp4"
+            
             ep_item = QTableWidgetItem(f" Tập {ep_num}")
             ep_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             ep_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
@@ -1202,32 +1296,30 @@ class HonggouWidget(QWidget):
             if hasattr(self, 'current_cover_pixmap') and self.current_cover_pixmap: thumb_item.setIcon(QIcon(self.current_cover_pixmap))
             self.table.setItem(i, 1, thumb_item)
             
-            if ep_data and ep_data.get("drive_link"):
-                file_item = QTableWidgetItem(ep_data.get("file_name", f"Tap_{ep_num}.mp4"))
-                file_item.setFlags(readonly_flags); file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 2, file_item)
-                # Soi ổ đĩa: tập này đã có file thật trong thư mục phim chưa?
-                safe_name = re.sub(r'[\\/*?:"<>|]', "", ep_data.get("file_name", f"Tap_{ep_num}.mp4"))
-                local_path = os.path.join(movie_folder, safe_name)
-                if os.path.exists(local_path) and os.path.getsize(local_path) > 1024:
-                    link_item = QTableWidgetItem("💾 Đã có trên máy")
-                    link_item.setForeground(QColor("#c084fc"))
-                    _f = link_item.font(); _f.setBold(True); link_item.setFont(_f)
-                else:
-                    link_item = QTableWidgetItem("✅ Sẵn sàng")
-                    link_item.setForeground(QColor("#10b981"))
-                link_item.setFlags(readonly_flags); link_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 3, link_item)
+            file_item = QTableWidgetItem(file_name)
+            file_item.setFlags(readonly_flags); file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 2, file_item)
+
+            safe_name = re.sub(r'[\\/*?:"<>|]', "", file_name)
+            local_path = os.path.join(movie_folder, safe_name)
+            
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 1024:
+                link_item = QTableWidgetItem("💾 Đã có trên máy")
+                link_item.setForeground(QColor("#c084fc"))
+                _f = link_item.font(); _f.setBold(True); link_item.setFont(_f)
+            elif ep_data and ep_data.get("drive_link"):
+                link_item = QTableWidgetItem("☁️ Sẵn sàng (Link R2)")
+                link_item.setForeground(QColor("#10b981"))
             else:
-                file_item = QTableWidgetItem("---")
-                file_item.setFlags(readonly_flags); file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 2, file_item)
-                wait_item = QTableWidgetItem("⏳ Đang đợi")
-                wait_item.setFlags(readonly_flags); wait_item.setForeground(QColor("#f59e0b")); wait_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 3, wait_item)
+                link_item = QTableWidgetItem("⚡ Sẵn sàng (Link Gốc)")
+                link_item.setForeground(QColor("#0ea5e9"))
+                
+            link_item.setFlags(readonly_flags); link_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 3, link_item)
 
     def _toggle_select_all(self):
         def _on_disk(i):
             st = self.table.item(i, 3)
             return bool(st and "Đã có trên máy" in st.text())
 
-        # Chỉ xét các tập CHƯA có trên máy - tập đã tải rồi không bị chọn theo (khỏi mất tiền oan)
         selectable = [i for i in range(self.table.rowCount()) if not _on_disk(i)]
         all_checked = bool(selectable) and all(
             (self.table.item(i, 0) is not None and self.table.item(i, 0).checkState() == Qt.CheckState.Checked)
@@ -1246,52 +1338,157 @@ class HonggouWidget(QWidget):
         if new_state == Qt.CheckState.Checked and skipped:
             self.lbl_status.setText(f"☑ Đã chọn {len(selectable)} tập cần tải (bỏ qua {skipped} tập đã có trên máy).")
 
+    # ==========================================
+    # LOGIC TẢI KHỞI ĐỘNG
+    # ==========================================
     def _download_selected(self):
-        selected_eps = []
+        selected_eps_nums = []
         for i in range(self.table.rowCount()):
             item = self.table.item(i, 0)
             if item and item.checkState() == Qt.CheckState.Checked:
-                ep_num = i + 1
-                ep_data = next((e for e in self.current_episodes if e.get("episode_number") == ep_num), None)
-                if ep_data and ep_data.get("drive_link"): selected_eps.append(ep_data)
+                selected_eps_nums.append(i + 1)
 
-        if not selected_eps:
-            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn (tích) ít nhất 1 tập đã xử lý xong!")
+        if not selected_eps_nums:
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn (tích) ít nhất 1 tập để tải!")
             return
             
         if self.current_series_id in getattr(self, '_cached_history_ids', set()):
             reply = QMessageBox.question(self, "Cảnh báo tải trùng", "Bộ phim này bạn ĐÃ TẢI VỀ máy trước đó rồi!\nBạn có chắc chắn muốn TẢI LẠI và BỊ TRỪ TIỀN không?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.No: return
 
-        num_eps = len(selected_eps)
+        # Dừng hẳn luồng theo dõi (Monitor) để nó không làm mới bảng và xóa mất tiến trình tải
+        if getattr(self, 'monitor_thread', None):
+            self.monitor_thread.stop()
+            self.monitor_thread = None
+
+        self.btn_download.setEnabled(False)
+        self.btn_download.setText("⏳ Đang khởi chạy tải...")
+        self.lbl_status.setText("⏳ Đang gửi yêu cầu giải mã hàng loạt...")
+
         folder_name = self.current_series_id if self.current_series_id else "Phim_Khong_Ro_ID"
         final_save_path = os.path.join(self.save_folder, folder_name)
         os.makedirs(final_save_path, exist_ok=True)
 
-        try:
-            res = requests.post(f"{SERVER_URL}/api/client/pay_for_download", json={"username": self.username, "num_episodes": num_eps}, headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=10)
-            data = res.json()
-            if data.get("status") == "success":
-                self._save_to_history(self.current_series_id, self.current_title, self.current_cover_url,
-                                      total_eps=len(self.current_episodes) or getattr(self, 'current_total_eps', 0),
-                                      cover_bytes=getattr(self, 'current_cover_bytes', None))
-                self.btn_download.setEnabled(False)
-                self.btn_download.setText("⏳ Đang lưu về máy...")
-                self.lbl_status.setText(f"⏳ Đang lưu {num_eps} tập về máy...")
-                self._refresh_balance()
+        self._save_to_history(self.current_series_id, self.current_title, self.current_cover_url,
+                              total_eps=len(self.current_episodes) or getattr(self, 'current_total_eps', 0),
+                              cover_bytes=getattr(self, 'current_cover_bytes', None),
+                              downloaded=True)
 
-                self._dl_finished = 0
-                self.total_progress.setMaximum(num_eps); self.total_progress.setValue(0); self.total_progress.show()
-                try: max_threads = int(self.threads_combo.currentText())
-                except Exception: max_threads = 3
-                self.download_manager = DriveDownloadManager(selected_eps, final_save_path, parent=self, max_concurrent=max_threads)
-                self.download_manager.progress_signal.connect(self._on_download_progress)
-                self.download_manager.done_signal.connect(self._on_episode_downloaded)
-                self.download_manager.error_signal.connect(self._on_download_error)
-                self.download_manager.all_done_signal.connect(self._on_all_downloads_done)
-                self.download_manager.start()
-            else: QMessageBox.critical(self, "Không đủ số dư", data.get("message", "Vui lòng nạp thêm tiền!"))
-        except Exception as e: QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Hệ thống: {e}")
+        num_eps = len(selected_eps_nums)
+        self._dl_finished = 0
+        self.total_progress.setMaximum(num_eps); self.total_progress.setValue(0); self.total_progress.show()
+
+        # Lưu danh sách file sẽ tải để phục vụ ghép sau
+        self.downloaded_file_paths = []
+        for ep_num in selected_eps_nums:
+            fname = f"Tap_{int(ep_num):02d}.mp4"
+            self.downloaded_file_paths.append(os.path.join(final_save_path, fname))
+
+        try: max_threads = int(self.threads_combo.currentText())
+        except Exception: max_threads = 3
+
+        # Bộ đếm lượt xin lại link (Tránh treo app)
+        self.server_retries = {} 
+
+        self.download_manager = DriveDownloadManager(
+            [], 
+            final_save_path, 
+            self.auth_token, 
+            parent=self, 
+            max_concurrent=max_threads, 
+            expected_total=num_eps
+        )
+        self.download_manager.progress_signal.connect(self._on_download_progress)
+        self.download_manager.done_signal.connect(self._on_episode_downloaded)
+        self.download_manager.error_signal.connect(self._on_download_error)
+        self.download_manager.dead_link_signal.connect(self._on_dead_link)
+        self.download_manager.all_done_signal.connect(self._on_all_downloads_done)
+        
+        self._refresh_balance()
+        
+        payload = {
+            "username": self.username,
+            "num_episodes": num_eps,
+            "series_id": self.current_series_id,
+            "episodes": selected_eps_nums,
+            "job_id": self.current_job_id
+        }
+        
+        self.stream_thread = StreamDownloadThread(payload, self.auth_token)
+        self._keep_thread_alive(self.stream_thread)
+        self.stream_thread.link_ready_signal.connect(self._on_stream_link_ready)
+        self.stream_thread.error_signal.connect(self._on_pay_error)
+        self.stream_thread.start()
+
+    def _on_stream_link_ready(self, data):
+        ep_num = data.get("episode_number")
+        url = data.get("url")
+        
+        # Nhận link thành công
+        if ep_num and url:
+            ep_item_data = {
+                "episode_number": ep_num,
+                "file_name": f"Tap_{int(ep_num):02d}.mp4",
+                "drive_link": url,
+                "series_id": self.current_series_id,
+                "job_id": self.current_job_id
+            }
+            self.download_manager.add_and_run_episode(ep_item_data)
+            
+            if self.btn_download.text() == "⏳ Đang khởi chạy tải...":
+                self.btn_download.setText("⏳ Đang lưu về máy...")
+                self.lbl_status.setText("⏳ Đang kéo các tập phim về máy (bằng file .part)...")
+                
+        # Server báo lỗi giải mã -> Hoàn tiền luôn trên UI
+        elif ep_num and data.get("status") == "error":
+            self.download_manager._finished_count += 1
+            self.download_manager.error_signal.emit(int(ep_num), data.get("message", "Lỗi giải mã API"))
+            self.download_manager._check_all_done()
+            self._refresh_balance()
+
+    def _on_dead_link(self, ep_num):
+        retry_count = self.server_retries.get(ep_num, 0)
+        if retry_count >= 2:
+            self.download_manager._finished_count += 1
+            self.download_manager.error_signal.emit(ep_num, "Server không thể phục hồi link.")
+            self.download_manager._check_all_done()
+            return
+            
+        self.server_retries[ep_num] = retry_count + 1
+        
+        row = ep_num - 1
+        if row < self.table.rowCount():
+            status_item = QTableWidgetItem(f"🔄 Đang xin Server cấp lại link...")
+            status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            status_item.setForeground(QColor("#f59e0b"))
+            self.table.setItem(row, 3, status_item)
+            
+        thread = RetryDeadLinkThread(self.username, self.current_job_id, self.current_series_id, ep_num, self.auth_token)
+        self._keep_thread_alive(thread)
+        thread.new_link_signal.connect(self._on_new_link_received)
+        thread.start()
+
+    def _on_new_link_received(self, data):
+        ep_num = data.get("episode_number")
+        if data.get("status") == "success":
+            ep_item_data = {
+                "episode_number": ep_num,
+                "file_name": f"Tap_{int(ep_num):02d}.mp4",
+                "drive_link": data["url"],
+                "series_id": self.current_series_id,
+                "job_id": self.current_job_id
+            }
+            self.download_manager.add_and_run_episode(ep_item_data)
+        else:
+            self.download_manager._finished_count += 1
+            self.download_manager.error_signal.emit(ep_num, data.get("message", "Server từ chối cấp lại link"))
+            self.download_manager._check_all_done()
+
+    def _on_pay_error(self, error_msg):
+        self.btn_download.setEnabled(True)
+        self.btn_download.setText("📥 Tải đã chọn")
+        self.lbl_status.setText("Trạng thái: Lỗi thanh toán/lấy link.")
+        QMessageBox.critical(self, "Lỗi Xử Lý", error_msg)
 
     def _open_movie_folder(self):
         folder = os.path.join(self.save_folder, str(getattr(self, 'current_series_id', '') or ''))
@@ -1306,17 +1503,32 @@ class HonggouWidget(QWidget):
 
     def _refresh_balance(self):
         try:
-            res = requests.get(f"{SERVER_URL}/api/client/balance/{self.username}", headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=5)
+            token = self.auth_token if hasattr(self, 'auth_token') else QSettings("HongguoDownloader", "ClientApp").value("auth_token", "")
+            res = requests.get(f"{SERVER_URL}/api/client/balance/{self.username}", headers={"Authorization": f"Bearer {token}"}, timeout=5)
             if res.status_code == 200:
                 balance = res.json().get("balance", 0)
-                if hasattr(self, 'balance_changed') and self.balance_changed: self.balance_changed(balance)
+                if hasattr(self, 'balance_changed') and self.balance_changed: self.balance_changed.emit(balance)
         except: pass
 
     def _on_download_progress(self, ep_num, percent, speed_mb):
         row = ep_num - 1
         if row < self.table.rowCount():
-            status_item = QTableWidgetItem(f"⬇️ {percent}% ({speed_mb:.1f} MB/s)")
-            status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable); status_item.setForeground(QColor("#38bdf8")); status_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
+            if percent == -1:
+                status_item = QTableWidgetItem(f"🔑 Đang xin Server giải mã...")
+                status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                status_item.setForeground(QColor("#f59e0b"))
+                status_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
+            elif percent == -2:
+                status_item = QTableWidgetItem(f"🔄 Thử lại lần {int(speed_mb)}...")
+                status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                status_item.setForeground(QColor("#f43f5e"))
+                status_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
+            else:
+                status_item = QTableWidgetItem(f"⬇️ {percent}% ({speed_mb:.1f} MB/s)")
+                status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                status_item.setForeground(QColor("#38bdf8"))
+                status_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
+            
             self.table.setItem(row, 3, status_item)
 
     def _on_episode_downloaded(self, ep_num, file_path):
@@ -1338,12 +1550,82 @@ class HonggouWidget(QWidget):
         self._bump_total_progress()
 
     def _on_all_downloads_done(self, total_downloaded):
+        self._refresh_balance()
+
+        mode = self.merge_mode_combo.currentIndex()
+        files_to_merge = getattr(self, 'downloaded_file_paths', [])
+
+        # Nếu không gộp hoặc không đủ file
+        if mode == 0 or len(files_to_merge) <= 1:
+            self.btn_download.setEnabled(True)
+            self.btn_download.setText("📥 Tải đã chọn")
+            self.lbl_status.setText(f"✅ Hoàn tất! Đã lưu {total_downloaded} tập phim lẻ.")
+            if hasattr(self, 'lbl_downloaded_badge'): self.lbl_downloaded_badge.show()
+            QMessageBox.information(self, "Thành công", f"Đã lưu thành công {total_downloaded} tập phim về máy bạn!")
+            return
+
+        # ==========================================
+        # QUÁ TRÌNH GỘP FILE (MERGE)
+        # ==========================================
+        merge_tasks = []
+        safe_title = re.sub(r'[\\/*?:"<>|]', "", self.current_title)
+
+        if mode == 1:
+            merge_tasks.append({
+                "output_name": f"{safe_title} - Trọn Bộ.mp4",
+                "files": files_to_merge
+            })
+        elif mode == 2:
+            chunk_size = self.chunk_spinbox.value()
+            for i in range(0, len(files_to_merge), chunk_size):
+                chunk = files_to_merge[i:i + chunk_size]
+                part_num = (i // chunk_size) + 1
+                if len(chunk) > 1:
+                    merge_tasks.append({
+                        "output_name": f"{safe_title} - Phần {part_num}.mp4",
+                        "files": chunk
+                    })
+                elif len(chunk) == 1:
+                    out_path = os.path.join(self.save_folder, self.current_series_id, f"{safe_title} - Phần {part_num}.mp4")
+                    try:
+                        if os.path.exists(chunk[0]): shutil.move(chunk[0], out_path)
+                    except: pass
+
+        merge_tasks = [t for t in merge_tasks if len(t["files"]) > 1]
+
+        if not merge_tasks:
+            self.btn_download.setEnabled(True)
+            self.btn_download.setText("📥 Tải đã chọn")
+            self.lbl_status.setText("✅ Đã lưu và xử lý xong!")
+            return
+
+        folder_name = self.current_series_id if self.current_series_id else "Phim_Khong_Ro_ID"
+        movie_folder = os.path.join(self.save_folder, folder_name)
+
+        self.btn_download.setText("⚙️ Đang gộp file...")
+
+        self.merge_thread = HonggouMergeThread(movie_folder, merge_tasks)
+        self.merge_thread.progress_msg.connect(lambda msg: self.lbl_status.setText(msg))
+        self.merge_thread.error_signal.connect(self._on_merge_error)
+        self.merge_thread.finished_signal.connect(self._on_merge_finished)
+        self._keep_thread_alive(self.merge_thread)
+        self.merge_thread.start()
+
+    def _on_merge_error(self, err_msg):
         self.btn_download.setEnabled(True)
         self.btn_download.setText("📥 Tải đã chọn")
-        self.lbl_status.setText(f"✅ Hoàn tất! Đã lưu {total_downloaded} tập về máy.")
+        self.lbl_status.setText("❌ Gộp file thất bại.")
+        QMessageBox.critical(self, "Lỗi gộp file", err_msg)
+
+    def _on_merge_finished(self):
+        self.btn_download.setEnabled(True)
+        self.btn_download.setText("📥 Tải đã chọn")
+        self.lbl_status.setText("✅ Đã tải và gộp thành công file!")
         if hasattr(self, 'lbl_downloaded_badge'): self.lbl_downloaded_badge.show()
-        self._refresh_balance()
-        QMessageBox.information(self, "Thành công", f"Đã lưu thành công {total_downloaded} tập phim về máy bạn!")
+        QMessageBox.information(
+            self, "Thành công hoàn toàn",
+            "Hệ thống đã tải và gộp thành công phim!\nCác tập lẻ đã được tự động xóa để tiết kiệm bộ nhớ."
+        )
 
     def _change_folder(self):
         new_folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục lưu phim", self.save_folder)
@@ -1408,7 +1690,6 @@ class DownloadUpdateThread(QThread):
             url = self.download_url
             session = requests.Session()
             
-            # Xử lý đặc biệt nếu link update cũng là Google Drive
             if 'drive.google.com' in url:
                 file_id = self._extract_file_id(url)
                 if file_id:
@@ -1435,10 +1716,8 @@ class DownloadUpdateThread(QThread):
                 else:
                     resp = session.get(url, stream=True, timeout=30)
             else:
-                # Tải bình thường từ host khác
                 resp = session.get(url, stream=True, timeout=30)
 
-            # CHỐT CHẶN: Đảm bảo không lưu nhầm file HTML thành file EXE cập nhật
             if 'text/html' in resp.headers.get('Content-Type', '') and 'drive.google.com' in url:
                 self.error_signal.emit("Lỗi: Không thể tải bản cập nhật (Bị chặn bởi Google Drive).")
                 return
@@ -1659,7 +1938,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(header)
 
         self.honggou_tab = HonggouWidget(username)
-        self.honggou_tab.balance_changed = self._update_balance_display
+        self.honggou_tab.balance_changed.connect(self._update_balance_display)
         main_layout.addWidget(self.honggou_tab)
 
         self.stack.addWidget(main_widget); self.stack.setCurrentWidget(main_widget)
@@ -1669,14 +1948,22 @@ class MainWindow(QMainWindow):
     
     def _fetch_balance(self, username):
         try:
-            token = QSettings("HongguoDownloader", "ClientApp").value("auth_token", "")
+            token = self.honggou_tab.auth_token if hasattr(self, 'honggou_tab') else QSettings("HongguoDownloader", "ClientApp").value("auth_token", "")
             res = requests.get(f"{SERVER_URL}/api/client/balance/{username}", headers={"Authorization": f"Bearer {token}"}, timeout=5)
             if res.status_code == 200:
                 balance = res.json().get("balance", 0)
                 self._update_balance_display(balance)
-        except: pass
+            else:
+                self._update_balance_display(0)
+        except: 
+            self._update_balance_display(0)
 
-    def _update_balance_display(self, balance): self.lbl_balance.setText(f"💰 Số dư: {balance:,} đ".replace(",", "."))
+    def _update_balance_display(self, balance): 
+        try:
+            safe_bal = int(balance) if balance is not None else 0
+            self.lbl_balance.setText(f"💰 Số dư: {safe_bal:,} đ".replace(",", "."))
+        except:
+            self.lbl_balance.setText("💰 Số dư: 0 đ")
 
     def _send_heartbeat(self):
         try:
