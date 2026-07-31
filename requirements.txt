@@ -1,0 +1,5 @@
+requests>=2.25.0
+edge-tts>=7.0.0
+PyQt6>=6.5.0
+pydub>=0.25.1
+playwright>=1.40.0

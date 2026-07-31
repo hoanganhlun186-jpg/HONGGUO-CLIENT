@@ -15,15 +15,48 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, 
     QTableWidget, QTableWidgetItem, QLabel, QMessageBox, 
     QHeaderView, QListWidget, QListWidgetItem, QApplication, QMainWindow, QStackedWidget,
-    QFileDialog, QProgressDialog, QProgressBar, QComboBox, QSpinBox
+    QFileDialog, QProgressDialog, QProgressBar, QComboBox, QSpinBox,
+    QCheckBox, QTextEdit, QTabWidget, QSplitter, QAbstractItemView,
+    QTreeWidget, QTreeWidgetItem, QDoubleSpinBox, QScrollArea, QFrame, QSizePolicy, QDialog
 )
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize, QSettings, QTimer
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 
+# === Cấu hình ffmpeg cho pydub (tránh WinError 2 khi lồng tiếng) ===
+def _setup_ffmpeg_pydub():
+    _here = os.path.dirname(os.path.abspath(__file__))
+    cand = [os.path.join(_here, "ffmpeg.exe"), os.path.join(_here, "ffmpeg"),
+            os.path.join(_here, "bin", "ffmpeg.exe")]
+    fp = next((p for p in cand if os.path.exists(p)), None) or shutil.which("ffmpeg")
+    try:
+        from pydub import AudioSegment as _AS
+        if fp:
+            _AS.converter = fp
+            _AS.ffmpeg = fp
+            probe = os.path.join(os.path.dirname(fp), "ffprobe.exe")
+            _AS.ffprobe = probe if os.path.exists(probe) else fp  # không có ffprobe thì trỏ tạm ffmpeg
+            os.environ["PATH"] = os.path.dirname(fp) + os.pathsep + os.environ.get("PATH", "")
+    except Exception:
+        pass
+    return fp
+
+FFMPEG_PATH = _setup_ffmpeg_pydub()
+
+# Đồng bộ Gemini: tái dùng login + prompt presets từ tab dịch (nếu có)
+try:
+    from translate_tab import GoogleManualLoginThread, PROMPT_PRESETS, AUTH_FILE, GeminiTranslateThread
+    _GEMINI_AVAILABLE = True
+except Exception:
+    GoogleManualLoginThread = None
+    PROMPT_PRESETS = {}
+    AUTH_FILE = "gemini_auth.json"
+    GeminiTranslateThread = None
+    _GEMINI_AVAILABLE = False
+
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.28"
+APP_VERSION = "1.0.29"
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  
 
@@ -588,6 +621,336 @@ class DriveDownloadManager(QObject):
 # ==========================================
 # GIAO DIỆN CHÍNH: HONGGOU WIDGET
 # ==========================================
+
+# ==========================================
+# STT BATCH THREAD — Tách sub từ file video
+# ==========================================
+class SttBatchThread(QThread):
+    progress_signal = pyqtSignal(str)       # log message
+    finished_signal = pyqtSignal(int, int)  # success, failed
+
+    def __init__(self, file_paths, src_lang="zh-CN", out_lang="vi-VN", use_trans=True):
+        super().__init__()
+        self.file_paths = file_paths
+        self.src_lang   = src_lang
+        self.out_lang   = out_lang
+        # KHÔNG dùng dịch của CapCut nữa -> chỉ tách sub tiếng GỐC.
+        # Việc dịch sang tiếng Việt do Gemini đảm nhận ở bước sau.
+        self.use_trans  = False
+        self._stop      = False
+
+    def stop(self):
+        self._stop = True
+
+    @staticmethod
+    def _ms_to_srt(ms):
+        ms = int(ms)
+        h, ms = divmod(ms, 3_600_000)
+        m, ms = divmod(ms,    60_000)
+        s, ms = divmod(ms,     1_000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    def run(self):
+        try:
+            from capcut_tts_api import CapCutClient
+            client = CapCutClient()
+        except Exception as e:
+            self.progress_signal.emit(f"❌ Không khởi tạo được CapCutClient: {e}")
+            self.finished_signal.emit(0, len(self.file_paths))
+            return
+
+        SUCCEED = {"succeed", "success", "completed", "done"}
+        FAIL    = {"failed",  "error",   "fail"}
+        ok = failed = 0
+
+        for i, fp in enumerate(self.file_paths):
+            if self._stop:
+                self.progress_signal.emit("🛑 Đã dừng bởi người dùng.")
+                break
+            if not os.path.exists(fp):
+                self.progress_signal.emit(f"[{i+1}] ⏭ Bỏ qua (chưa có): {os.path.basename(fp)}")
+                failed += 1; continue
+
+            bname = os.path.basename(fp)
+            out_srt = os.path.splitext(fp)[0] + ".srt"
+            out_txt = os.path.splitext(fp)[0] + ".txt"
+
+            self.progress_signal.emit(f"[{i+1}/{len(self.file_paths)}] ⬆️ Upload: {bname} ...")
+            try:
+                upload = client.upload_audio(fp)
+                self.progress_signal.emit(f"[{i+1}] ✅ Upload xong ({upload.duration_ms}ms) · Đang nhận dạng...")
+
+                stt_res = client.create_stt_task(
+                    audio_vid=upload.vid, audio_md5=upload.md5,
+                    duration_ms=upload.duration_ms or 10000,
+                    language=self.src_lang,
+                    translation_language=self.out_lang,
+                    use_translation=self.use_trans)
+
+                tasks = (stt_res.get("data") or {}).get("tasks") or []
+                if not tasks:
+                    raise RuntimeError(f"API không trả về task. Resp: {stt_res}")
+                task_id, token = tasks[0]["id"], tasks[0]["token"]
+
+                result = None; status = ""
+                for attempt in range(90):
+                    if self._stop: break
+                    time.sleep(2)
+                    q = client.query_stt_task(task_id, token)
+                    qt = (q.get("data") or {}).get("tasks") or []
+                    if not qt: continue
+                    status = qt[0].get("status", "")
+                    prog   = qt[0].get("progress", 0)
+                    self.progress_signal.emit(f"[{i+1}] ⏳ {status} | {prog}%")
+                    if status in SUCCEED: result = q; break
+                    elif status in FAIL:  raise RuntimeError(f"STT thất bại: {status}")
+
+                if result is None:
+                    raise RuntimeError("Timeout hoặc bị dừng")
+
+                subs = client.extract_subtitles(result)
+                srt_lines = []
+                for j, u in enumerate(subs.utterances, 1):
+                    t = (u.translated_text if (self.use_trans
+                         and hasattr(u, "translated_text") and u.translated_text)
+                         else u.text)
+                    srt_lines.append(
+                        f"{j}\n{self._ms_to_srt(u.start_time)} --> {self._ms_to_srt(u.end_time)}\n{t}\n"
+                    )
+                with open(out_srt, "w", encoding="utf-8") as f: f.write("\n".join(srt_lines))
+                with open(out_txt, "w", encoding="utf-8") as f: f.write(subs.full_text)
+                self.progress_signal.emit(f"[{i+1}] 💾 Đã lưu: {os.path.basename(out_srt)}")
+                ok += 1
+
+            except Exception as e:
+                self.progress_signal.emit(f"[{i+1}] ❌ Lỗi {bname}: {str(e)[:100]}")
+                failed += 1
+
+        self.finished_signal.emit(ok, failed)
+
+
+# ==========================================
+# DUB THREAD — Lồng tiếng từ SRT vào video
+# ==========================================
+class DubThread(QThread):
+    progress_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(int, int)   # success, failed
+
+    def __init__(self, tasks, voice_type="BV074_streaming", rate="1.0", mute_original=True):
+        """
+        tasks = list of {"video": path, "srt": path}
+        mute_original: True = tắt hẳn tiếng gốc (chỉ còn tiếng lồng)
+        """
+        super().__init__()
+        self.tasks      = tasks
+        self.voice_type = voice_type
+        self.rate       = rate
+        self.mute_original = mute_original
+        self._stop      = False
+
+    def stop(self): self._stop = True
+
+    @staticmethod
+    def _ms_to_srt(ms):
+        ms = int(ms)
+        h, ms = divmod(ms, 3_600_000)
+        m, ms = divmod(ms,    60_000)
+        s, ms = divmod(ms,     1_000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    @staticmethod
+    def _parse_srt(srt_path):
+        """Trả về list of (start_ms, end_ms, text)"""
+        import re
+        entries = []
+        with open(srt_path, encoding="utf-8", errors="ignore") as f:
+            raw = f.read()
+        blocks = re.split(r"\n\s*\n", raw.strip())
+        for block in blocks:
+            lines = block.strip().splitlines()
+            if len(lines) < 3: continue
+            try:
+                time_line = lines[1]
+                m = re.match(
+                    r"(\d+):(\d+):(\d+)[,\.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,\.](\d+)",
+                    time_line)
+                if not m: continue
+                g = [int(x) for x in m.groups()]
+                start_ms = g[0]*3600000 + g[1]*60000 + g[2]*1000 + g[3]
+                end_ms   = g[4]*3600000 + g[5]*60000 + g[6]*1000 + g[7]
+                text = " ".join(lines[2:]).strip()
+                if text: entries.append((start_ms, end_ms, text))
+            except Exception: pass
+        return entries
+
+    def run(self):
+        import urllib.request, shutil, json, time as _time
+        from pydub import AudioSegment
+        from pydub.effects import speedup
+
+        try:
+            from capcut_tts_api import CapCutClient
+            client = CapCutClient()
+        except Exception as e:
+            self.progress_signal.emit(f"❌ Không khởi tạo được CapCutClient: {e}")
+            self.finished_signal.emit(0, len(self.tasks)); return
+
+        ffmpeg = get_ffmpeg_path()
+        if not ffmpeg:
+            self.progress_signal.emit("❌ Không tìm thấy ffmpeg! Đặt ffmpeg.exe cùng thư mục.")
+            self.finished_signal.emit(0, len(self.tasks)); return
+
+        ok = failed = 0
+        SUCCEED = {"succeed","success","completed","done","finish"}
+        FAIL    = {"failed","error","fail"}
+        is_neural = "Neural" in self.voice_type
+
+        for idx, task in enumerate(self.tasks):
+            if self._stop:
+                self.progress_signal.emit("🛑 Đã dừng."); break
+
+            video_path = task["video"]
+            srt_path   = task["srt"]
+            if not os.path.exists(video_path) or not os.path.exists(srt_path):
+                self.progress_signal.emit(f"[{idx+1}] ⏭ Bỏ qua: thiếu file video hoặc SRT")
+                failed += 1; continue
+
+            bname = os.path.basename(video_path)
+            self.progress_signal.emit(f"[{idx+1}/{len(self.tasks)}] 🎙 Bắt đầu lồng tiếng: {bname}")
+
+            entries = self._parse_srt(srt_path)
+            if not entries:
+                self.progress_signal.emit(f"[{idx+1}] ⚠️ SRT rỗng: {os.path.basename(srt_path)}")
+                failed += 1; continue
+
+            temp_dir = tempfile.mkdtemp(prefix="dub_")
+            try:
+                # Tính tổng duration từ SRT cuối
+                total_ms = entries[-1][1] + 500
+
+                # TTS từng dòng
+                combined = AudioSegment.silent(duration=total_ms)
+                for i, (start_ms, end_ms, text) in enumerate(entries):
+                    if self._stop: break
+                    if not text.strip(): continue
+                    target_dur = end_ms - start_ms
+                    seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp3")
+                    try:
+                        if is_neural:
+                            import asyncio, edge_tts
+                            r = float(self.rate)
+                            pct = int((r-1.0)*100)
+                            rate_str = f"+{pct}%" if pct>=0 else f"{pct}%"
+                            async def _run_edge():
+                                comm = edge_tts.Communicate(text=text, voice=self.voice_type, rate=rate_str)
+                                await comm.save(seg_path)
+                            asyncio.run(_run_edge())
+                        else:
+                            create = client.create_tts_task(texts=text, voice=self.voice_type, rate=self.rate)
+                            tasks_r = (create.get("data") or {}).get("tasks") or []
+                            if not tasks_r: raise RuntimeError("Không có TTS task")
+                            tid, tok = tasks_r[0]["id"], tasks_r[0]["token"]
+                            url = None
+                            for _ in range(60):
+                                _time.sleep(2)
+                                q = client.query_tts_task(tid, tok)
+                                qt = (q.get("data") or {}).get("tasks") or []
+                                if not qt: continue
+                                st = qt[0].get("status","")
+                                if st in SUCCEED:
+                                    raw = qt[0].get("payload","{}")
+                                    pl = json.loads(raw) if isinstance(raw,str) else raw
+                                    subs2 = pl.get("audio_subtitles") or []
+                                    if subs2: url = subs2[0].get("speech_url","")
+                                    if not url:
+                                        for k in ("audio_list","url_list"):
+                                            for u in (pl.get(k) or []):
+                                                url = (u.get("url") or u.get("speech_url")) if isinstance(u,dict) else str(u)
+                                                if url: break
+                                    break
+                                elif st in FAIL: raise RuntimeError(f"TTS fail: {st}")
+                            if not url: raise RuntimeError("Timeout TTS")
+                            urllib.request.urlretrieve(url, seg_path)
+
+                        # Chỉnh tốc độ cho khớp duration SRT.
+                        # Decode qua ffmpeg trực tiếp (from_file thay from_mp3) để bớt phụ thuộc ffprobe.
+                        try:
+                            audio_seg = AudioSegment.from_file(seg_path, format="mp3")
+                        except Exception:
+                            # ffprobe/from_mp3 lỗi -> ép ffmpeg convert sang wav rồi đọc lại
+                            wav_path = seg_path + ".wav"
+                            _flags = 0x08000000 if os.name == "nt" else 0
+                            subprocess.run([FFMPEG_PATH or "ffmpeg", "-y", "-i", seg_path, wav_path],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=_flags)
+                            audio_seg = AudioSegment.from_file(wav_path, format="wav")
+                        cur = len(audio_seg)
+                        if cur > target_dur and target_dur > 0:
+                            factor = min(cur/target_dur, 2.5)
+                            try:
+                                audio_seg = speedup(audio_seg, playback_speed=factor)
+                            except Exception:
+                                pass  # không tăng tốc được thì để nguyên, vẫn có tiếng
+                        elif cur < target_dur:
+                            audio_seg += AudioSegment.silent(duration=target_dur-cur)
+
+                        # Đặt vào đúng vị trí timeline
+                        combined = combined.overlay(audio_seg, position=start_ms)
+                        self.progress_signal.emit(f"[{idx+1}] 🔊 Dòng {i+1}/{len(entries)} xong")
+                    except Exception as seg_e:
+                        self.progress_signal.emit(f"[{idx+1}] ⚠️ Dòng {i+1}: {str(seg_e)[:60]}")
+
+                if self._stop: break
+
+                # Xuất file audio lồng tiếng
+                dub_audio = os.path.join(temp_dir, "dub_final.mp3")
+                combined.export(dub_audio, format="mp3")
+                self.progress_signal.emit(f"[{idx+1}] 🎬 Đang mix vào video bằng ffmpeg...")
+
+                # ffmpeg mix: giữ video gốc, thay/mix audio
+                out_video = os.path.splitext(video_path)[0] + "_dubbed.mp4"
+                import subprocess as _sp, sys as _sys
+                si = None
+                if _sys.platform == "win32":
+                    si = _sp.STARTUPINFO()
+                    si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+
+                # Tùy chọn: tắt HẲN tiếng gốc (chỉ còn tiếng lồng) hoặc mix nhẹ tiếng gốc làm nền
+                if getattr(self, "mute_original", True):
+                    # CHỈ lấy audio lồng tiếng, bỏ hoàn toàn tiếng gốc
+                    cmd = [ffmpeg, "-y",
+                           "-i", video_path,
+                           "-i", dub_audio,
+                           "-map", "0:v", "-map", "1:a",
+                           "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                           "-shortest",
+                           out_video]
+                else:
+                    # Giữ 15% tiếng gốc làm nền + tiếng lồng
+                    cmd = [ffmpeg, "-y",
+                           "-i", video_path,
+                           "-i", dub_audio,
+                           "-filter_complex",
+                           "[0:a]volume=0.15[orig];[1:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=longest[aout]",
+                           "-map", "0:v", "-map", "[aout]",
+                           "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                           out_video]
+                res = _sp.run(cmd, startupinfo=si, stdout=_sp.DEVNULL, stderr=_sp.PIPE)
+                if res.returncode == 0:
+                    self.progress_signal.emit(f"[{idx+1}] ✅ Xong! → {os.path.basename(out_video)}")
+                    ok += 1
+                else:
+                    err = res.stderr.decode("utf-8", errors="ignore")[-200:]
+                    raise RuntimeError(f"ffmpeg lỗi: {err}")
+
+            except Exception as e:
+                self.progress_signal.emit(f"[{idx+1}] ❌ Lỗi {bname}: {str(e)[:120]}")
+                failed += 1
+            finally:
+                try: shutil.rmtree(temp_dir)
+                except: pass
+
+        self.finished_signal.emit(ok, failed)
+
 class HonggouWidget(QWidget):
     balance_changed = pyqtSignal(int)
 
@@ -857,6 +1220,95 @@ class HonggouWidget(QWidget):
         bottom_layout.addLayout(merge_layout)
         bottom_layout.addWidget(self.btn_select_all)
         bottom_layout.addWidget(self.btn_download)
+
+        # ─── STT / Tách sub controls ───────────────────────────────────
+        stt_ctrl = QHBoxLayout(); stt_ctrl.setSpacing(8)
+        self.chk_auto_stt = QCheckBox("🔤 Tự động tách sub sau khi tải")
+        self.chk_auto_stt.setStyleSheet("""
+            QCheckBox { color: #f1f5f9; font-size: 12px; padding: 4px; font-weight: bold; }
+            QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #7c3aed;
+                border-radius: 4px; background: #1e293b; }
+            QCheckBox::indicator:checked { background: #7c3aed; border-color: #7c3aed;
+                image: none; }
+            QCheckBox::indicator:checked::after { color: white; }
+        """)
+        stt_ctrl.addWidget(self.chk_auto_stt)
+
+        stt_ctrl.addWidget(QLabel("  Tiếng gốc:"))
+        self.cmb_stt_src = QComboBox()
+        self.cmb_stt_src.addItems(["zh-CN","en-US","vi-VN","ja-JP","ko-KR","fr-FR"])
+        self.cmb_stt_src.setToolTip("Ngôn ngữ gốc trong phim")
+        self.cmb_stt_src.setStyleSheet("QComboBox { background:#1f2937; color:#f8fafc; border:1px solid #374151; border-radius:6px; padding:4px 8px; } QComboBox QAbstractItemView { background:#1e293b; color:#f8fafc; }")
+        stt_ctrl.addWidget(self.cmb_stt_src)
+
+        stt_ctrl.addWidget(QLabel("→ Dịch sang:"))
+        self.cmb_stt_out = QComboBox()
+        self.cmb_stt_out.addItems(["vi-VN","en-US","zh-CN","ja-JP","ko-KR"])
+        self.cmb_stt_out.setToolTip("Ngôn ngữ phụ đề cần dịch sang")
+        self.cmb_stt_out.setStyleSheet("QComboBox { background:#1f2937; color:#f8fafc; border:1px solid #374151; border-radius:6px; padding:4px 8px; } QComboBox QAbstractItemView { background:#1e293b; color:#f8fafc; }")
+        stt_ctrl.addWidget(self.cmb_stt_out)
+
+        self.btn_stt_now = QPushButton("🔤 Tách sub ngay")
+        self.btn_stt_now.setEnabled(False)
+        self.btn_stt_now.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_stt_now.setStyleSheet("QPushButton { padding: 8px 18px; background-color: #7c3aed; color: white; border-radius: 8px; font-weight: bold; font-size: 13px; border: none; } QPushButton:hover { background-color: #6d28d9; } QPushButton:disabled { background-color: #374151; color: #64748b; }")
+        self.btn_stt_now.clicked.connect(self._run_stt_on_downloaded)
+        stt_ctrl.addWidget(self.btn_stt_now)
+        stt_ctrl.addStretch()
+        detail_layout.addLayout(stt_ctrl)
+
+        # ─── Lồng tiếng controls ──────────────────────────────────────
+        dub_ctrl = QHBoxLayout(); dub_ctrl.setSpacing(8)
+        self.chk_auto_dub = QCheckBox("🎙 Lồng tiếng sau khi tách sub")
+        self.chk_auto_dub.setStyleSheet("""
+            QCheckBox { color: #fde68a; font-size: 12px; padding: 4px; font-weight: bold; }
+            QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #f59e0b;
+                border-radius: 4px; background: #1e293b; }
+            QCheckBox::indicator:checked { background: #f59e0b; border-color: #f59e0b; }
+        """)
+        dub_ctrl.addWidget(self.chk_auto_dub)
+
+        dub_ctrl.addWidget(QLabel("  Giọng:"))
+        self.cmb_dub_voice = QComboBox()
+        self._load_dub_voices()
+        self.cmb_dub_voice.setToolTip("Giọng lồng tiếng (đọc từ Voice.json)")
+        self.cmb_dub_voice.setStyleSheet("QComboBox { background:#1f2937; color:#fde68a; border:1px solid #f59e0b; border-radius:6px; padding:4px 8px; } QComboBox QAbstractItemView { background:#1e293b; color:#fde68a; }")
+        dub_ctrl.addWidget(self.cmb_dub_voice)
+
+        dub_ctrl.addWidget(QLabel("Tốc độ:"))
+        self.spn_dub_rate = QDoubleSpinBox()
+        self.spn_dub_rate.setRange(0.5, 2.0); self.spn_dub_rate.setSingleStep(0.1)
+        self.spn_dub_rate.setValue(1.0); self.spn_dub_rate.setDecimals(1)
+        self.spn_dub_rate.setFixedWidth(65)
+        self.spn_dub_rate.setStyleSheet("QDoubleSpinBox { background:#1f2937; color:#fde68a; border:1px solid #f59e0b; border-radius:6px; padding:3px; }")
+        dub_ctrl.addWidget(self.spn_dub_rate)
+
+        self.chk_mute_original = QCheckBox("🔇 Tắt tiếng gốc")
+        self.chk_mute_original.setChecked(True)
+        self.chk_mute_original.setToolTip("Bật = chỉ còn tiếng lồng (bỏ hẳn tiếng Trung gốc)")
+        self.chk_mute_original.setStyleSheet("""
+            QCheckBox { color:#fde68a; font-weight:bold; font-size:13px; padding:2px; }
+            QCheckBox::indicator { width:18px; height:18px; border:2px solid #f59e0b; border-radius:4px; background:#1f2937; }
+            QCheckBox::indicator:checked { background:#f59e0b; }
+        """)
+        dub_ctrl.addWidget(self.chk_mute_original)
+
+        self.btn_dub_now = QPushButton("🎙 Lồng tiếng ngay")
+        self.btn_dub_now.setEnabled(False)
+        self.btn_dub_now.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_dub_now.setStyleSheet("QPushButton { padding: 8px 18px; background-color: #b45309; color: white; border-radius: 8px; font-weight: bold; font-size: 13px; border: none; } QPushButton:hover { background-color: #92400e; } QPushButton:disabled { background-color: #374151; color: #64748b; }")
+        self.btn_dub_now.clicked.connect(self._run_dub_on_downloaded)
+        dub_ctrl.addWidget(self.btn_dub_now)
+        dub_ctrl.addStretch()
+        detail_layout.addLayout(dub_ctrl)
+        # ─────────────────────────────────────────────────────────────
+
+        self.txt_stt_log = QTextEdit()
+        self.txt_stt_log.setReadOnly(True); self.txt_stt_log.setFixedHeight(110)
+        self.txt_stt_log.setStyleSheet("QTextEdit { background: #0a0c14; color: #a3e635; font-family: Consolas; font-size: 9pt; border: 1px solid #374151; border-radius: 6px; padding: 4px; }")
+        self.txt_stt_log.hide()
+        detail_layout.addWidget(self.txt_stt_log)
+        # ───────────────────────────────────────────────────────────────
         detail_layout.addLayout(bottom_layout)
         self.content_stack.addWidget(self.page_detail)
         self._render_history_sidebar()
@@ -1501,6 +1953,33 @@ class HonggouWidget(QWidget):
         self._dl_finished = getattr(self, '_dl_finished', 0) + 1
         self.total_progress.setValue(min(self._dl_finished, self.total_progress.maximum()))
 
+    def _load_dub_voices(self):
+        """Đọc HẾT giọng tiếng Việt từ Voice.json đổ vào combo. Thiếu file -> dùng vài giọng mặc định."""
+        voices = []
+        try:
+            vpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Voice.json")
+            with open(vpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for v in data:
+                if v.get("lan") == "vi" or v.get("lang") == "vi-VN":
+                    name = v.get("display_name") or v.get("voice_type")
+                    vt = v.get("voice_type")
+                    if vt:
+                        voices.append(f"{name} [{vt}]")
+        except Exception:
+            pass
+        if not voices:
+            voices = [
+                "Cô Gái Hoạt Ngôn [BV074_streaming]",
+                "Giọng Bé [BV074_streaming_dsp]",
+                "Nhỏ Ngọt Ngào [BV421_vivn_streaming]",
+                "Thanh Niên Tự Tin [BV075_streaming]",
+            ]
+        self.cmb_dub_voice.addItems(voices)
+        for i in range(self.cmb_dub_voice.count()):
+            if "BV074_streaming]" in self.cmb_dub_voice.itemText(i):
+                self.cmb_dub_voice.setCurrentIndex(i); break
+
     def _refresh_balance(self):
         try:
             token = self.auth_token if hasattr(self, 'auth_token') else QSettings("HongguoDownloader", "ClientApp").value("auth_token", "")
@@ -1539,6 +2018,8 @@ class HonggouWidget(QWidget):
             _f = done_item.font(); _f.setBold(True); done_item.setFont(_f)
             self.table.setItem(row, 3, done_item)
         self._bump_total_progress()
+        if hasattr(self, 'btn_stt_now'):
+            self.btn_stt_now.setEnabled(True)
 
     def _on_download_error(self, ep_num, error_msg):
         row = ep_num - 1
@@ -1562,6 +2043,8 @@ class HonggouWidget(QWidget):
             self.lbl_status.setText(f"✅ Hoàn tất! Đã lưu {total_downloaded} tập phim lẻ.")
             if hasattr(self, 'lbl_downloaded_badge'): self.lbl_downloaded_badge.show()
             QMessageBox.information(self, "Thành công", f"Đã lưu thành công {total_downloaded} tập phim về máy bạn!")
+            if hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked():
+                QTimer.singleShot(500, self._run_stt_on_downloaded)
             return
 
         # ==========================================
@@ -1626,6 +2109,158 @@ class HonggouWidget(QWidget):
             self, "Thành công hoàn toàn",
             "Hệ thống đã tải và gộp thành công phim!\nCác tập lẻ đã được tự động xóa để tiết kiệm bộ nhớ."
         )
+        if hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked():
+            # Tách sub từ file gộp (file mới nhất trong thư mục phim)
+            folder = os.path.join(self.save_folder, self.current_series_id or "")
+            if os.path.exists(folder):
+                mp4s = sorted([os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".mp4")],
+                              key=os.path.getmtime, reverse=True)
+                if mp4s:
+                    self._files_for_stt = mp4s
+                    QTimer.singleShot(500, self._run_stt_on_downloaded)
+
+    # ─────────────────────────────────────────────────────────────────
+    #  STT / TÁCH SUB
+    # ─────────────────────────────────────────────────────────────────
+    def _run_dub_on_downloaded(self):
+        """Lồng tiếng: ghép TTS vào video dựa trên SRT đã có."""
+        files = getattr(self, '_files_for_stt', None) or getattr(self, 'downloaded_file_paths', [])
+        files = [f for f in files if os.path.exists(f)]
+        if not files:
+            QMessageBox.warning(self, "Không có file", "Chưa có file video nào!"); return
+
+        # Tìm file SRT tương ứng - ƯU TIÊN bản dịch _vi.srt (đã dịch Gemini)
+        tasks = []
+        for vf in files:
+            base = os.path.splitext(vf)[0]
+            vi_srt = base + "_vi.srt"
+            srt_goc = base + ".srt"
+            if os.path.exists(vi_srt):
+                tasks.append({"video": vf, "srt": vi_srt})
+            elif os.path.exists(srt_goc):
+                # Chỉ còn srt gốc (chưa dịch) -> cảnh báo vì sẽ lồng tiếng gốc
+                self.txt_stt_log.append(f"⚠️ Chưa có bản dịch _vi.srt cho {os.path.basename(vf)} — dùng srt gốc.")
+                tasks.append({"video": vf, "srt": srt_goc})
+            else:
+                self.txt_stt_log.append(f"⏭ Bỏ qua (chưa có SRT): {os.path.basename(vf)}")
+
+        if not tasks:
+            QMessageBox.warning(self, "Không có SRT", "Chưa tìm thấy file .srt nào cạnh file video!\nHãy tách sub trước."); return
+
+        # Lấy voice_type từ combo
+        sel = self.cmb_dub_voice.currentText() if hasattr(self, 'cmb_dub_voice') else ""
+        voice_type = "BV074_streaming"
+        if "[" in sel and sel.endswith("]"):
+            voice_type = sel[sel.rfind("[")+1:-1]
+        rate = f"{self.spn_dub_rate.value():.1f}" if hasattr(self, 'spn_dub_rate') else "1.0"
+
+        self.txt_stt_log.show()
+        self.txt_stt_log.append(f"\n🎙 Bắt đầu lồng tiếng {len(tasks)} file | giọng: {voice_type} | rate: {rate}x")
+        self.btn_dub_now.setEnabled(False); self.btn_dub_now.setText("⏳ Đang lồng tiếng...")
+        self.lbl_status.setText(f"🎙 Đang lồng tiếng {len(tasks)} file...")
+
+        mute_orig = self.chk_mute_original.isChecked() if hasattr(self, 'chk_mute_original') else True
+        self._dub_thread = DubThread(tasks, voice_type=voice_type, rate=rate, mute_original=mute_orig)
+        self._dub_thread.progress_signal.connect(self._on_stt_progress)   # dùng chung log box
+        self._dub_thread.finished_signal.connect(self._on_dub_finished)
+        self._keep_thread_alive(self._dub_thread)
+        self._dub_thread.start()
+
+    def _on_dub_finished(self, ok, failed):
+        self.btn_dub_now.setEnabled(True); self.btn_dub_now.setText("🎙 Lồng tiếng ngay")
+        summary = f"✅ Lồng tiếng xong: {ok} thành công, {failed} lỗi. File output: *_dubbed.mp4"
+        self.lbl_status.setText(summary); self.txt_stt_log.append("\n" + summary)
+        if ok > 0:
+            QMessageBox.information(self, "Lồng tiếng hoàn tất",
+                f"Đã lồng tiếng thành công {ok} video!\nFile đầu ra: *_dubbed.mp4 cạnh file gốc.")
+
+    def _run_stt_on_downloaded(self):
+        """Tách sub từ danh sách file đã tải."""
+        # Ưu tiên _files_for_stt (từ merge), nếu không dùng downloaded_file_paths
+        files = getattr(self, '_files_for_stt', None) or getattr(self, 'downloaded_file_paths', [])
+        files = [f for f in files if os.path.exists(f)]
+        if not files:
+            QMessageBox.warning(self, "Không có file", "Chưa có file video nào để tách sub!"); return
+
+        src  = self.cmb_stt_src.currentText() if hasattr(self, 'cmb_stt_src') else "zh-CN"
+        out  = self.cmb_stt_out.currentText() if hasattr(self, 'cmb_stt_out') else "vi-VN"
+        use_trans = src != out
+
+        self.txt_stt_log.clear(); self.txt_stt_log.show()
+        self.btn_stt_now.setEnabled(False); self.btn_stt_now.setText("⏳ Đang tách sub...")
+        self.lbl_status.setText(f"🔤 Đang tách sub {len(files)} file...")
+        self._stt_files = list(files)   # lưu để bước dịch Gemini dùng
+        self._stt_out_lang = out
+
+        self._stt_thread = SttBatchThread(files, src_lang=src, out_lang=out, use_trans=use_trans)
+        self._stt_thread.progress_signal.connect(self._on_stt_progress)
+        self._stt_thread.finished_signal.connect(self._on_stt_finished)
+        self._keep_thread_alive(self._stt_thread)
+        self._stt_thread.start()
+
+    def _on_stt_progress(self, msg):
+        self.txt_stt_log.append(msg)
+        self.txt_stt_log.verticalScrollBar().setValue(self.txt_stt_log.verticalScrollBar().maximum())
+
+    def _on_stt_finished(self, ok, failed):
+        self.btn_stt_now.setEnabled(True); self.btn_stt_now.setText("🔤 Tách sub ngay")
+        summary = f"✅ Tách sub xong: {ok} thành công, {failed} lỗi."
+        self.lbl_status.setText(summary); self.txt_stt_log.append("\n" + summary)
+        if ok <= 0:
+            self._files_for_stt = None
+            return
+        if hasattr(self, 'btn_dub_now'): self.btn_dub_now.setEnabled(True)
+
+        # BƯỚC DỊCH GEMINI: dịch các file .srt gốc -> _vi.srt trước khi lồng tiếng
+        srt_files = []
+        for vid in getattr(self, '_stt_files', []) or []:
+            sp = os.path.splitext(vid)[0] + ".srt"
+            if os.path.exists(sp):
+                srt_files.append((vid, sp))
+
+        if _GEMINI_AVAILABLE and GeminiTranslateThread and srt_files:
+            if not os.path.exists(AUTH_FILE):
+                QMessageBox.warning(self, "Chưa đăng nhập Gemini",
+                    "Bạn cần bấm nút 'Đồng bộ Gemini' để đăng nhập trước khi dịch.")
+                return
+            self.txt_stt_log.append("\n🌐 Bắt đầu dịch bằng Gemini...")
+            self._start_gemini_translate(srt_files)
+        else:
+            # Không có Gemini -> giữ hành vi cũ (chỉ tách sub)
+            QMessageBox.information(self, "Tách sub hoàn tất",
+                f"Đã tách sub {ok} file!\n(Chưa cấu hình Gemini nên không dịch.)")
+        self._files_for_stt = None
+
+    def _start_gemini_translate(self, srt_files):
+        """Dịch danh sách (video, srt) bằng Gemini -> tạo _vi.srt, xong thì lồng tiếng."""
+        settings = QSettings("HongguoDownloader", "ClientApp")
+        preset = settings.value("trans_preset", list(PROMPT_PRESETS.keys())[0] if PROMPT_PRESETS else "")
+        queue = [{"video": v, "srt": s} for (v, s) in srt_files]
+        self._gemini_vi_map = {}   # video_path -> _vi.srt
+        self._gemini_total = len(queue)
+        self._gemini_done_count = 0
+
+        self._gtrans_thread = GeminiTranslateThread(queue, preset, "Auto (Mặc định)", 100)
+        self._gtrans_thread.log.connect(lambda m: self.txt_stt_log.append(m.strip()))
+        def _on_item_done(idx, video_path, vi_path):
+            self._gemini_vi_map[video_path] = vi_path
+        def _on_item_failed(idx, msg):
+            self.txt_stt_log.append(f"⚠️ Dịch lỗi 1 file: {msg}")
+        self._gtrans_thread.item_done.connect(_on_item_done)
+        self._gtrans_thread.item_failed.connect(_on_item_failed)
+        self._gtrans_thread.all_done.connect(self._on_gemini_all_done)
+        self._keep_thread_alive(self._gtrans_thread)
+        self._gtrans_thread.start()
+
+    def _on_gemini_all_done(self):
+        n = len(getattr(self, '_gemini_vi_map', {}))
+        self.txt_stt_log.append(f"\n✅ Dịch Gemini xong: {n} file.")
+        # Sau khi dịch xong -> lồng tiếng (nếu bật auto dub)
+        if hasattr(self, 'chk_auto_dub') and self.chk_auto_dub.isChecked():
+            QTimer.singleShot(500, self._run_dub_on_downloaded)
+        else:
+            QMessageBox.information(self, "Dịch hoàn tất",
+                f"Đã dịch {n} file sang tiếng Việt (_vi.srt).\nCó thể bấm Lồng tiếng.")
 
     def _change_folder(self):
         new_folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục lưu phim", self.save_folder)
@@ -1790,18 +2425,35 @@ class AutoUpdater:
     def _on_update_found(self, version, url, changelog, force):
         self._latest_version = version; self._download_url = url; self._changelog = changelog
         self.btn_update.setText(f"🔄 Cập nhật v{version}"); self.btn_update.setVisible(True)
-        if force: QMessageBox.warning(self.parent, "Bắt buộc cập nhật", f"Phiên bản {version} là bản cập nhật bắt buộc.\nVui lòng cập nhật để tiếp tục sử dụng.\n\n{changelog}")
+        self._is_force = bool(force)
+        if force:
+            # BẮT BUỘC: chặn dùng bản cũ. Chỉ có nút OK -> tải ngay. Đóng = thoát app.
+            box = QMessageBox(self.parent)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Bắt buộc cập nhật")
+            box.setText(f"Phiên bản mới v{version} là bản BẮT BUỘC.\n"
+                        f"Bạn phải cập nhật để tiếp tục sử dụng.\n\n"
+                        f"{changelog}\n\nNhấn OK để tải và cập nhật ngay.")
+            box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            box.exec()
+            # Bấm OK (hoặc đóng) -> tải luôn, không cho thoát ra dùng bản cũ
+            self._start_download(force=True)
 
     def _on_update_clicked(self):
         msg = f"Phiên bản mới: v{self._latest_version}\nHiện tại: v{APP_VERSION}\n\n"
         if self._changelog: msg += f"Thay đổi:\n{self._changelog}\n\n"
         msg += "Nhấn OK để tải bản mới.\nApp sẽ tự tắt → cập nhật → mở lại."
         if QMessageBox.question(self.parent, "Cập nhật phần mềm", msg, QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Ok: return
+        self._start_download(force=False)
 
+    def _start_download(self, force=False):
         self.progress = QProgressDialog("Đang tải phiên bản mới...", None, 0, 100, self.parent)
         self.progress.setWindowTitle("Cập nhật Hongguo Downloader")
-        self.progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress.setWindowModality(Qt.WindowModality.ApplicationModal if force else Qt.WindowModality.WindowModal)
         self.progress.setCancelButton(None); self.progress.setMinimumDuration(0); self.progress.setValue(0)
+        # Bản bắt buộc: không cho tắt cửa sổ tải (chặn nút X)
+        if force:
+            self.progress.setWindowFlags(self.progress.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
         self.progress.setStyleSheet("QProgressDialog { background: #1e293b; color: white; } QProgressBar { border: 1px solid #374151; border-radius: 6px; background: #111827; text-align: center; color: white; } QProgressBar::chunk { background-color: #10b981; border-radius: 5px; }")
         self.progress.show()
         self.btn_update.setEnabled(False); self.btn_update.setText("⏳ Đang tải...")
@@ -1820,6 +2472,9 @@ class AutoUpdater:
     def _on_dl_error(self, error_msg):
         self.progress.close(); self.btn_update.setEnabled(True); self.btn_update.setText(f"🔄 Cập nhật v{self._latest_version}")
         QMessageBox.critical(self.parent, "Lỗi cập nhật", f"Không thể tải bản mới:\n{error_msg}")
+        # Bản BẮT BUỘC mà tải lỗi -> không cho dùng bản cũ, thoát app
+        if getattr(self, "_is_force", False):
+            QApplication.instance().quit()
 
 # ==========================================
 # MÀN HÌNH ĐĂNG NHẬP
@@ -1931,8 +2586,16 @@ class MainWindow(QMainWindow):
         btn_logout.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #ef4444; color: white; border-radius: 6px; font-weight: bold; border: none; } QPushButton:hover { background-color: #dc2626; }")
         btn_logout.clicked.connect(self.logout)
 
+        # Nút đồng bộ Gemini (đăng nhập 1 lần + chọn prompt dịch)
+        self.btn_gemini = QPushButton()
+        self.btn_gemini.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_gemini.clicked.connect(self._open_gemini_sync)
+        self._refresh_gemini_btn()
+
         header_layout.addWidget(lbl_logo); header_layout.addStretch(); header_layout.addWidget(lbl_user_info)
-        header_layout.addSpacing(20); header_layout.addWidget(self.lbl_balance); header_layout.addSpacing(20); header_layout.addWidget(btn_logout)
+        header_layout.addSpacing(20); header_layout.addWidget(self.lbl_balance)
+        header_layout.addSpacing(15); header_layout.addWidget(self.btn_gemini)
+        header_layout.addSpacing(20); header_layout.addWidget(btn_logout)
 
         self.updater = AutoUpdater(header_layout, parent_widget=self)
         main_layout.addWidget(header)
@@ -1980,6 +2643,87 @@ class MainWindow(QMainWindow):
             requests.post(f"{SERVER_URL}/api/client/heartbeat", json=payload, headers={"Authorization": f"Bearer {token}"}, timeout=5)
         except: pass
 
+    def _refresh_gemini_btn(self):
+        """Cập nhật màu/chữ nút Gemini theo trạng thái đã login chưa."""
+        try:
+            logged = os.path.exists(AUTH_FILE)
+        except Exception:
+            logged = False
+        if logged:
+            self.btn_gemini.setText("🟢 Gemini")
+            self.btn_gemini.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #16a34a; color: white; border-radius: 6px; font-weight: bold; border: none; } QPushButton:hover { background-color: #15803d; }")
+        else:
+            self.btn_gemini.setText("🔑 Đồng bộ Gemini")
+            self.btn_gemini.setStyleSheet("QPushButton { padding: 8px 16px; background-color: #7c3aed; color: white; border-radius: 6px; font-weight: bold; border: none; } QPushButton:hover { background-color: #6d28d9; }")
+
+    def _open_gemini_sync(self):
+        if not _GEMINI_AVAILABLE:
+            QMessageBox.warning(self, "Thiếu module", "Không tìm thấy tab dịch (translate_tab.py). Hãy đặt file này cạnh app.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Đồng bộ Gemini")
+        dlg.setMinimumWidth(460)
+        dlg.setStyleSheet("QDialog { background:#0f172a; } QLabel { color:#e2e8f0; } QComboBox, QTextEdit { background:#1e293b; color:#e2e8f0; border:1px solid #334155; border-radius:6px; padding:6px; } QPushButton { padding:8px 14px; border:none; border-radius:6px; font-weight:bold; color:white; }")
+        lay = QVBoxLayout(dlg)
+
+        logged = os.path.exists(AUTH_FILE)
+        lbl_status = QLabel("🟢 Đã đăng nhập Gemini" if logged else "🔴 Chưa đăng nhập Gemini")
+        lay.addWidget(lbl_status)
+
+        # Nút đăng nhập (mở Chrome đăng nhập 1 lần, lần sau khỏi cần)
+        btn_login = QPushButton("🔑 Đăng nhập Gemini (1 lần)")
+        btn_login.setStyleSheet("background:#7c3aed;")
+        lay.addWidget(btn_login)
+
+        # Chọn prompt dịch
+        lay.addWidget(QLabel("Chọn prompt dịch:"))
+        cb_preset = QComboBox()
+        _gem_settings = QSettings("HongguoDownloader", "ClientApp")
+        cb_preset.addItems(list(PROMPT_PRESETS.keys()))
+        _default_preset = list(PROMPT_PRESETS.keys())[0] if PROMPT_PRESETS else ""
+        saved = _gem_settings.value("trans_preset", _default_preset)
+        if saved: cb_preset.setCurrentText(saved)
+        lay.addWidget(cb_preset)
+
+        # Xem nội dung prompt
+        txt_preview = QTextEdit()
+        txt_preview.setReadOnly(True)
+        txt_preview.setFixedHeight(140)
+        def _update_preview():
+            txt_preview.setPlainText(PROMPT_PRESETS.get(cb_preset.currentText(), ""))
+        cb_preset.currentTextChanged.connect(lambda _: _update_preview())
+        _update_preview()
+        lay.addWidget(QLabel("Nội dung prompt:"))
+        lay.addWidget(txt_preview)
+
+        log_box = QTextEdit(); log_box.setReadOnly(True); log_box.setFixedHeight(80)
+        lay.addWidget(log_box)
+
+        def _do_login():
+            btn_login.setEnabled(False)
+            log_box.append("⏳ Đang mở trình duyệt đăng nhập Gemini...")
+            self._gemini_login_thread = GoogleManualLoginThread()
+            self._gemini_login_thread.log.connect(lambda m: log_box.append(m.strip()))
+            def _fin(ok):
+                btn_login.setEnabled(True)
+                lbl_status.setText("🟢 Đã đăng nhập Gemini" if ok else "🔴 Đăng nhập thất bại")
+                self._refresh_gemini_btn()
+            self._gemini_login_thread.finished_signal.connect(_fin)
+            self._gemini_login_thread.start()
+        btn_login.clicked.connect(_do_login)
+
+        # Lưu preset khi đóng
+        btn_save = QPushButton("💾 Lưu prompt & Đóng")
+        btn_save.setStyleSheet("background:#16a34a;")
+        def _save_close():
+            _gem_settings.setValue("trans_preset", cb_preset.currentText())
+            dlg.accept()
+        btn_save.clicked.connect(_save_close)
+        lay.addWidget(btn_save)
+
+        dlg.exec()
+        self._refresh_gemini_btn()
+
     def logout(self):
         reply = QMessageBox.question(self, "Đăng xuất", "Bạn có chắc chắn muốn đăng xuất không?\n(Sẽ xóa thông tin tài khoản đã ghi nhớ)", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
@@ -1993,6 +2737,20 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    # Style cho popup thông báo (QMessageBox) - nền tối, CHỮ TRẮNG rõ, nút sáng
+    app.setStyleSheet("""
+        QMessageBox { background-color: #1e293b; }
+        QMessageBox QLabel { color: #f1f5f9; font-size: 13px; }
+        QMessageBox QPushButton {
+            background-color: #2563eb; color: white; border: none;
+            border-radius: 6px; padding: 6px 18px; font-weight: bold; min-width: 70px;
+        }
+        QMessageBox QPushButton:hover { background-color: #1d4ed8; }
+        QInputDialog { background-color: #1e293b; }
+        QInputDialog QLabel { color: #f1f5f9; }
+        QDialog { background-color: #1e293b; }
+        QDialog QLabel { color: #f1f5f9; }
+    """)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
