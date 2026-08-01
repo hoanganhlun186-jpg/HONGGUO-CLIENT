@@ -42,6 +42,39 @@ def _setup_ffmpeg_pydub():
 
 FFMPEG_PATH = _setup_ffmpeg_pydub()
 
+# Ẩn cửa sổ đen (console) khi pydub/ffmpeg chạy subprocess trên Windows.
+# pydub gọi ffmpeg nội bộ mà không ẩn cửa sổ -> nháy bảng đen mỗi lần TTS.
+def _patch_subprocess_no_window():
+    if os.name != "nt":
+        return
+    try:
+        import subprocess as _subp
+        _CNW = 0x08000000  # CREATE_NO_WINDOW
+        _orig_popen = _subp.Popen
+        class _QuietPopen(_orig_popen):
+            def __init__(self, *args, **kwargs):
+                if "creationflags" not in kwargs:
+                    kwargs["creationflags"] = _CNW
+                else:
+                    kwargs["creationflags"] |= _CNW
+                super().__init__(*args, **kwargs)
+        _subp.Popen = _QuietPopen
+    except Exception:
+        pass
+
+_patch_subprocess_no_window()
+
+def _get_capcut_device():
+    """Mỗi MÁY một device_id riêng (ổn định, lưu QSettings) để CapCut không gộp
+    nhiều khách vào 1 thiết bị -> tránh lỗi 'TTS fail: failed' do bị rate-limit chung."""
+    s = QSettings("HongguoDownloader", "ClientApp")
+    did = s.value("capcut_device_id", "")
+    if not did:
+        # tạo device_id kiểu số dài giống định dạng CapCut
+        did = "".join(str(uuid.uuid4().int)[:20])
+        s.setValue("capcut_device_id", did)
+    return {"device_id": did, "iid": did, "tdid": did}
+
 # Đồng bộ Gemini: tái dùng login + prompt presets từ tab dịch (nếu có)
 try:
     from translate_tab import GoogleManualLoginThread, PROMPT_PRESETS, AUTH_FILE, GeminiTranslateThread
@@ -56,7 +89,7 @@ except Exception:
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.29"
+APP_VERSION = "1.0.30"
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  
 
@@ -310,9 +343,24 @@ class HonggouScanThread(QThread):
             self.url_resolved_signal.emit(self.url) 
 
             headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(self.url, headers=headers, timeout=30)
-            resp.raise_for_status()
-            html = resp.text
+            # Web hongguoduanju hay chập chờn (lỗi 500) -> thử lại tối đa 3 lần
+            html = None
+            last_err = None
+            for attempt in range(1, 4):
+                try:
+                    resp = requests.get(self.url, headers=headers, timeout=30)
+                    resp.raise_for_status()
+                    html = resp.text
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < 3:
+                        time.sleep(attempt * 2)  # nghỉ 2s, 4s rồi thử lại
+            if html is None:
+                self.error_signal.emit(
+                    f"Web nguồn đang lỗi (đã thử 3 lần): {str(last_err)}\n"
+                    f"Web hongguoduanju có thể đang bận. Hãy thử lại sau ít phút.")
+                return
 
             detail = None
             json_match = re.search(r'window\._ROUTER_DATA\s*=\s*(\{.+?\})\s*;?\s*</script>', html, re.DOTALL)
@@ -653,7 +701,7 @@ class SttBatchThread(QThread):
     def run(self):
         try:
             from capcut_tts_api import CapCutClient
-            client = CapCutClient()
+            client = CapCutClient(device=_get_capcut_device())
         except Exception as e:
             self.progress_signal.emit(f"❌ Không khởi tạo được CapCutClient: {e}")
             self.finished_signal.emit(0, len(self.file_paths))
@@ -675,55 +723,66 @@ class SttBatchThread(QThread):
             out_srt = os.path.splitext(fp)[0] + ".srt"
             out_txt = os.path.splitext(fp)[0] + ".txt"
 
-            self.progress_signal.emit(f"[{i+1}/{len(self.file_paths)}] ⬆️ Upload: {bname} ...")
-            try:
-                upload = client.upload_audio(fp)
-                self.progress_signal.emit(f"[{i+1}] ✅ Upload xong ({upload.duration_ms}ms) · Đang nhận dạng...")
+            stt_ok = False
+            last_err = ""
+            for attempt in range(1, 4):  # RETRY tối đa 3 lần cho mỗi tập
+                if self._stop: break
+                try:
+                    self.progress_signal.emit(f"[{i+1}/{len(self.file_paths)}] ⬆️ Upload: {bname} ..." +
+                                              (f" (lần {attempt})" if attempt > 1 else ""))
+                    upload = client.upload_audio(fp)
+                    self.progress_signal.emit(f"[{i+1}] ✅ Upload xong ({upload.duration_ms}ms) · Đang nhận dạng...")
 
-                stt_res = client.create_stt_task(
-                    audio_vid=upload.vid, audio_md5=upload.md5,
-                    duration_ms=upload.duration_ms or 10000,
-                    language=self.src_lang,
-                    translation_language=self.out_lang,
-                    use_translation=self.use_trans)
+                    stt_res = client.create_stt_task(
+                        audio_vid=upload.vid, audio_md5=upload.md5,
+                        duration_ms=upload.duration_ms or 10000,
+                        language=self.src_lang,
+                        translation_language=self.out_lang,
+                        use_translation=self.use_trans)
 
-                tasks = (stt_res.get("data") or {}).get("tasks") or []
-                if not tasks:
-                    raise RuntimeError(f"API không trả về task. Resp: {stt_res}")
-                task_id, token = tasks[0]["id"], tasks[0]["token"]
+                    tasks = (stt_res.get("data") or {}).get("tasks") or []
+                    if not tasks:
+                        raise RuntimeError(f"API không trả về task. Resp: {stt_res}")
+                    task_id, token = tasks[0]["id"], tasks[0]["token"]
 
-                result = None; status = ""
-                for attempt in range(90):
-                    if self._stop: break
-                    time.sleep(2)
-                    q = client.query_stt_task(task_id, token)
-                    qt = (q.get("data") or {}).get("tasks") or []
-                    if not qt: continue
-                    status = qt[0].get("status", "")
-                    prog   = qt[0].get("progress", 0)
-                    self.progress_signal.emit(f"[{i+1}] ⏳ {status} | {prog}%")
-                    if status in SUCCEED: result = q; break
-                    elif status in FAIL:  raise RuntimeError(f"STT thất bại: {status}")
+                    result = None; status = ""
+                    for _poll in range(90):
+                        if self._stop: break
+                        time.sleep(2)
+                        q = client.query_stt_task(task_id, token)
+                        qt = (q.get("data") or {}).get("tasks") or []
+                        if not qt: continue
+                        status = qt[0].get("status", "")
+                        pct = qt[0].get("progress", "")
+                        if pct: self.progress_signal.emit(f"[{i+1}] ⏳ {status} | {pct}%")
+                        if status in SUCCEED:
+                            result = qt[0]; break
+                        elif status in FAIL:
+                            raise RuntimeError(f"STT fail: {status}")
+                    if result is None:
+                        raise RuntimeError("Timeout nhận dạng STT")
 
-                if result is None:
-                    raise RuntimeError("Timeout hoặc bị dừng")
-
-                subs = client.extract_subtitles(result)
-                srt_lines = []
-                for j, u in enumerate(subs.utterances, 1):
-                    t = (u.translated_text if (self.use_trans
-                         and hasattr(u, "translated_text") and u.translated_text)
-                         else u.text)
-                    srt_lines.append(
-                        f"{j}\n{self._ms_to_srt(u.start_time)} --> {self._ms_to_srt(u.end_time)}\n{t}\n"
-                    )
-                with open(out_srt, "w", encoding="utf-8") as f: f.write("\n".join(srt_lines))
-                with open(out_txt, "w", encoding="utf-8") as f: f.write(subs.full_text)
-                self.progress_signal.emit(f"[{i+1}] 💾 Đã lưu: {os.path.basename(out_srt)}")
-                ok += 1
-
-            except Exception as e:
-                self.progress_signal.emit(f"[{i+1}] ❌ Lỗi {bname}: {str(e)[:100]}")
+                    subs = client.extract_subtitles({"data": {"tasks": [result]}})
+                    srt_lines = []
+                    for j, u in enumerate(subs.utterances, 1):
+                        t = (u.translated_text if (self.use_trans
+                             and hasattr(u, "translated_text") and u.translated_text)
+                             else u.text)
+                        srt_lines.append(
+                            f"{j}\n{self._ms_to_srt(u.start_time)} --> {self._ms_to_srt(u.end_time)}\n{t}\n"
+                        )
+                    with open(out_srt, "w", encoding="utf-8") as f: f.write("\n".join(srt_lines))
+                    with open(out_txt, "w", encoding="utf-8") as f: f.write(subs.full_text)
+                    self.progress_signal.emit(f"[{i+1}] 💾 Đã lưu: {os.path.basename(out_srt)}")
+                    ok += 1; stt_ok = True
+                    break  # thành công -> thoát vòng retry
+                except Exception as e:
+                    last_err = str(e)[:100]
+                    if attempt < 3:
+                        self.progress_signal.emit(f"[{i+1}] 🔄 Lỗi tách sub, thử lại lần {attempt+1}/3: {last_err}")
+                        time.sleep(attempt * 3)
+            if not stt_ok and not self._stop:
+                self.progress_signal.emit(f"[{i+1}] ❌ Tách sub lỗi sau 3 lần: {last_err}")
                 failed += 1
 
         self.finished_signal.emit(ok, failed)
@@ -784,13 +843,13 @@ class DubThread(QThread):
         return entries
 
     def run(self):
-        import urllib.request, shutil, json, time as _time
+        import urllib.request, shutil, json
         from pydub import AudioSegment
         from pydub.effects import speedup
 
         try:
             from capcut_tts_api import CapCutClient
-            client = CapCutClient()
+            client = CapCutClient(device=_get_capcut_device())
         except Exception as e:
             self.progress_signal.emit(f"❌ Không khởi tạo được CapCutClient: {e}")
             self.finished_signal.emit(0, len(self.tasks)); return
@@ -828,76 +887,96 @@ class DubThread(QThread):
                 # Tính tổng duration từ SRT cuối
                 total_ms = entries[-1][1] + 500
 
-                # TTS từng dòng
+                # TTS từng dòng — CHẠY SONG SONG nhiều dòng cho nhanh
                 combined = AudioSegment.silent(duration=total_ms)
-                for i, (start_ms, end_ms, text) in enumerate(entries):
-                    if self._stop: break
-                    if not text.strip(): continue
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                def _make_one_segment(i, start_ms, end_ms, text):
+                    """Tạo audio 1 dòng, CÓ RETRY 3 lần. Trả (i, start_ms, AudioSegment|None)."""
+                    if not text.strip():
+                        return (i, start_ms, None)
                     target_dur = end_ms - start_ms
                     seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp3")
-                    try:
-                        if is_neural:
-                            import asyncio, edge_tts
-                            r = float(self.rate)
-                            pct = int((r-1.0)*100)
-                            rate_str = f"+{pct}%" if pct>=0 else f"{pct}%"
-                            async def _run_edge():
-                                comm = edge_tts.Communicate(text=text, voice=self.voice_type, rate=rate_str)
-                                await comm.save(seg_path)
-                            asyncio.run(_run_edge())
-                        else:
-                            create = client.create_tts_task(texts=text, voice=self.voice_type, rate=self.rate)
-                            tasks_r = (create.get("data") or {}).get("tasks") or []
-                            if not tasks_r: raise RuntimeError("Không có TTS task")
-                            tid, tok = tasks_r[0]["id"], tasks_r[0]["token"]
-                            url = None
-                            for _ in range(60):
-                                _time.sleep(2)
-                                q = client.query_tts_task(tid, tok)
-                                qt = (q.get("data") or {}).get("tasks") or []
-                                if not qt: continue
-                                st = qt[0].get("status","")
-                                if st in SUCCEED:
-                                    raw = qt[0].get("payload","{}")
-                                    pl = json.loads(raw) if isinstance(raw,str) else raw
-                                    subs2 = pl.get("audio_subtitles") or []
-                                    if subs2: url = subs2[0].get("speech_url","")
-                                    if not url:
-                                        for k in ("audio_list","url_list"):
-                                            for u in (pl.get(k) or []):
-                                                url = (u.get("url") or u.get("speech_url")) if isinstance(u,dict) else str(u)
-                                                if url: break
-                                    break
-                                elif st in FAIL: raise RuntimeError(f"TTS fail: {st}")
-                            if not url: raise RuntimeError("Timeout TTS")
-                            urllib.request.urlretrieve(url, seg_path)
-
-                        # Chỉnh tốc độ cho khớp duration SRT.
-                        # Decode qua ffmpeg trực tiếp (from_file thay from_mp3) để bớt phụ thuộc ffprobe.
+                    last_err = ""
+                    for attempt in range(1, 4):  # thử tối đa 3 lần
+                        if self._stop:
+                            return (i, start_ms, None)
                         try:
-                            audio_seg = AudioSegment.from_file(seg_path, format="mp3")
-                        except Exception:
-                            # ffprobe/from_mp3 lỗi -> ép ffmpeg convert sang wav rồi đọc lại
-                            wav_path = seg_path + ".wav"
-                            _flags = 0x08000000 if os.name == "nt" else 0
-                            subprocess.run([FFMPEG_PATH or "ffmpeg", "-y", "-i", seg_path, wav_path],
-                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=_flags)
-                            audio_seg = AudioSegment.from_file(wav_path, format="wav")
-                        cur = len(audio_seg)
-                        if cur > target_dur and target_dur > 0:
-                            factor = min(cur/target_dur, 2.5)
-                            try:
-                                audio_seg = speedup(audio_seg, playback_speed=factor)
-                            except Exception:
-                                pass  # không tăng tốc được thì để nguyên, vẫn có tiếng
-                        elif cur < target_dur:
-                            audio_seg += AudioSegment.silent(duration=target_dur-cur)
+                            if is_neural:
+                                import asyncio, edge_tts
+                                r = float(self.rate)
+                                pct = int((r-1.0)*100)
+                                rate_str = f"+{pct}%" if pct>=0 else f"{pct}%"
+                                async def _run_edge():
+                                    comm = edge_tts.Communicate(text=text, voice=self.voice_type, rate=rate_str)
+                                    await comm.save(seg_path)
+                                asyncio.run(_run_edge())
+                            else:
+                                create = client.create_tts_task(texts=text, voice=self.voice_type, rate=self.rate)
+                                tasks_r = (create.get("data") or {}).get("tasks") or []
+                                if not tasks_r: raise RuntimeError("Không có TTS task")
+                                tid, tok = tasks_r[0]["id"], tasks_r[0]["token"]
+                                url = None
+                                for _ in range(60):
+                                    time.sleep(2)
+                                    q = client.query_tts_task(tid, tok)
+                                    qt = (q.get("data") or {}).get("tasks") or []
+                                    if not qt: continue
+                                    st = qt[0].get("status","")
+                                    if st in SUCCEED:
+                                        raw = qt[0].get("payload","{}")
+                                        pl = json.loads(raw) if isinstance(raw,str) else raw
+                                        subs2 = pl.get("audio_subtitles") or []
+                                        if subs2: url = subs2[0].get("speech_url","")
+                                        if not url:
+                                            for k in ("audio_list","url_list"):
+                                                for u in (pl.get(k) or []):
+                                                    url = (u.get("url") or u.get("speech_url")) if isinstance(u,dict) else str(u)
+                                                    if url: break
+                                        break
+                                    elif st in FAIL: raise RuntimeError(f"TTS fail: {st}")
+                                if not url: raise RuntimeError("Timeout TTS")
+                                urllib.request.urlretrieve(url, seg_path)
 
-                        # Đặt vào đúng vị trí timeline
-                        combined = combined.overlay(audio_seg, position=start_ms)
-                        self.progress_signal.emit(f"[{idx+1}] 🔊 Dòng {i+1}/{len(entries)} xong")
-                    except Exception as seg_e:
-                        self.progress_signal.emit(f"[{idx+1}] ⚠️ Dòng {i+1}: {str(seg_e)[:60]}")
+                            # Decode + chỉnh độ dài cho khớp phụ đề
+                            try:
+                                audio_seg = AudioSegment.from_file(seg_path, format="mp3")
+                            except Exception:
+                                wav_path = seg_path + ".wav"
+                                _flags = 0x08000000 if os.name == "nt" else 0
+                                subprocess.run([FFMPEG_PATH or "ffmpeg", "-y", "-i", seg_path, wav_path],
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=_flags)
+                                audio_seg = AudioSegment.from_file(wav_path, format="wav")
+                            cur = len(audio_seg)
+                            if cur > target_dur and target_dur > 0:
+                                factor = min(cur/target_dur, 2.5)
+                                try: audio_seg = speedup(audio_seg, playback_speed=factor)
+                                except Exception: pass
+                            elif cur < target_dur:
+                                audio_seg += AudioSegment.silent(duration=target_dur-cur)
+                            return (i, start_ms, audio_seg)  # THÀNH CÔNG
+                        except Exception as seg_e:
+                            last_err = str(seg_e)[:60]
+                            if attempt < 3:
+                                self.progress_signal.emit(f"[{idx+1}] 🔄 Dòng {i+1} lỗi, thử lại lần {attempt+1}/3...")
+                                time.sleep(attempt * 2)  # nghỉ tăng dần rồi thử lại
+                    # Thử hết 3 lần vẫn lỗi
+                    self.progress_signal.emit(f"[{idx+1}] ❌ Dòng {i+1} lỗi sau 3 lần: {last_err}")
+                    return (i, start_ms, None)
+
+                # Gửi song song (mặc định 4 luồng - vừa đủ nhanh, tránh CapCut rate-limit)
+                luong_tts = getattr(self, "tts_workers", 4)
+                done_cnt = 0
+                with ThreadPoolExecutor(max_workers=luong_tts) as ex:
+                    futs = [ex.submit(_make_one_segment, i, s, e, t)
+                            for i, (s, e, t) in enumerate(entries)]
+                    for fut in as_completed(futs):
+                        if self._stop: break
+                        i, start_ms, seg = fut.result()
+                        done_cnt += 1
+                        if seg is not None:
+                            combined = combined.overlay(seg, position=start_ms)
+                            self.progress_signal.emit(f"[{idx+1}] 🔊 {done_cnt}/{len(entries)} dòng")
 
                 if self._stop: break
 
@@ -1292,6 +1371,16 @@ class HonggouWidget(QWidget):
             QCheckBox::indicator:checked { background:#f59e0b; }
         """)
         dub_ctrl.addWidget(self.chk_mute_original)
+
+        self.chk_del_original = QCheckBox("🗑 Xóa file gốc")
+        self.chk_del_original.setChecked(False)  # mặc định TẮT - giữ nguyên logic cũ
+        self.chk_del_original.setToolTip("Bật = sau khi xong, xóa video gốc + sub tiếng Trung,\nchỉ giữ bản lồng tiếng + phụ đề Việt (đổi tên sạch: Tap_01.mp4 + Tap_01.srt)")
+        self.chk_del_original.setStyleSheet("""
+            QCheckBox { color:#fca5a5; font-weight:bold; font-size:13px; padding:2px; }
+            QCheckBox::indicator { width:18px; height:18px; border:2px solid #ef4444; border-radius:4px; background:#1f2937; }
+            QCheckBox::indicator:checked { background:#ef4444; }
+        """)
+        dub_ctrl.addWidget(self.chk_del_original)
 
         self.btn_dub_now = QPushButton("🎙 Lồng tiếng ngay")
         self.btn_dub_now.setEnabled(False)
@@ -2035,21 +2124,35 @@ class HonggouWidget(QWidget):
 
         mode = self.merge_mode_combo.currentIndex()
         files_to_merge = getattr(self, 'downloaded_file_paths', [])
+        auto_stt = hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked()
 
-        # Nếu không gộp hoặc không đủ file
+        # Nhớ chế độ ghép để làm BƯỚC CUỐI (sau khi lồng tiếng) - cuốn chiếu trước, ghép sau
+        self._merge_mode_after = mode
+
+        # Bật tự động tách sub -> TÁCH SUB TRƯỚC, hoãn ghép tới cuối (dù chọn gộp gì)
+        if auto_stt and files_to_merge:
+            self.btn_download.setEnabled(True)
+            self.btn_download.setText("📥 Tải đã chọn")
+            if hasattr(self, 'lbl_downloaded_badge'): self.lbl_downloaded_badge.show()
+            self.lbl_status.setText(f"✅ Đã tải {total_downloaded} tập. Tự động tách sub (ghép ở bước cuối)...")
+            self._files_for_stt = list(files_to_merge)
+            QTimer.singleShot(500, self._run_stt_on_downloaded)
+            return
+
+        # Không gộp hoặc không đủ file -> xong luôn
         if mode == 0 or len(files_to_merge) <= 1:
             self.btn_download.setEnabled(True)
             self.btn_download.setText("📥 Tải đã chọn")
             self.lbl_status.setText(f"✅ Hoàn tất! Đã lưu {total_downloaded} tập phim lẻ.")
             if hasattr(self, 'lbl_downloaded_badge'): self.lbl_downloaded_badge.show()
             QMessageBox.information(self, "Thành công", f"Đã lưu thành công {total_downloaded} tập phim về máy bạn!")
-            if hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked():
-                QTimer.singleShot(500, self._run_stt_on_downloaded)
             return
 
-        # ==========================================
-        # QUÁ TRÌNH GỘP FILE (MERGE)
-        # ==========================================
+        # Không auto tách sub nhưng có chọn gộp -> ghép ngay (như cũ)
+        self._do_merge(mode, files_to_merge)
+
+    def _do_merge(self, mode, files_to_merge, after_dub=False):
+        """Ghép file theo chế độ. after_dub=True: đang ghép các file _dubbed.mp4 ở bước cuối."""
         merge_tasks = []
         safe_title = re.sub(r'[\\/*?:"<>|]', "", self.current_title)
 
@@ -2103,21 +2206,10 @@ class HonggouWidget(QWidget):
     def _on_merge_finished(self):
         self.btn_download.setEnabled(True)
         self.btn_download.setText("📥 Tải đã chọn")
-        self.lbl_status.setText("✅ Đã tải và gộp thành công file!")
+        self.lbl_status.setText("🎉 Hoàn tất! Đã lồng tiếng và ghép file xong.")
         if hasattr(self, 'lbl_downloaded_badge'): self.lbl_downloaded_badge.show()
-        QMessageBox.information(
-            self, "Thành công hoàn toàn",
-            "Hệ thống đã tải và gộp thành công phim!\nCác tập lẻ đã được tự động xóa để tiết kiệm bộ nhớ."
-        )
-        if hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked():
-            # Tách sub từ file gộp (file mới nhất trong thư mục phim)
-            folder = os.path.join(self.save_folder, self.current_series_id or "")
-            if os.path.exists(folder):
-                mp4s = sorted([os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".mp4")],
-                              key=os.path.getmtime, reverse=True)
-                if mp4s:
-                    self._files_for_stt = mp4s
-                    QTimer.singleShot(500, self._run_stt_on_downloaded)
+        if hasattr(self, 'txt_stt_log'):
+            self.txt_stt_log.append("🎉 XONG TOÀN BỘ: tách sub → dịch → lồng tiếng → ghép file!")
 
     # ─────────────────────────────────────────────────────────────────
     #  STT / TÁCH SUB
@@ -2232,18 +2324,28 @@ class HonggouWidget(QWidget):
         self._files_for_stt = None
 
     def _start_gemini_translate(self, srt_files):
-        """Dịch danh sách (video, srt) bằng Gemini -> tạo _vi.srt, xong thì lồng tiếng."""
+        """Dịch (video, srt) bằng Gemini. CUỐN CHIẾU: tập nào dịch xong -> lồng tiếng ngay
+        (song song với việc dịch tập tiếp theo), không đợi dịch hết cả lô."""
         settings = QSettings("HongguoDownloader", "ClientApp")
         preset = settings.value("trans_preset", list(PROMPT_PRESETS.keys())[0] if PROMPT_PRESETS else "")
         queue = [{"video": v, "srt": s} for (v, s) in srt_files]
-        self._gemini_vi_map = {}   # video_path -> _vi.srt
+        self._gemini_vi_map = {}
         self._gemini_total = len(queue)
         self._gemini_done_count = 0
+        # Hàng đợi lồng tiếng cuốn chiếu
+        self._dub_queue = []           # danh sách video path chờ lồng tiếng
+        self._dub_running = False      # đang lồng tiếng 1 tập hay không
+        self._auto_dub_on = hasattr(self, 'chk_auto_dub') and self.chk_auto_dub.isChecked()
 
-        self._gtrans_thread = GeminiTranslateThread(queue, preset, "Auto (Mặc định)", 100)
+        self._gtrans_thread = GeminiTranslateThread(queue, preset, "Auto (Mặc định)", 150)
         self._gtrans_thread.log.connect(lambda m: self.txt_stt_log.append(m.strip()))
         def _on_item_done(idx, video_path, vi_path):
             self._gemini_vi_map[video_path] = vi_path
+            # Dịch xong 1 tập -> nếu bật auto dub thì đẩy vào hàng đợi lồng tiếng NGAY
+            if self._auto_dub_on and os.path.exists(vi_path):
+                self.txt_stt_log.append(f"✅ Dịch xong {os.path.basename(video_path)} → xếp hàng lồng tiếng.")
+                self._dub_queue.append(video_path)
+                self._pump_dub_queue()
         def _on_item_failed(idx, msg):
             self.txt_stt_log.append(f"⚠️ Dịch lỗi 1 file: {msg}")
         self._gtrans_thread.item_done.connect(_on_item_done)
@@ -2252,12 +2354,112 @@ class HonggouWidget(QWidget):
         self._keep_thread_alive(self._gtrans_thread)
         self._gtrans_thread.start()
 
+    def _pump_dub_queue(self):
+        """Chạy lồng tiếng lần lượt từng tập trong hàng đợi (1 tập 1 lúc, tránh đụng CapCut)."""
+        if self._dub_running or not self._dub_queue:
+            return
+        video_path = self._dub_queue.pop(0)
+        vi_srt = os.path.splitext(video_path)[0] + "_vi.srt"
+        if not os.path.exists(vi_srt):
+            # chưa có bản dịch -> bỏ, chạy tập kế
+            QTimer.singleShot(100, self._pump_dub_queue)
+            return
+        self._dub_running = True
+        voice_type = self.cmb_dub_voice.currentText()
+        voice_type = voice_type[voice_type.rfind("[")+1:-1] if "[" in voice_type else "BV074_streaming"
+        rate = str(self.spn_dub_rate.value()) if hasattr(self, 'spn_dub_rate') else "1.0"
+        mute_orig = self.chk_mute_original.isChecked() if hasattr(self, 'chk_mute_original') else True
+        self.txt_stt_log.append(f"🎙 Lồng tiếng: {os.path.basename(video_path)}...")
+
+        self._roll_dub_thread = DubThread([{"video": video_path, "srt": vi_srt}],
+                                          voice_type=voice_type, rate=rate, mute_original=mute_orig)
+        self._roll_dub_thread.progress_signal.connect(lambda m: self.txt_stt_log.append(m.strip()))
+        def _one_done(ok, failed):
+            self._dub_running = False
+            # Dọn file gốc tập vừa xong (nếu bật xóa VÀ chế độ không ghép)
+            # Nếu có ghép thì để tới bước ghép mới dọn (vì merge cần file _dubbed).
+            if getattr(self, '_merge_mode_after', 0) == 0:
+                self._cleanup_one_episode(video_path, vi_srt)
+            if self._dub_queue:
+                self._pump_dub_queue()  # còn tập -> chạy tiếp
+            else:
+                trans_done = not (hasattr(self, '_gtrans_thread') and self._gtrans_thread.isRunning())
+                if trans_done:
+                    self._merge_after_dub()
+        self._roll_dub_thread.finished_signal.connect(_one_done)
+        self._keep_thread_alive(self._roll_dub_thread)
+        self._roll_dub_thread.start()
+
+    def _cleanup_one_episode(self, video_path, vi_srt):
+        """Nếu bật 'Xóa file gốc': xóa video gốc + sub Trung + txt,
+        đổi tên bản lồng tiếng và _vi.srt thành tên sạch (Tap_01.mp4 + Tap_01.srt)."""
+        if not (hasattr(self, 'chk_del_original') and self.chk_del_original.isChecked()):
+            return
+        try:
+            base = os.path.splitext(video_path)[0]      # .../Tap_01
+            dubbed = base + "_dubbed.mp4"
+            srt_goc = base + ".srt"
+            txt_goc = base + ".txt"
+            if not os.path.exists(dubbed):
+                return  # chưa có bản lồng tiếng -> không dọn (an toàn)
+            # 1. Xóa video gốc (tiếng Trung) + sub Trung + txt
+            for f in (video_path, srt_goc, txt_goc):
+                try:
+                    if os.path.exists(f): os.remove(f)
+                except Exception: pass
+            # 2. Đổi tên bản lồng tiếng -> tên sạch (chiếm chỗ file gốc)
+            try:
+                if os.path.exists(video_path):  # gốc chưa xóa được -> bỏ đổi tên
+                    pass
+                else:
+                    os.rename(dubbed, video_path)   # Tap_01_dubbed.mp4 -> Tap_01.mp4
+            except Exception: pass
+            # 3. Đổi tên _vi.srt -> Tap_01.srt (phụ đề Việt tên sạch)
+            try:
+                if os.path.exists(vi_srt):
+                    os.rename(vi_srt, srt_goc)
+            except Exception: pass
+            self.txt_stt_log.append(f"🗑 Đã dọn file gốc, giữ bản Việt: {os.path.basename(video_path)}")
+        except Exception as e:
+            self.txt_stt_log.append(f"⚠️ Dọn file lỗi: {str(e)[:50]}")
+
+    def _merge_after_dub(self):
+        """BƯỚC CUỐI: ghép các file _dubbed.mp4 theo chế độ đã chọn (trọn bộ / theo phần)."""
+        mode = getattr(self, '_merge_mode_after', 0)
+        if mode == 0:
+            self.txt_stt_log.append("🎉 Hoàn tất tất cả: tách sub → dịch → lồng tiếng (từng tập rời)!")
+            self.lbl_status.setText("🎉 Hoàn tất! Các tập đã lồng tiếng (rời).")
+            return
+        # Gom các file _dubbed.mp4 theo thứ tự tập
+        dubbed = sorted(getattr(self, '_gemini_vi_map', {}).keys())
+        dub_files = []
+        for v in dubbed:
+            df = os.path.splitext(v)[0] + "_dubbed.mp4"
+            if os.path.exists(df):
+                dub_files.append(df)
+        if len(dub_files) <= 1:
+            self.txt_stt_log.append("🎉 Hoàn tất! (Không đủ file để ghép.)")
+            return
+        # Nếu bật xóa file gốc: dọn video gốc + sub Trung trước khi ghép (giữ _dubbed để ghép)
+        if hasattr(self, 'chk_del_original') and self.chk_del_original.isChecked():
+            for v in dubbed:
+                b = os.path.splitext(v)[0]
+                for f in (v, b + ".srt", b + ".txt"):  # video gốc, sub Trung, txt
+                    try:
+                        if os.path.exists(f): os.remove(f)
+                    except Exception: pass
+            self.txt_stt_log.append("🗑 Đã dọn file gốc trước khi ghép.")
+        self.txt_stt_log.append(f"🔗 Đang ghép {len(dub_files)} tập đã lồng tiếng thành {'trọn bộ' if mode==1 else 'từng phần'}...")
+        self._do_merge(mode, dub_files, after_dub=True)
+
     def _on_gemini_all_done(self):
         n = len(getattr(self, '_gemini_vi_map', {}))
-        self.txt_stt_log.append(f"\n✅ Dịch Gemini xong: {n} file.")
-        # Sau khi dịch xong -> lồng tiếng (nếu bật auto dub)
-        if hasattr(self, 'chk_auto_dub') and self.chk_auto_dub.isChecked():
-            QTimer.singleShot(500, self._run_dub_on_downloaded)
+        self.txt_stt_log.append(f"\n✅ Dịch Gemini xong toàn bộ: {n} file.")
+        if self._auto_dub_on:
+            self._pump_dub_queue()
+            # Nếu lồng tiếng cũng đã xong hết (hàng đợi rỗng + không đang chạy) -> ghép luôn
+            if not self._dub_queue and not self._dub_running:
+                self._merge_after_dub()
         else:
             QMessageBox.information(self, "Dịch hoàn tất",
                 f"Đã dịch {n} file sang tiếng Việt (_vi.srt).\nCó thể bấm Lồng tiếng.")
