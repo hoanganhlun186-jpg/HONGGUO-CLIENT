@@ -24,7 +24,7 @@ jobs:
 
     - name: Build EXE with Nuitka
       run: |
-        python -m nuitka --onefile --windows-disable-console --enable-plugin=pyqt6 --include-package=capcut_tts_api --include-module=capcut_widget --include-module=translate_tab --include-module=cenc_decrypt --include-package=Crypto --include-data-files=Voice.json=Voice.json --output-filename=AnhStudio.exe --assume-yes-for-downloads honggou_tab.py
+        python -m nuitka --onefile --windows-disable-console --enable-plugin=pyqt6 --include-package=capcut_tts_api --include-module=capcut_widget --include-module=translate_tab --include-module=cenc_decrypt --include-module=demucs_manager --include-package=Crypto --include-data-files=Voice.json=Voice.json --output-filename=AnhStudio.exe --assume-yes-for-downloads honggou_tab.py
 
     # ── Tải ffmpeg + ffprobe (bản tĩnh, không cần cài) ──
     - name: Download ffmpeg

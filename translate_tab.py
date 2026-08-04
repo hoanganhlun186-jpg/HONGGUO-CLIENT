@@ -23,7 +23,12 @@ BROWSER_ARGS = ["--disable-blink-features=AutomationControlled", "--disable-gpu"
 # BỘ QUY TẮC DỊCH THUẬT (PROMPT PRESETS ĐA DẠNG)
 # ============================================================
 PROMPT_PRESETS = {
-    "🌟 VIP: Tự động phân tích & Suy luận (Đề xuất)": "Bạn là biên dịch viên phim chuyên nghiệp. Dịch sát nghĩa, mượt mà. Hãy tuân thủ nghiêm ngặt bối cảnh và xưng hô đã được phân tích.",
+    "🌟 SUPER VIP: Tối ưu Dubbing AI (Mọi Bối Cảnh)": """Bạn là chuyên gia biên dịch phim và viết kịch bản lồng tiếng (Dubbing). Nhiệm vụ của bạn là dịch mượt mà, tự nhiên và tối ưu tuyệt đối cho giọng đọc AI (Text-to-Speech).
+YÊU CẦU DỊCH THUẬT TỐI ƯU:
+1. Súc tích tối đa (Quy tắc 3 giây): Rút ngắn số lượng từ 20-30% so với gốc để tránh lố nhịp audio. Lược bỏ từ đệm (đã, đang, sẽ, những, các...) và bỏ bớt đại từ/chủ ngữ nếu ngữ cảnh đã rõ.
+2. Thích nghi văn phong (Cực kỳ quan trọng): Tự động điều chỉnh tỷ lệ từ Hán Việt, thuần Việt hoặc tiếng lóng dựa CHÍNH XÁC vào bối cảnh (cổ trang, hiện đại, hoặc xuyên không). Xử lý mượt sự giao thoa ngôn ngữ nếu là phim xuyên không.
+3. Tối ưu câu chữ Audio: Thay thế các cụm thuần Việt dài dòng bằng từ súc tích (VD: 'người làm cho tôi' -> 'thuộc hạ'). Văn phong gãy gọn như người thật đang nói chuyện. Phiên âm tên riêng chuẩn Hán Việt.
+4. Xử lý điểm mù: Tuyệt đối không dịch word-by-word. Nếu mơ hồ chủ thể, dùng cách diễn đạt trung tính thay vì đoán bừa.""",
     "1. Tiên Hiệp / Huyền Huyễn (Tu tiên)": "Bạn là dịch giả truyện Tiên Hiệp. Dịch sang tiếng Việt, ƯU TIÊN dùng từ Hán Việt (đạo hữu, bổn tọa, tại hạ, tông môn, sư tôn, sư muội...).",
     "2. Hào Môn / Ngôn Tình (Tổng tài)": "Bạn là dịch giả truyện Ngôn Tình. Dịch với giọng văn bá đạo, sến súa hoặc lạnh lùng (hắn, cô ta, thiếu gia, phu nhân, bảo bối...).",
     "3. Giang Hồ / Xã Hội Đen (Hành động)": "Bạn là dịch giả phim Xã Hội Đen. Dịch dùng từ lóng, xưng hô giang hồ (đại ca, lão đại, sếp, tao/mày, anh/chú, tụi bấy...).",
@@ -80,7 +85,7 @@ def _select_model(page, model_key, log_fn=None):
         if log_fn: log_fn(f"⚠️ Không chọn được model {model_key}: {e}\n")
 
 # ============================================================
-# THREAD THAO TÁC ĐĂNG NHẬP (Dùng Chrome Thật + Profile Độc lập)
+# THREAD THAO TÁC ĐĂNG NHẬP
 # ============================================================
 class GoogleManualLoginThread(QThread):
     log = pyqtSignal(str)
@@ -92,21 +97,18 @@ class GoogleManualLoginThread(QThread):
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
-                
-                # Tạo thư mục Profile Tool cạnh nơi lưu code để lách luật
                 base_dir = os.path.dirname(os.path.abspath(__file__))
                 tool_profile_path = os.path.join(base_dir, "AnhStudio_ChromeData")
                 
                 ctx = p.chromium.launch_persistent_context(
                     user_data_dir=tool_profile_path,
-                    channel="chrome", # Chỉ định xài Chrome thật cài trong máy, không xài Chromium ảo
+                    channel="chrome",
                     headless=False,
                     user_agent=UA,
                     viewport={"width": 1280, "height": 900},
                     args=["--disable-blink-features=AutomationControlled"]
                 )
                 
-                # Bơm Script Tàng hình vào tất cả các trang được mở ra
                 ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
                 
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -131,7 +133,6 @@ class GoogleManualLoginThread(QThread):
                     page.wait_for_timeout(3000)
                 
                 if logged_in:
-                    # Ghi đè giả lập trạng thái AUTH_FILE để tool hoạt động bình thường
                     ctx.storage_state(path=AUTH_FILE)
                     self.log.emit(f"✅ Đăng nhập hợp lệ. Bắt đầu quét menu phiên bản...\n")
                     page.wait_for_timeout(2000)
@@ -170,8 +171,8 @@ class GoogleManualLoginThread(QThread):
 class GeminiTranslateThread(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(int)
-    context_extracted = pyqtSignal(int, str) # Gửi Context lên UI
-    chunk_done = pyqtSignal(int, dict)       # Quăng chữ dịch lên UI (Real-time)
+    context_extracted = pyqtSignal(int, str)
+    chunk_done = pyqtSignal(int, dict)
     item_done = pyqtSignal(int, str, str)
     item_failed = pyqtSignal(int, str)
     all_done = pyqtSignal()
@@ -208,7 +209,6 @@ class GeminiTranslateThread(QThread):
             from playwright.sync_api import sync_playwright
             pw = sync_playwright().start()
             
-            # Sử dụng thư mục Profile chung
             base_dir = os.path.dirname(os.path.abspath(__file__))
             tool_profile_path = os.path.join(base_dir, "AnhStudio_ChromeData")
             
@@ -217,8 +217,8 @@ class GeminiTranslateThread(QThread):
                 try:
                     ctx = pw.chromium.launch_persistent_context(
                         user_data_dir=tool_profile_path,
-                        channel="chrome", # Dùng Chrome thật
-                        headless=True,    # Ẩn trình duyệt khi đang dịch tự động
+                        channel="chrome",
+                        headless=True,
                         user_agent=UA,
                         viewport={"width": 1280, "height": 900},
                         args=BROWSER_ARGS
@@ -231,14 +231,13 @@ class GeminiTranslateThread(QThread):
                     if attempt < 2:
                         self.log.emit(
                             f"⚠️ Mở Chrome thất bại (lần {attempt+1}/3): {e}\n"
-                            f"⏳ Có thể do phiên Chrome trước chưa kịp giải phóng profile. Đợi 3s rồi thử lại...\n"
+                            f"⏳ Đợi 3s rồi thử lại...\n"
                         )
                         import time as _time
                         _time.sleep(3)
             if ctx is None:
-                raise RuntimeError(f"Không thể mở Chrome sau 3 lần thử: {launch_err}")
+                raise RuntimeError(f"Không thể mở Chrome sau 3 lần thử: {launch_err}\n=> Hãy mở Task Manager và End Task các tiến trình 'chrome.exe' đang chạy ngầm rồi thử lại.")
             
-            # Bơm Script Tàng hình để qua mặt CAPTCHA
             ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -250,7 +249,6 @@ class GeminiTranslateThread(QThread):
                 base = os.path.basename(srt_path)
                 self.log.emit(f"\n{'='*50}\n📄 [{idx+1}/{total}] Đang xử lý: {base}\n")
                 try: 
-                    # TRUYỀN THÊM ctx ĐỂ HÀM BÊN TRONG CÓ THỂ QUẢN LÝ VÀ ĐÓNG MỞ PAGE
                     page = self._translate_smart(ctx, page, idx, video_path, srt_path)
                 except Exception as e: 
                     self.item_failed.emit(idx, str(e))
@@ -272,10 +270,7 @@ class GeminiTranslateThread(QThread):
         if not blocks:
             self.item_failed.emit(idx, "File trống hoặc sai định dạng SRT."); return page
             
-        # ==========================================
-        # BƯỚC 1: TRINH SÁT BỐI CẢNH (AI EXTRACT CONTEXT)
-        # ==========================================
-        sample_blocks = blocks[:150] # Lấy 150 câu đầu để nhận diện
+        sample_blocks = blocks[:150]
         sample_text = "\n".join([b["text"] for b in sample_blocks])
         
         context_prompt = (
@@ -292,14 +287,10 @@ class GeminiTranslateThread(QThread):
         if "ERROR" in context_res:
             context_res = "Không thể phân tích bối cảnh. Hệ thống sẽ dịch theo mặc định."
         
-        # Làm sạch markdown để quăng lên UI đẹp hơn
         clean_ctx = re.sub(r'```[a-zA-Z]*\n?', '', context_res).replace('```', '')
         self.context_extracted.emit(idx, clean_ctx.strip())
         self.log.emit("🧠 Phân tích xong bối cảnh! Bắt đầu dịch...\n")
 
-        # ==========================================
-        # BƯỚC 2: DỊCH CHIA KHỐI & TÍCH LŨY DỊCH NỐT PHẦN THIẾU
-        # ==========================================
         chunks = [blocks[i:i + self.chunk_size] for i in range(0, len(blocks), self.chunk_size)]
         translated_results = {} 
         has_error = False
@@ -310,23 +301,30 @@ class GeminiTranslateThread(QThread):
             chunk_to_translate = chunk.copy()
             translated_chunk_lines = []
             
-            max_retries = 5  # Đã tăng lên 5 lần để bắt dịch lại nếu sót chữ
+            max_retries = 5
             retry_count = 0
             progressive_steps = 0
             
-            # Vòng lặp này sẽ bám đuổi cho đến khi dịch ĐỦ số câu trong khối thì thôi
+            # SỬ DỤNG batch_size CHIA LƯỢNG GỬI (TRÁNH LỖI OUT OF RANGE)
+            batch_size = len(chunk_to_translate)
+            
             while len(chunk_to_translate) > 0 and retry_count < max_retries and progressive_steps < 10:
                 if self._cancel: break
                 
-                lines_to_translate = [b["text"] for b in chunk_to_translate]
+                # Chỉ lấy ra đúng lượng batch_size để dịch
+                current_batch = chunk_to_translate[:batch_size]
+                lines_to_translate = [b["text"] for b in current_batch]
                 text_payload = "\n".join(lines_to_translate)
                 
-                # BẮT BUỘC: Nhồi lại biến {clean_ctx} (Bối cảnh vừa nhận diện) vào đây.
+                # ====================================================
+                # BẢN FIX: ÉP BUỘC AI PHẢI DÙNG TIẾNG VIỆT CÓ DẤU
+                # ====================================================
                 strict_rules = f"""QUY TẮC TUYỆT ĐỐI (VI PHẠM SẼ LỖI PHẦN MỀM):
 1. BẮT BUỘC trả về ĐÚNG {len(lines_to_translate)} dòng. Không gộp, không tách.
-2. KHÔNG giải thích, KHÔNG CHÀO HỎI (Tuyệt đối không được nói "Dạ", "Đây là bản dịch"...), KHÔNG dùng thẻ markdown. CHỈ TRẢ VỀ NỘI DUNG DỊCH.
-3. DỊCH SẠCH 100% SANG TIẾNG VIỆT, TUYỆT ĐỐI KHÔNG ĐỂ SÓT LẠI CHỮ HÁN/TRUNG QUỐC.
-4. ÁP DỤNG BỐI CẢNH VÀ XƯNG HÔ SAU ĐÂY VÀO BẢN DỊCH:
+2. KHÔNG giải thích, KHÔNG CHÀO HỎI. KHÔNG dùng thẻ markdown. CHỈ TRẢ VỀ NỘI DUNG DỊCH.
+3. BẮT BUỘC SỬ DỤNG TIẾNG VIỆT CÓ DẤU CHUẨN CHÍNH TẢ (Ví dụ: "Không", tuyệt đối không viết "Khong"). Đảm bảo giữ nguyên các dấu thanh của tiếng Việt.
+4. DỊCH SẠCH 100%, KHÔNG ĐỂ SÓT LẠI KÝ TỰ HÁN/TRUNG QUỐC.
+5. ÁP DỤNG BỐI CẢNH VÀ XƯNG HÔ SAU ĐÂY VÀO BẢN DỊCH:
 ---
 {clean_ctx}
 ---"""
@@ -334,7 +332,7 @@ class GeminiTranslateThread(QThread):
                 final_prompt = f"{self.preset_text}\n\n{strict_rules}\n\nDịch {len(lines_to_translate)} dòng sau:\n{text_payload}"
                 
                 if retry_count == 0:
-                    if len(chunk_to_translate) == len(chunk):
+                    if batch_size == len(chunk):
                         self.log.emit(f"⏳ Đang dịch khối {i+1}/{len(chunks)} ({len(lines_to_translate)} câu)...\n")
                     else:
                         self.log.emit(f"🔄 Nạp lại bối cảnh, mở trang mới dịch TIẾP {len(lines_to_translate)} câu bị thiếu của khối {i+1}...\n")
@@ -346,50 +344,45 @@ class GeminiTranslateThread(QThread):
                 if c_res.startswith("ERROR"): 
                     self.log.emit(f"⚠️ Lỗi mạng/gửi: {c_res}\n")
                     self.log.emit(f"⚙️ Đang Thoát vào lại (Mở trang mới) để reset AI...\n")
-                    try:
-                        page.close()
-                        page = ctx.new_page()
+                    try: page.close()
+                    except Exception: pass
+                    try: page = ctx.new_page(); page.goto("about:blank")
                     except Exception: pass
                     retry_count += 1
+                    time.sleep(2)
                     continue
                     
-                # Làm sạch kết quả trả về
                 res_clean = re.sub(r'```[a-zA-Z]*\n?', '', c_res)
                 res_clean = res_clean.replace('```', '').replace('*', '')
                 temp_lines_raw = [l.strip() for l in res_clean.split('\n') if l.strip()]
                 
-                # ====================================================
-                # LỚP BẢO VỆ 2: PHẪU THUẬT SUB (SUB-SURGEON)
-                # ====================================================
-                # 1. Chặt bỏ câu chào hỏi luyên thuyên của AI
+                # Phẫu thuật sub
                 while temp_lines_raw:
-                    first_line = temp_lines_raw[0].lower()
-                    if any(kw in first_line for kw in ["dạ,", "dạ ", "đây là bản", "bản dịch", "dưới đây là", "chắc chắn", "tất nhiên", "theo yêu cầu"]):
+                    first_line = temp_lines_raw[0].strip().lower()
+                    forbidden_starts = ("dạ,", "dạ ", "vâng", "đây là bản", "bản dịch", "dưới đây là", "chắc chắn", "tất nhiên", "theo yêu cầu")
+                    
+                    if first_line.startswith(forbidden_starts):
                         self.log.emit(f"✂️ Đã chặt bỏ câu chào hỏi thừa của AI: '{temp_lines_raw[0]}'\n")
                         temp_lines_raw.pop(0)
                     else:
                         break
                         
-                # 2. Xử lý ảo giác lặp từ (Vâng vâng vâng...)
                 temp_lines = []
                 for line in temp_lines_raw:
                     clean_line = re.sub(r'(\b\w+\b)(?:\s+\1){2,}', r'\1', line, flags=re.IGNORECASE)
                     clean_line = re.sub(r' +', ' ', clean_line)
                     temp_lines.append(clean_line)
-                # ====================================================
                 
                 if len(temp_lines) == 0:
                     self.log.emit(f"⚠️ AI không trả về dòng nào hợp lệ. Thoát vào lại và thử lại...\n")
-                    try:
-                        page.close()
-                        page = ctx.new_page()
+                    try: page.close()
+                    except Exception: pass
+                    try: page = ctx.new_page(); page.goto("about:blank")
                     except Exception: pass
                     retry_count += 1
+                    time.sleep(2)
                     continue
                 
-                # ====================================================
-                # BỘ LỌC ĐÁNH GIÁ SÓT CHỮ TRUNG (Tỷ lệ > 3%)
-                # ====================================================
                 joined_temp = " ".join(temp_lines)
                 total_chars = len(re.sub(r"\s", "", joined_temp))
                 cjk_count = len(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7a3]", joined_temp))
@@ -397,64 +390,75 @@ class GeminiTranslateThread(QThread):
                 if total_chars > 0 and (cjk_count / total_chars) > 0.03:
                     ratio = cjk_count / total_chars
                     self.log.emit(f"⚠️ CẢNH BÁO: Khối {i+1} AI lười dịch, sót {cjk_count} chữ Hán ({ratio*100:.1f}% > 3%). Ép AI dịch lại!\n")
-                    try:
-                        # Reset trang để xóa bộ nhớ tạm của con AI cứng đầu
-                        page.close()
-                        page = ctx.new_page()
+                    
+                    # FIX 1: Chỉ thu hẹp batch_size, không gọt mảng gốc
+                    if retry_count >= 2 and batch_size > 20:
+                        half = max(1, batch_size // 2)
+                        self.log.emit(f"✂️ Tự động chia nhỏ: {batch_size} câu → {half} câu để AI bớt lười...\n")
+                        batch_size = half
+
+                    try: page.close()
+                    except Exception: pass
+                    try: page = ctx.new_page(); page.goto("about:blank")
                     except Exception: pass
                     retry_count += 1
+                    time.sleep(2)
                     continue
-                # ====================================================
                     
-                if len(temp_lines) < len(chunk_to_translate):
-                    self.log.emit(f"⚠️ AI dịch được {len(temp_lines)}/{len(chunk_to_translate)} dòng. Đã lưu an toàn phần thành công!\n")
-                    self.log.emit(f"⚙️ Ép AI dịch nốt {len(chunk_to_translate) - len(temp_lines)} dòng còn thiếu...\n")
+                # FIX 2: Xử lý lệch Timeline dựa trên batch_size và current_batch
+                if len(temp_lines) < len(current_batch):
+                    self.log.emit(f"⚠️ AI dịch thiếu ({len(temp_lines)}/{len(current_batch)} dòng). Chắc chắn AI đã bỏ sót câu ở giữa!\n")
+                    self.log.emit("✂️ Vứt bỏ bản dịch lỗi. Đang chia nhỏ khối để ép AI dịch lại chính xác...\n")
                     
-                    translated_chunk_lines.extend(temp_lines)
-                    chunk_to_translate = chunk_to_translate[len(temp_lines):] # Cắt bỏ những câu đã dịch xong
-                    progressive_steps += 1
-                    retry_count = 0 # Reset lỗi vì chúng ta đã có tiến triển!
+                    if batch_size > 15:
+                        batch_size = max(1, batch_size // 2)
                     
-                    # Thoát vào lại bằng trang mới để AI không bị nhớ nhầm vết xe đổ cũ
-                    try:
-                        page.close()
-                        page = ctx.new_page()
+                    retry_count += 1
+                    try: page.close()
                     except Exception: pass
+                    try: page = ctx.new_page(); page.goto("about:blank")
+                    except Exception: pass
+                    time.sleep(2)
+                    continue
                     
-                elif len(temp_lines) > len(chunk_to_translate):
-                    # Nếu AI bị "ảo giác" tự đẻ thêm dòng, ta chỉ lấy đúng số lượng cần
-                    translated_chunk_lines.extend(temp_lines[:len(chunk_to_translate)])
-                    chunk_to_translate = []
+                elif len(temp_lines) > len(current_batch):
+                    translated_chunk_lines.extend(temp_lines[:len(current_batch)])
+                    chunk_to_translate = chunk_to_translate[len(current_batch):]
                 else:
-                    # Hoàn hảo 100%
                     translated_chunk_lines.extend(temp_lines)
-                    chunk_to_translate = []
+                    chunk_to_translate = chunk_to_translate[len(current_batch):]
+                    
+                # Tới bước này là đã thành công, chuẩn bị chạy phần tiếp theo của Chunk
+                progressive_steps += 1
+                retry_count = 0
+                batch_size = len(chunk_to_translate)
+                
+                # Sang trang mới để reset bộ nhớ đệm AI
+                if len(chunk_to_translate) > 0:
+                    try: page.close()
+                    except Exception: pass
+                    try: page = ctx.new_page(); page.goto("about:blank")
+                    except Exception: pass
 
-            # ==========================================
-            # KẾT THÚC VÒNG LẶP CHO 1 KHỐI (CHUNK)
-            # ==========================================
+            # Nếu nỗ lực thử lại đều thất bại, giữ nguyên gốc
             if len(chunk_to_translate) > 0:
                 has_error = True
                 self.log.emit(f"❌ Khối {i+1} vẫn thất bại sau mọi nỗ lực. Đành khớp bù bản gốc phần thiếu.\n")
                 for b in chunk_to_translate:
                     translated_chunk_lines.append(b["text"])
                     
+            # FIX TẬN GỐC LỖI INDEX OUT OF RANGE: Lúc này số lượng translated_chunk_lines luôn = len(chunk)
             for j, b in enumerate(chunk):
                 translated_results[b["stt"]] = translated_chunk_lines[j]
             
-            # Quăng trực tiếp chữ vừa dịch xong lên Bảng UI (Real-time)
             self.chunk_done.emit(idx, translated_results)
 
-            # ----------------------------------------------------
-            # CƠ CHẾ NGHỈ 1 GIÂY (DELAY) TRƯỚC KHI GỬI KHỐI MỚI
-            # ----------------------------------------------------
             if i < len(chunks) - 1 and not self._cancel:
                 self.log.emit("⏸️ Đã nhận kết quả, nghỉ 1 giây trước khi gửi tiếp...\n")
-                page.wait_for_timeout(1000) # Delay 1000ms = 1s
+                page.wait_for_timeout(1000)
 
         if self._cancel: return page
         
-        # Ráp file lưu lại
         final_srt_content = ""
         for b in blocks:
             stt = b["stt"]
@@ -467,17 +471,15 @@ class GeminiTranslateThread(QThread):
             f.write(final_srt_content.strip() + "\n")
             
         if has_error:
-            self.item_failed.emit(idx, "Hoàn thành nhưng có lỗi ở vài dòng cuối (Đã giữ nguyên bản gốc).")
+            self.item_failed.emit(idx, "Hoàn thành nhưng có lỗi ở vài dòng (Đã giữ nguyên bản gốc phần thiếu).")
         else:
             self.log.emit(f"✅ Đã lưu file khớp 100% Timeline: {os.path.basename(vi_path)}\n")
             self.item_done.emit(idx, video_path, vi_path)
 
-        # Quan trọng: Trả lại page đã được tạo mới (hoặc page cũ) ra ngoài để các file SRT tiếp theo sử dụng
         return page
 
     def _send_and_wait(self, page, bot_name, prompt_message, expected_min_lines=None):
         try:
-            # Việc gọi goto ở đây sẽ luôn kích hoạt trang chủ Gemini trong page (đã reset nếu được khởi tạo lại)
             page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(1000)
             _select_model(page, self.model_key, log_fn=self.log.emit)
@@ -491,11 +493,15 @@ class GeminiTranslateThread(QThread):
             }''', prompt_message)
             page.wait_for_timeout(300)
             page.keyboard.press("End"); page.keyboard.press("Space"); page.wait_for_timeout(300)
+            
             btn = _find_el(page, _SEND_SELS, timeout=2000, cancel_check=lambda: self._cancel)
             if btn:
-                try: btn.click()
-                except Exception: page.keyboard.press("Enter")
-            else: page.keyboard.press("Enter")
+                try: 
+                    btn.click()
+                except Exception: 
+                    page.keyboard.press("Control+Enter")
+            else: 
+                page.keyboard.press("Control+Enter")
             
             prev, stable = "", 0
             for _ in range(720): 
@@ -509,16 +515,10 @@ class GeminiTranslateThread(QThread):
                     except Exception: continue
                 if cur and cur == prev:
                     stable += 1
-                    # Ngưỡng ổn định mặc định: 8 lần x 0.5s = 4 giây không đổi -> coi là AI đã trả lời xong.
                     required_stable = 8
                     if expected_min_lines:
                         got_lines = len([l for l in cur.split('\n') if l.strip()])
                         if got_lines < expected_min_lines:
-                            # Số dòng nhận được còn ÍT HƠN mong đợi -> rất có thể Gemini chỉ đang
-                            # KHỰNG TẠM (lag mạng/model nghỉ giữa câu) chứ chưa thực sự dừng hẳn.
-                            # Với chunk dài, khoảng khựng như vậy có thể kéo dài vài giây.
-                            # => Bắt chờ ổn định LÂU HƠN (30 lần x 0.5s = 15 giây) trước khi
-                            # chấp nhận, để tránh cắt ngang phản hồi giữa chừng gây thiếu dòng.
                             required_stable = 30
                     if stable >= required_stable: return cur
                 else: stable = 0; prev = cur
@@ -549,7 +549,7 @@ class QueueCard(QWidget):
         self.badge.setText({"waiting": "⏳", "done": "✅", "error": "❌"}.get(s, "⏳"))
 
 # ============================================================
-# GIAO DIỆN CHÍNH (ĐÃ XÓA BẢNG CHỈNH SỬA - THÊM KHUNG BỐI CẢNH)
+# GIAO DIỆN CHÍNH
 # ============================================================
 class TranslateWidget(QWidget):
     def __init__(self, parent=None):
@@ -558,8 +558,6 @@ class TranslateWidget(QWidget):
         self.settings = QSettings("AnhStudio", "TranslateTab")
         self._translate_thread = None
         self.current_selected_item = None
-        
-        # Từ điển lưu Context của từng file để khi bấm chuyển file không bị mất
         self.context_memory = {} 
         
         self.setStyleSheet("""
@@ -578,9 +576,7 @@ class TranslateWidget(QWidget):
         main_layout.setContentsMargins(15, 15, 15, 15)
         self.main_sp = QSplitter(Qt.Orientation.Horizontal)
         
-        # =========================================
-        # 1. CỘT TRÁI (BẢNG ĐIỀU KHIỂN)
-        # =========================================
+        # 1. CỘT TRÁI
         left_frame = QFrame()
         ll = QVBoxLayout(left_frame)
         ll.setContentsMargins(15, 15, 15, 15)
@@ -650,9 +646,7 @@ class TranslateWidget(QWidget):
         
         self.main_sp.addWidget(left_frame)
 
-        # =========================================
-        # 2. CỘT PHẢI (BẢNG DỊCH & BỐI CẢNH)
-        # =========================================
+        # 2. CỘT PHẢI
         right_sp = QSplitter(Qt.Orientation.Vertical)
         table_frame = QFrame()
         rl = QVBoxLayout(table_frame)
@@ -677,7 +671,6 @@ class TranslateWidget(QWidget):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         rl.addWidget(self.table_widget)
         
-        # Nút Lưu SRT
         btn_save_box = QHBoxLayout()
         btn_save_box.addStretch()
         self.btn_save_table = QPushButton("💾 XUẤT / LƯU FILE SRT")
@@ -687,9 +680,7 @@ class TranslateWidget(QWidget):
         rl.addLayout(btn_save_box)
         right_sp.addWidget(table_frame)
         
-        # =========================================
-        # 3. KHUNG HIỂN THỊ BỐI CẢNH (MỚI)
-        # =========================================
+        # 3. KHUNG HIỂN THỊ BỐI CẢNH
         ctx_box = QFrame()
         cl = QVBoxLayout(ctx_box)
         cl.setContentsMargins(15, 10, 15, 10)
@@ -769,7 +760,6 @@ class TranslateWidget(QWidget):
             
             item_vi = QTableWidgetItem(vi_blocks.get(stt, ""))
             item_vi.setForeground(QBrush(QColor("#A7F3D0")))
-            # Font chữ mập mạp cho dễ nhìn
             font = QFont(); font.setBold(True); item_vi.setFont(font)
             item_vi.setFlags(item_vi.flags() | Qt.ItemFlag.ItemIsEditable) 
             self.table_widget.setItem(row, 3, item_vi)
@@ -798,7 +788,6 @@ class TranslateWidget(QWidget):
         self.current_selected_item = widget
         self._load_data_to_table(widget.srt_path, os.path.splitext(widget.srt_path)[0] + "_vi.srt")
         
-        # Load lại Context AI đã lưu
         if widget.srt_path in self.context_memory:
             self.txt_context.setPlainText(self.context_memory[widget.srt_path])
         else:
@@ -811,18 +800,15 @@ class TranslateWidget(QWidget):
             if widget: widget.set_status(status)
 
     def _on_context_extracted(self, queue_idx, context_text):
-        # Lưu vào từ điển bộ nhớ
         item = self.q_list.item(queue_idx)
         if item:
             widget = self.q_list.itemWidget(item)
             if widget:
                 self.context_memory[widget.srt_path] = context_text
-                # Nếu đang chọn đúng file đó, hiển thị luôn lên màn hình
                 if self.current_selected_item == widget:
                     self.txt_context.setPlainText(context_text)
 
     def _on_chunk_done(self, queue_idx, translated_dict):
-        # Update UI Table THEO THỜI GIAN THỰC
         if queue_idx >= self.q_list.count(): return
         if self.current_selected_item == self.q_list.itemWidget(self.q_list.item(queue_idx)):
             for row in range(self.table_widget.rowCount()):
@@ -839,7 +825,6 @@ class TranslateWidget(QWidget):
                         new_item.setFlags(new_item.flags() | Qt.ItemFlag.ItemIsEditable)
                         self.table_widget.setItem(row, 3, new_item)
             self.table_widget.resizeRowsToContents()
-            # Cuộn xuống dòng cuối cùng đang dịch
             self.table_widget.scrollToBottom()
 
     def add_to_queue(self, vp, sp):
@@ -866,7 +851,6 @@ class TranslateWidget(QWidget):
     def _remove_selected(self):
         for i in sorted([x.row() for x in self.q_list.selectedIndexes()], reverse=True):
             popped = self._queue.pop(i)
-            # Xóa luôn context trong bộ nhớ
             if popped["srt"] in self.context_memory: del self.context_memory[popped["srt"]]
             self.q_list.takeItem(i)
 
@@ -907,7 +891,6 @@ class TranslateWidget(QWidget):
         self._translate_thread.log.connect(self._log)
         self._translate_thread.progress.connect(self.pbar.setValue)
         
-        # Kết nối tín hiệu Context và Chunk UI
         self._translate_thread.context_extracted.connect(self._on_context_extracted)
         self._translate_thread.chunk_done.connect(self._on_chunk_done)
         
