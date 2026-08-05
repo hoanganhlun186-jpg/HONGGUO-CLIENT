@@ -10,10 +10,13 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QTextEdit, QFileDialog, QProgressBar,
     QFrame, QSplitter, QComboBox, QAbstractItemView, QMessageBox,
-    QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox
+    QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox,
+    QLineEdit, QCheckBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings, QSize
 from PyQt6.QtGui import QTextCursor, QBrush, QColor, QFont
+
+import deepseek_translate as dst  # module dịch DeepSeek V4 Pro (giữ ngữ cảnh xuyên suốt)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 AUTH_FILE = "gemini_auth.json"
@@ -525,6 +528,154 @@ class GeminiTranslateThread(QThread):
             return prev if prev else f"ERROR [{bot_name}]: Quá thời gian chờ"
         except Exception as e: return f"ERROR [{bot_name}]: {e}"
 
+class DeepSeekTranslateThread(QThread):
+    """Thread dịch bằng DeepSeek V4 Pro (API), bắn đúng bộ signal như
+    GeminiTranslateThread để dùng chung toàn bộ UI (bảng dịch, panel ngữ cảnh,
+    progress bar...) không cần đổi gì ở phần giao diện.
+
+    2 mode:
+      - full_series_mode=False (khách tải lẻ): mỗi tập tự phân tích ngữ cảnh
+        riêng, dịch độc lập.
+      - full_series_mode=True  (khách chọn trọn bộ): phân tích ngữ cảnh 1 lần
+        cho TOÀN BỘ queue rồi dịch tuần tự, ngữ cảnh chảy liên tục xuyên suốt.
+    """
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    context_extracted = pyqtSignal(int, str)
+    chunk_done = pyqtSignal(int, dict)
+    item_done = pyqtSignal(int, str, str)
+    item_failed = pyqtSignal(int, str)
+    all_done = pyqtSignal()
+
+    def __init__(self, queue_items, api_key, genre="Phụ đề phim",
+                 target_style="Tự nhiên, dễ nghe", full_series_mode=False):
+        super().__init__()
+        self.queue_items = list(queue_items)
+        self.api_key = api_key
+        self.genre = genre
+        self.target_style = target_style
+        self.full_series_mode = full_series_mode
+        self._cancel = False
+        self.rule_template = dst._load_rule_prompt()
+
+    def cancel(self):
+        self._cancel = True
+
+    def _ctx_display_text(self, ctx) -> str:
+        gl = ctx.glossary_as_text()
+        cp = ctx.character_profiles or "(chưa có hồ sơ nhân vật)"
+        return f"📖 GLOSSARY:\n{gl}\n\n🎭 NHÂN VẬT / DIỄN BIẾN:\n{cp}"
+
+    def _translate_one_episode(self, idx, video_path, srt_path, ctx, done_offset, total_lines):
+        """Dịch 1 tập bằng ctx đã có sẵn (dùng chung cho cả 'each' lẫn 'full').
+        Trả về done_offset mới sau khi dịch xong tập này."""
+        with open(srt_path, "r", encoding="utf-8-sig") as f:
+            blocks = dst.parse_srt(f.read())
+        if not blocks:
+            self.item_failed.emit(idx, "File trống hoặc sai định dạng SRT.")
+            return done_offset
+
+        translated_results = {}
+        done = done_offset
+        for start in range(0, len(blocks), dst.LINES_PER_CHUNK):
+            if self._cancel:
+                return done
+            chunk = blocks[start:start + dst.LINES_PER_CHUNK]
+            try:
+                texts = dst.translate_chunk(self.api_key, ctx, self.rule_template, chunk)
+            except dst.DeepSeekAPIError as e:
+                self.item_failed.emit(idx, f"Lỗi gọi DeepSeek: {e}")
+                return done
+
+            for b, vi in zip(chunk, texts):
+                translated_results[b.idx] = vi
+            ctx.update_previous_context(texts)
+
+            self.chunk_done.emit(idx, dict(translated_results))
+            done += len(chunk)
+            self.progress.emit(done)
+
+        if self._cancel:
+            return done
+
+        for b in blocks:
+            b.text = translated_results.get(b.idx, b.text)
+        vi_path = os.path.splitext(srt_path)[0] + "_vi.srt"
+        with open(vi_path, "w", encoding="utf-8") as f:
+            f.write(dst.rebuild_srt(blocks))
+
+        self.log.emit(f"✅ Đã lưu: {os.path.basename(vi_path)}\n")
+        self.item_done.emit(idx, video_path, vi_path)
+        return done
+
+    def run(self):
+        if not self.api_key:
+            self.log.emit("❌ Chưa nhập DeepSeek API key.\n")
+            self.all_done.emit()
+            return
+
+        total = len(self.queue_items)
+        if total == 0:
+            self.all_done.emit()
+            return
+
+        try:
+            total_lines = 0
+            episodes_blocks = {}
+            for item in self.queue_items:
+                with open(item["srt"], "r", encoding="utf-8-sig") as f:
+                    b = dst.parse_srt(f.read())
+                episodes_blocks[item["srt"]] = b
+                total_lines += len(b)
+
+            if self.full_series_mode and total > 1:
+                # ── MODE TRỌN BỘ: phân tích ngữ cảnh 1 LẦN cho cả series ──
+                self.log.emit(f"🔗 Chế độ TRỌN BỘ: phân tích ngữ cảnh chung cho {total} tập...\n")
+                ctx = dst.SeriesContext(genre=self.genre, target_style=self.target_style)
+                full_script = "\n\n".join(
+                    f"[Tập {i+1}]\n" + "\n".join(b.text for b in episodes_blocks[item["srt"]])
+                    for i, item in enumerate(self.queue_items)
+                )
+                dst.analyze_movie_context(self.api_key, full_script, ctx)
+                ctx_text = self._ctx_display_text(ctx)
+                for idx in range(total):
+                    self.context_extracted.emit(idx, ctx_text)
+                self.log.emit("🧠 Phân tích xong! Bắt đầu dịch tuần tự các tập (ngữ cảnh nối liền)...\n")
+
+                done = 0
+                for idx, item in enumerate(self.queue_items):
+                    if self._cancel:
+                        break
+                    self.log.emit(f"\n{'='*50}\n📄 [{idx+1}/{total}] {os.path.basename(item['srt'])}\n")
+                    done = self._translate_one_episode(idx, item["video"], item["srt"], ctx, done, total_lines)
+
+            else:
+                # ── MODE TẢI LẺ: mỗi tập tự phân tích ngữ cảnh riêng ──
+                done = 0
+                for idx, item in enumerate(self.queue_items):
+                    if self._cancel:
+                        break
+                    srt_path = item["srt"]
+                    self.log.emit(f"\n{'='*50}\n📄 [{idx+1}/{total}] {os.path.basename(srt_path)}\n")
+
+                    ctx = dst.SeriesContext(genre=self.genre, target_style=self.target_style)
+                    blocks = episodes_blocks[srt_path]
+                    full_text = "\n".join(b.text for b in blocks)
+
+                    self.log.emit("🔍 Đang phân tích kịch bản & mối quan hệ nhân vật...\n")
+                    dst.analyze_movie_context(self.api_key, full_text, ctx)
+                    self.context_extracted.emit(idx, self._ctx_display_text(ctx))
+                    self.log.emit("🧠 Phân tích xong bối cảnh! Bắt đầu dịch...\n")
+
+                    done = self._translate_one_episode(idx, item["video"], srt_path, ctx, done, total_lines)
+
+        except Exception as e:
+            self.log.emit(f"❌ Lỗi nghiêm trọng trong luồng dịch DeepSeek: {e}\n")
+
+        self.log.emit(f"\n🏁 XONG CHIẾN DỊCH (DeepSeek).\n")
+        self.all_done.emit()
+
+
 class QueueCard(QWidget):
     def __init__(self, video_path, srt_path, parent=None):
         super().__init__(parent)
@@ -602,7 +753,47 @@ class TranslateWidget(QWidget):
         ll.addWidget(self.q_list, stretch=1)
         
         ll.addWidget(QLabel("⚙️ CẤU HÌNH SMART TRANSLATE", styleSheet="color: #7452FF; font-weight: bold; margin-top: 15px; font-size: 13px;"))
-        
+
+        # ── CHỌN ENGINE DỊCH: Gemini (trình duyệt, free) hoặc DeepSeek (API) ──
+        ll.addWidget(QLabel("Engine dịch:", styleSheet="color: #8A8D98; font-size: 11px;"))
+        self.cb_engine = QComboBox()
+        self.cb_engine.addItems([
+            "🌐 Gemini (Trình duyệt - Miễn phí)",
+            "🚀 DeepSeek V4 Pro (API Key - Nhanh & Rẻ)",
+        ])
+        self.cb_engine.setCurrentText(self.settings.value("trans_engine", self.cb_engine.itemText(0)))
+        self.cb_engine.currentTextChanged.connect(self._on_engine_changed)
+        ll.addWidget(self.cb_engine)
+
+        # ── Ô nhập API key DeepSeek (chỉ hiện khi chọn engine DeepSeek) ──
+        self.deepseek_key_box = QWidget()
+        dsk_lay = QVBoxLayout(self.deepseek_key_box)
+        dsk_lay.setContentsMargins(0, 4, 0, 0)
+        dsk_lay.addWidget(QLabel("DeepSeek API Key:", styleSheet="color: #8A8D98; font-size: 11px;"))
+        self.txt_deepseek_key = QLineEdit()
+        self.txt_deepseek_key.setPlaceholderText("sk-xxxxxxxxxxxxxxxx")
+        self.txt_deepseek_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.txt_deepseek_key.setText(self.settings.value("deepseek_api_key", ""))
+        self.txt_deepseek_key.textChanged.connect(
+            lambda t: self.settings.setValue("deepseek_api_key", t)
+        )
+        dsk_lay.addWidget(self.txt_deepseek_key)
+        ll.addWidget(self.deepseek_key_box)
+
+        # ── Checkbox chọn mode: tải lẻ (mỗi tập tự phân tích riêng) hay
+        #    trọn bộ (phân tích ngữ cảnh 1 lần, dịch xuyên suốt cả series) ──
+        self.chk_full_series = QCheckBox("🔗 Dịch trọn bộ (giữ ngữ cảnh xuyên suốt cả series)")
+        self.chk_full_series.setToolTip(
+            "Bật: phân tích ngữ cảnh 1 LẦN cho toàn bộ các tập trong danh sách,\n"
+            "biết trước cốt truyện/nhân vật xuất hiện muộn, dịch xuyên suốt không đứt mạch.\n"
+            "Tắt (tải lẻ): mỗi tập tự phân tích ngữ cảnh riêng, độc lập với các tập khác."
+        )
+        self.chk_full_series.setChecked(self.settings.value("trans_full_series", "false") == "true")
+        self.chk_full_series.stateChanged.connect(
+            lambda s: self.settings.setValue("trans_full_series", "true" if s else "false")
+        )
+        ll.addWidget(self.chk_full_series)
+
         self.cb_preset = QComboBox()
         self.cb_preset.addItems(list(PROMPT_PRESETS.keys()))
         saved_preset = self.settings.value("trans_preset", list(PROMPT_PRESETS.keys())[0])
@@ -713,9 +904,25 @@ class TranslateWidget(QWidget):
         self.main_sp.setStretchFactor(0, 25); self.main_sp.setStretchFactor(1, 75)
         main_layout.addWidget(self.main_sp)
 
+        # Set trạng thái ẩn/hiện ban đầu cho ô nhập key DeepSeek theo engine đã lưu
+        self._on_engine_changed(self.cb_engine.currentText())
+
     # --------------------------------------------------------
     # HÀM LOGIC GIAO DIỆN & XỬ LÝ
     # --------------------------------------------------------
+    def _on_engine_changed(self, text):
+        self.settings.setValue("trans_engine", text)
+        is_deepseek = text.startswith("🚀")
+        self.deepseek_key_box.setVisible(is_deepseek)
+        self.chk_full_series.setVisible(is_deepseek)  # mode trọn bộ chỉ áp dụng cho DeepSeek
+        # model_combo/spin_chunk là cấu hình riêng của Gemini (chọn phiên bản, chunk theo trình duyệt)
+        if hasattr(self, 'model_combo'):
+            self.model_combo.setEnabled(not is_deepseek)
+        if hasattr(self, 'spin_chunk'):
+            self.spin_chunk.setEnabled(not is_deepseek)
+        if hasattr(self, 'btn_login'):
+            self.btn_login.setEnabled(not is_deepseek)
+
     def _update_ui_models_list(self, models):
         self.model_combo.clear(); self.model_combo.addItem("Auto (Mặc định)"); self.model_combo.addItems(models)
         self.settings.setValue("cached_models", ["Auto (Mặc định)"] + models)
@@ -872,33 +1079,58 @@ class TranslateWidget(QWidget):
         self.settings.setValue("gemini_model", self.model_combo.currentText())
         self.settings.setValue("chunk_size", self.spin_chunk.value())
         self.settings.setValue("trans_preset", self.cb_preset.currentText())
-        
+
+        if self.cb_engine.currentText().startswith("🚀"):
+            if not self.txt_deepseek_key.text().strip():
+                QMessageBox.warning(self, "Thiếu API Key", "Vui lòng nhập DeepSeek API key trước khi dịch.")
+                return
+
         self._set_ui_lock(True)
         self._proceed_translate()
 
     def _proceed_translate(self):
         if not [it for it in self._queue if os.path.exists(it["srt"])]:
             self._set_ui_lock(False); return
-            
-        self.pbar.setMaximum(len(self._queue)); self.pbar.setValue(0)
+
         for i in range(self.q_list.count()): self._update_item_status(i, "waiting")
-        
+
         preset_key = self.cb_preset.currentText()
-        model_key = self.model_combo.currentText()
-        chunk_val = self.spin_chunk.value()
-        
-        self._translate_thread = GeminiTranslateThread(self._queue, preset_key, model_key, chunk_val)
+        use_deepseek = self.cb_engine.currentText().startswith("🚀")
+
+        if use_deepseek:
+            # Pbar theo TỔNG SỐ DÒNG (mượt hơn, vì DeepSeek báo tiến trình theo dòng chứ không theo tập)
+            total_lines = 0
+            for it in self._queue:
+                if os.path.exists(it["srt"]):
+                    with open(it["srt"], "r", encoding="utf-8-sig") as f:
+                        total_lines += len(dst.parse_srt(f.read()))
+            self.pbar.setMaximum(max(1, total_lines)); self.pbar.setValue(0)
+
+            api_key = self.txt_deepseek_key.text().strip()
+            # Rút gọn preset text (bỏ số thứ tự/emoji) làm "genre" mô tả cho DeepSeek
+            genre = re.sub(r"^[^\wÀ-ỹ]*\d*\.?\s*", "", preset_key).strip() or "Phụ đề phim"
+            full_series = self.chk_full_series.isChecked()
+
+            self._translate_thread = DeepSeekTranslateThread(
+                self._queue, api_key=api_key, genre=genre, full_series_mode=full_series
+            )
+        else:
+            self.pbar.setMaximum(len(self._queue)); self.pbar.setValue(0)
+            model_key = self.model_combo.currentText()
+            chunk_val = self.spin_chunk.value()
+            self._translate_thread = GeminiTranslateThread(self._queue, preset_key, model_key, chunk_val)
+
         self._translate_thread.log.connect(self._log)
         self._translate_thread.progress.connect(self.pbar.setValue)
-        
+
         self._translate_thread.context_extracted.connect(self._on_context_extracted)
         self._translate_thread.chunk_done.connect(self._on_chunk_done)
-        
+
         def on_done(idx, vp, vsp):
             self._update_item_status(idx, "done")
             if self.current_selected_item == self.q_list.itemWidget(self.q_list.item(idx)):
                 self._on_item_clicked(self.q_list.item(idx))
-                
+
         self._translate_thread.item_done.connect(on_done)
         self._translate_thread.item_failed.connect(lambda idx, msg: self._update_item_status(idx, "error"))
         self._translate_thread.all_done.connect(lambda: self._set_ui_lock(False))

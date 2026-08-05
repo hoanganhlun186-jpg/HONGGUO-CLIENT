@@ -26,27 +26,11 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize, QSettings, QTimer
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 
-# === Cấu hình ffmpeg cho pydub (tránh WinError 2 khi lồng tiếng) ===
-def _setup_ffmpeg_pydub():
-    _here = os.path.dirname(os.path.abspath(__file__))
-    cand = [os.path.join(_here, "ffmpeg.exe"), os.path.join(_here, "ffmpeg"),
-            os.path.join(_here, "bin", "ffmpeg.exe")]
-    fp = next((p for p in cand if os.path.exists(p)), None) or shutil.which("ffmpeg")
-    try:
-        from pydub import AudioSegment as _AS
-        if fp:
-            _AS.converter = fp
-            _AS.ffmpeg = fp
-            probe = os.path.join(os.path.dirname(fp), "ffprobe.exe")
-            _AS.ffprobe = probe if os.path.exists(probe) else fp  # không có ffprobe thì trỏ tạm ffmpeg
-            os.environ["PATH"] = os.path.dirname(fp) + os.pathsep + os.environ.get("PATH", "")
-    except Exception:
-        pass
-    return fp
-
-FFMPEG_PATH = _setup_ffmpeg_pydub()
-
 # Ẩn cửa sổ đen (console) khi pydub/ffmpeg chạy subprocess trên Windows.
+# QUAN TRỌNG: patch này PHẢI chạy TRƯỚC khi import pydub bên dưới, vì pydub
+# tự làm "from subprocess import Popen" ngay lúc import -> nếu patch sau,
+# pydub vẫn giữ tham chiếu Popen GỐC (chưa ẩn cửa sổ) -> cmd đen flash lên
+# mỗi khi lồng tiếng gọi ffmpeg ghép audio qua pydub.
 def _patch_subprocess_no_window():
     if os.name != "nt":
         return
@@ -67,6 +51,34 @@ def _patch_subprocess_no_window():
 
 _patch_subprocess_no_window()
 
+# === Cấu hình ffmpeg cho pydub (tránh WinError 2 khi lồng tiếng) ===
+def _setup_ffmpeg_pydub():
+    _here = os.path.dirname(os.path.abspath(__file__))
+    cand = [os.path.join(_here, "ffmpeg.exe"), os.path.join(_here, "ffmpeg"),
+            os.path.join(_here, "bin", "ffmpeg.exe")]
+    fp = next((p for p in cand if os.path.exists(p)), None) or shutil.which("ffmpeg")
+    try:
+        from pydub import AudioSegment as _AS
+        if fp:
+            _AS.converter = fp
+            _AS.ffmpeg = fp
+            probe = os.path.join(os.path.dirname(fp), "ffprobe.exe")
+            _AS.ffprobe = probe if os.path.exists(probe) else fp  # không có ffprobe thì trỏ tạm ffmpeg
+            os.environ["PATH"] = os.path.dirname(fp) + os.pathsep + os.environ.get("PATH", "")
+        # An toàn 2 lớp: dù thứ tự import có bị đảo lại (vd import pydub ở module
+        # khác từ trước), vẫn ép pydub.utils dùng đúng Popen đã patch ẩn cửa sổ.
+        try:
+            import pydub.utils as _pydub_utils
+            import subprocess as _subp2
+            _pydub_utils.Popen = _subp2.Popen
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return fp
+
+FFMPEG_PATH = _setup_ffmpeg_pydub()
+
 def _get_capcut_device():
     s = QSettings("HongguoDownloader", "ClientApp")
     did = s.value("capcut_device_id", "")
@@ -77,13 +89,14 @@ def _get_capcut_device():
 
 # Đồng bộ Gemini: tái dùng login + prompt presets từ tab dịch (nếu có)
 try:
-    from translate_tab import GoogleManualLoginThread, PROMPT_PRESETS, AUTH_FILE, GeminiTranslateThread
+    from translate_tab import GoogleManualLoginThread, PROMPT_PRESETS, AUTH_FILE, GeminiTranslateThread, DeepSeekTranslateThread
     _GEMINI_AVAILABLE = True
 except Exception:
     GoogleManualLoginThread = None
     PROMPT_PRESETS = {}
     AUTH_FILE = "gemini_auth.json"
     GeminiTranslateThread = None
+    DeepSeekTranslateThread = None
     _GEMINI_AVAILABLE = False
 
 # Quản lý cài đặt Demucs tự động (lazy install)
@@ -96,7 +109,7 @@ except ImportError:
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.34"
+APP_VERSION = "1.0.35"
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  
 
@@ -173,18 +186,19 @@ def probe_stream(file_path, ffprobe_path=None):
         mv = re.search(r"Video:\s*([a-zA-Z0-9_]+)", text)
         if mv:
             info["vcodec"] = mv.group(1)
-        ma = re.search(r"Audio:\s*([a-zA-Z0-9_]+).*?(\d+)\s*Hz.*?(mono|stereo|\d+ channels)", text)
-        if ma:
-            info["acodec"] = ma.group(1)
-            info["sample_rate"] = ma.group(2)
-            ch = ma.group(3)
-            info["channels"] = "1" if ch == "mono" else ("2" if ch == "stereo" else re.sub(r"\D", "", ch))
+        # Bắt codec + Hz + channel trong 1 lần, từng nhóm optional riêng
+        ma_codec = re.search(r"Audio:\s*([a-zA-Z0-9_.]+)", text)
+        ma_hz    = re.search(r"(\d+)\s*Hz", text)
+        # Bắt channel sau Hz (stereo/mono/N channels) — phải search sau Hz để tránh nhầm số Hz
+        ma_ch    = re.search(r"Hz\s*,\s*(mono|stereo|\d+)\s*(?:channels?)?", text, re.IGNORECASE)
+        if ma_codec:
+            info["acodec"] = ma_codec.group(1).split(".")[0]  # chuẩn hoá mp4a.40.2 → mp4a
             info["has_audio"] = True
-        elif re.search(r"Audio:", text):
-            am = re.search(r"Audio:\s*([a-zA-Z0-9_]+)", text)
-            if am:
-                info["acodec"] = am.group(1)
-                info["has_audio"] = True
+            if ma_hz:
+                info["sample_rate"] = ma_hz.group(1)
+            if ma_ch:
+                ch = ma_ch.group(1).lower()
+                info["channels"] = "1" if ch == "mono" else ("2" if ch == "stereo" else ch)
     return info
 
 def _streams_uniform(infos):
@@ -194,12 +208,14 @@ def _streams_uniform(infos):
     acodecs = {i["acodec"] for i in infos if i["has_audio"]}
     srates  = {i["sample_rate"] for i in infos if i["has_audio"]}
     chans   = {i["channels"] for i in infos if i["has_audio"]}
-    audio_flags = {i["has_audio"] for i in infos}
-    all_have_audio = audio_flags == {True}
+    all_have_audio = all(i["has_audio"] for i in infos)
+    any_have_audio = any(i["has_audio"] for i in infos)
+    # uniform: chỉ cần video đồng nhất + audio đồng nhất (bỏ qua tập probe fail)
+    # Nếu phần lớn có audio thì coi như uniform audio (tránh encode lại không cần)
     uniform = (len(vcodecs) == 1 and len(acodecs) <= 1 and
                len(srates) <= 1 and len(chans) <= 1 and
-               len(audio_flags) == 1)
-    all_aac = acodecs == {"aac"} and all_have_audio
+               (all_have_audio or not any_have_audio))
+    all_aac = acodecs == {"aac"} and any_have_audio
     vcodec = next(iter(vcodecs)) if len(vcodecs) == 1 else ""
     return (uniform, all_have_audio, all_aac, vcodec)
 
@@ -250,6 +266,9 @@ class HonggouMergeThread(QThread):
             self.progress_msg.emit(f"🔎 Kiểm tra thông số phần {i+1}/{total_tasks}...")
             infos = [probe_stream(fp, ffprobe_path) for fp in files_to_merge]
             uniform, all_have_audio, all_aac, common_vcodec = _streams_uniform(infos)
+            # any_have_audio: dùng cho encode path — nếu ít nhất 1 tập có audio thì giữ audio
+            # (tránh trường hợp 1 tập probe fail → all_have_audio=False → ffmpeg chạy -an mất tiếng)
+            any_have_audio = any(i["has_audio"] for i in infos)
             need_encode = (not uniform)
 
             success = False
@@ -264,13 +283,22 @@ class HonggouMergeThread(QThread):
                         self.progress_msg.emit(f"⚙️ Chuẩn hoá tập {j+1}/{len(files_to_merge)} (Phần {i+1})...")
                         ts_path = fp + ".ts"
                         bsf = self._bsf_for_vcodec(infos[j].get("vcodec") or common_vcodec)
+                        # Thử copy nguyên + bsf video
                         ts_cmd = [ffmpeg_path, '-y', '-fflags', '+genpts', '-i', fp,
                                   '-c', 'copy', '-bsf:v', bsf, '-f', 'mpegts', ts_path]
                         res_ts = _run(ts_cmd)
                         if res_ts.returncode != 0:
+                            # Thử copy nguyên không bsf
                             ts_cmd2 = [ffmpeg_path, '-y', '-fflags', '+genpts', '-i', fp,
                                        '-c', 'copy', '-f', 'mpegts', ts_path]
                             res_ts = _run(ts_cmd2)
+                        if res_ts.returncode != 0:
+                            # Thử encode audio sang aac để đảm bảo có tiếng
+                            ts_cmd3 = [ffmpeg_path, '-y', '-fflags', '+genpts', '-i', fp,
+                                       '-c:v', 'copy', '-bsf:v', bsf,
+                                       '-c:a', 'aac', '-b:a', '192k',
+                                       '-f', 'mpegts', ts_path]
+                            res_ts = _run(ts_cmd3)
                             if res_ts.returncode != 0:
                                 raise Exception("remux .ts lỗi: " + res_ts.stderr.decode('utf-8', errors='ignore')[-160:])
                         ts_files.append(ts_path)
@@ -289,7 +317,17 @@ class HonggouMergeThread(QThread):
                     cmd += ['-movflags', '+faststart', final_output]
                     result = _run(cmd)
                     if result.returncode == 0 and os.path.exists(final_output):
-                        success = True
+                        # Kiểm tra file output có audio không (tránh ghép thành công nhưng mất tiếng)
+                        out_info = probe_stream(final_output, ffprobe_path)
+                        if any_have_audio and not out_info["has_audio"]:
+                            self.progress_msg.emit(f"↩️ Ghép nhanh mất tiếng, chuyển sang encode lại...")
+                            try:
+                                os.remove(final_output)
+                            except Exception:
+                                pass
+                            need_encode = True
+                        else:
+                            success = True
                     else:
                         self.progress_msg.emit(f"↩️ Ghép nhanh lỗi, chuyển sang chế độ an toàn (encode lại)...")
                         need_encode = True
@@ -303,7 +341,9 @@ class HonggouMergeThread(QThread):
 
                     cmd = [ffmpeg_path, '-y', '-f', 'concat', '-safe', '0', '-i', list_txt_path]
                     cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p']
-                    if all_have_audio:
+                    if any_have_audio:
+                        # Dùng any_have_audio (không phải all_have_audio) để tránh mất tiếng
+                        # khi probe 1 tập fail nhưng thực tế vẫn có audio
                         cmd += ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2']
                     else:
                         cmd += ['-an']
@@ -311,6 +351,13 @@ class HonggouMergeThread(QThread):
 
                     result = _run(cmd)
                     if result.returncode == 0 and os.path.exists(final_output):
+                        # Kiểm tra lần cuối: file output phải có audio nếu input có audio
+                        out_info = probe_stream(final_output, ffprobe_path)
+                        if any_have_audio and not out_info["has_audio"]:
+                            raise Exception("Encode lại xong nhưng file output không có tiếng — kiểm tra lại video gốc.")
+                        # Kiểm tra kích thước file > 0
+                        if os.path.getsize(final_output) < 1024:
+                            raise Exception("File output quá nhỏ, có thể bị lỗi khi ghép.")
                         success = True
                     else:
                         err = result.stderr.decode('utf-8', errors='ignore')[-200:]
@@ -1437,13 +1484,13 @@ class DubThread(QThread):
                             _device = "cuda"
                             _dev_label = "GPU"
                         else:
-                            _n_threads = str(max(1, int(os.cpu_count() * 0.5)))
+                            _n_threads = str(max(1, int(os.cpu_count() * 0.3)))
                             env["OMP_NUM_THREADS"] = _n_threads
                             env["MKL_NUM_THREADS"] = _n_threads       # giới hạn thêm MKL
                             env["NUMEXPR_NUM_THREADS"] = _n_threads
                             env["OPENBLAS_NUM_THREADS"] = _n_threads
                             _device = "cpu"
-                            _dev_label = "CPU (50% Công suất)"
+                            _dev_label = "CPU (30% Công suất - An toàn)"
                             
                         raw_wav = os.path.join(temp_dir, "orig_audio.wav")
                         _sp.run(
@@ -2272,9 +2319,9 @@ class HonggouWidget(QWidget):
         self.cmb_stt_out.setStyleSheet("QComboBox { background:#1f2937; color:#f8fafc; border:1px solid #374151; border-radius:6px; padding:4px 8px; } QComboBox QAbstractItemView { background:#1e293b; color:#f8fafc; }")
         stt_ctrl.addWidget(self.cmb_stt_out)
 
-        self.chk_do_translate = QCheckBox("🌐 Dịch bằng Gemini")
+        self.chk_do_translate = QCheckBox("🌐 Tự động dịch sau khi tách sub")
         self.chk_do_translate.setChecked(False)
-        self.chk_do_translate.setToolTip("Tích vào mới gọi Gemini dịch sub sang tiếng Việt")
+        self.chk_do_translate.setToolTip("Tích vào mới tự động dịch sub sang tiếng Việt")
         self.chk_do_translate.setStyleSheet("""
             QCheckBox { color: #86efac; font-size: 12px; padding: 4px; font-weight: bold; }
             QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #16a34a;
@@ -2282,6 +2329,28 @@ class HonggouWidget(QWidget):
             QCheckBox::indicator:checked { background: #16a34a; border-color: #16a34a; }
         """)
         stt_ctrl.addWidget(self.chk_do_translate)
+
+        # ── Chọn Engine dịch: Gemini (trình duyệt, free) hoặc DeepSeek (API) ──
+        self.cb_translate_engine = QComboBox()
+        self.cb_translate_engine.addItems(["🌐 Gemini", "🚀 DeepSeek V4 Pro"])
+        self.cb_translate_engine.setToolTip("Chọn công cụ dịch: Gemini (miễn phí, qua trình duyệt) hoặc DeepSeek (API key riêng, nhanh & rẻ)")
+        self.cb_translate_engine.setStyleSheet("QComboBox { background:#1f2937; color:#f8fafc; border:1px solid #374151; border-radius:6px; padding:4px 8px; } QComboBox QAbstractItemView { background:#1e293b; color:#f8fafc; }")
+        _saved_engine = QSettings("HongguoDownloader", "ClientApp").value("trans_engine_main", "🌐 Gemini")
+        self.cb_translate_engine.setCurrentText(_saved_engine)
+        self.cb_translate_engine.currentTextChanged.connect(self._on_translate_engine_changed)
+        stt_ctrl.addWidget(self.cb_translate_engine)
+
+        self.txt_ds_key_main = QLineEdit()
+        self.txt_ds_key_main.setPlaceholderText("DeepSeek API Key (sk-...)")
+        self.txt_ds_key_main.setEchoMode(QLineEdit.EchoMode.Password)
+        self.txt_ds_key_main.setFixedWidth(160)
+        self.txt_ds_key_main.setStyleSheet("QLineEdit { background:#1f2937; color:#f8fafc; border:1px solid #374151; border-radius:6px; padding:4px 8px; }")
+        self.txt_ds_key_main.setText(QSettings("HongguoDownloader", "ClientApp").value("deepseek_api_key", ""))
+        self.txt_ds_key_main.textChanged.connect(
+            lambda t: QSettings("HongguoDownloader", "ClientApp").setValue("deepseek_api_key", t)
+        )
+        stt_ctrl.addWidget(self.txt_ds_key_main)
+        self._on_translate_engine_changed(self.cb_translate_engine.currentText())  # set ẩn/hiện ban đầu
 
         self.btn_stt_now = QPushButton("🔤 Tách sub ngay")
         self.btn_stt_now.setEnabled(False)
@@ -2381,6 +2450,22 @@ class HonggouWidget(QWidget):
 
         # ── HÀNG TÁCH NHẠC NỀN ĐỘC LẬP ─────────────────────────────
         bgm_ctrl = QHBoxLayout(); bgm_ctrl.setSpacing(8)
+
+        self.btn_bgm_only = QPushButton("🎵 Tách nhạc nền ngay")
+        self.btn_bgm_only.setEnabled(False)
+        self.btn_bgm_only.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bgm_only.setToolTip(
+            "Chỉ tách nhạc nền khỏi các video đã tải, KHÔNG lồng tiếng.\n"
+            "Giữ lại: thoại tiếng Trung + SFX (đã ghép sẵn vào video).\n"
+            "Output: Tap_01_vocals.mp4 cạnh file gốc (hoặc ghi đè nếu tick 'Xóa file gốc').\n"
+            "Tự động dùng CPU ở chế độ an toàn (30%) để tránh văng máy.")
+        self.btn_bgm_only.setStyleSheet(
+            "QPushButton { padding: 8px 18px; background-color: #065f46; color: #6ee7b7; "
+            "border-radius: 8px; font-weight: bold; font-size: 13px; border: 2px solid #10b981; } "
+            "QPushButton:hover { background-color: #047857; } "
+            "QPushButton:disabled { background-color: #374151; color: #64748b; border-color: #374151; }")
+        self.btn_bgm_only.clicked.connect(self._run_bgm_only)
+        bgm_ctrl.addWidget(self.btn_bgm_only)
 
         self.chk_bgm_del_original = QCheckBox("🗑 Xóa file gốc sau tách")
         self.chk_bgm_del_original.setChecked(False)
@@ -3369,6 +3454,21 @@ class HonggouWidget(QWidget):
 
     def _on_episode_downloaded(self, ep_num, file_path):
         row = ep_num - 1
+
+        # Kiểm tra audio ngay sau khi tải xong
+        info = probe_stream(file_path, get_ffprobe_path())
+        if not info["has_audio"]:
+            # Mất tiếng — hiển thị cảnh báo đỏ trên bảng
+            if row < self.table.rowCount():
+                warn_item = QTableWidgetItem("⚠️ MẤT TIẾNG")
+                warn_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                warn_item.setForeground(QColor("#f97316"))
+                warn_item.setToolTip("Tập này tải về bị mất tiếng. Thử tải lại tập này.")
+                _f = warn_item.font(); _f.setBold(True); warn_item.setFont(_f)
+                self.table.setItem(row, 3, warn_item)
+            self._bump_total_progress()
+            return
+
         if row < self.table.rowCount():
             done_item = QTableWidgetItem("✔ ĐÃ XONG")
             done_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable); done_item.setForeground(QColor("#22d3ee")); done_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
@@ -3681,6 +3781,7 @@ class HonggouWidget(QWidget):
             self._files_for_stt = None
             return
         if hasattr(self, 'btn_dub_now'): self.btn_dub_now.setEnabled(True)
+        if hasattr(self, 'btn_bgm_only'): self.btn_bgm_only.setEnabled(True)
 
         srt_files = []
         for vid in getattr(self, '_stt_files', []) or []:
@@ -3690,11 +3791,17 @@ class HonggouWidget(QWidget):
 
         do_translate = hasattr(self, 'chk_do_translate') and self.chk_do_translate.isChecked()
         stt_files_list = list(getattr(self, '_stt_files', []) or [])
+        use_deepseek_engine = hasattr(self, 'cb_translate_engine') and self.cb_translate_engine.currentText().startswith("🚀")
 
         if not do_translate:
             QMessageBox.information(self, "Tách sub hoàn tất",
-                f"Đã tách sub {ok} file!\n(Chỉ lưu sub tiếng gốc — chưa bật dịch Gemini.)")
+                f"Đã tách sub {ok} file!\n(Chỉ lưu sub tiếng gốc — chưa bật dịch tự động.)")
             self._maybe_merge_after_stt(stt_files_list)
+        elif use_deepseek_engine and DeepSeekTranslateThread and srt_files:
+            # Dùng DeepSeek: không cần đăng nhập Gemini/AUTH_FILE, chỉ cần API key
+            # (việc kiểm tra thiếu key đã nằm trong _start_gemini_translate).
+            self.txt_stt_log.append("\n🚀 Bắt đầu dịch bằng DeepSeek V4 Pro...")
+            self._start_gemini_translate(srt_files)
         elif _GEMINI_AVAILABLE and GeminiTranslateThread and srt_files:
             if not os.path.exists(AUTH_FILE):
                 QMessageBox.warning(self, "Chưa đăng nhập Gemini",
@@ -3706,11 +3813,56 @@ class HonggouWidget(QWidget):
             self._start_gemini_translate(srt_files)
         else:
             QMessageBox.information(self, "Tách sub hoàn tất",
-                f"Đã tách sub {ok} file!\n(Chưa cấu hình Gemini nên không dịch.)")
+                f"Đã tách sub {ok} file!\n(Chưa cấu hình engine dịch nên không dịch.)")
             self._maybe_merge_after_stt(stt_files_list)
         self._files_for_stt = None
 
+    def _on_translate_engine_changed(self, text):
+        QSettings("HongguoDownloader", "ClientApp").setValue("trans_engine_main", text)
+        self.txt_ds_key_main.setVisible(text.startswith("🚀"))
+
     def _start_gemini_translate(self, srt_files):
+        use_deepseek = self.cb_translate_engine.currentText().startswith("🚀") if hasattr(self, 'cb_translate_engine') else False
+
+        if use_deepseek:
+            api_key = self.txt_ds_key_main.text().strip()
+            if not api_key:
+                self.txt_stt_log.append("❌ Chưa nhập DeepSeek API key! Vào ô cạnh combo Engine để dán key.")
+                return
+            if DeepSeekTranslateThread is None:
+                self.txt_stt_log.append("❌ Không tìm thấy module DeepSeek (deepseek_translate.py). Hãy đặt file này cạnh app.")
+                return
+
+            queue = [{"video": v, "srt": s} for (v, s) in srt_files]
+            self._gemini_vi_map = {}
+            self._gemini_total = len(queue)
+            self._gemini_done_count = 0
+            self._dub_queue = []
+            self._dub_running = False
+            self._auto_dub_on = hasattr(self, 'chk_auto_dub') and self.chk_auto_dub.isChecked()
+
+            _total_eps = getattr(self, 'current_total_eps', 0)
+            _is_full_series = (_total_eps > 0 and len(queue) >= _total_eps)
+            self._gtrans_thread = DeepSeekTranslateThread(queue, api_key=api_key, full_series_mode=_is_full_series)
+            self._gtrans_thread.log.connect(lambda m: self.txt_stt_log.append(m.strip()))
+
+            def _on_item_done(idx, video_path, vi_path):
+                self._gemini_vi_map[video_path] = vi_path
+                if self._auto_dub_on and os.path.exists(vi_path):
+                    self.txt_stt_log.append(f"✅ Dịch xong {os.path.basename(video_path)} → xếp hàng lồng tiếng.")
+                    self._dub_queue.append(video_path)
+                    self._pump_dub_queue()
+
+            def _on_item_failed(idx, msg):
+                self.txt_stt_log.append(f"⚠️ Dịch lỗi 1 file: {msg}")
+
+            self._gtrans_thread.item_done.connect(_on_item_done)
+            self._gtrans_thread.item_failed.connect(_on_item_failed)
+            self._gtrans_thread.all_done.connect(self._on_gemini_all_done)
+            self._keep_thread_alive(self._gtrans_thread)
+            self._gtrans_thread.start()
+            return
+
         settings = QSettings("HongguoDownloader", "ClientApp")
         preset = settings.value("trans_preset", list(PROMPT_PRESETS.keys())[0] if PROMPT_PRESETS else "")
         _CUSTOM_KEY = "✏️ Tự nhập prompt"
@@ -3781,6 +3933,21 @@ class HonggouWidget(QWidget):
         self._roll_dub_thread.start()
 
     # ── TÁCH NHẠC NỀN ĐỘC LẬP BẰNG SUBPROCESS AN TOÀN ───────────────────
+    def _run_bgm_only(self):
+        """Wrapper: kiểm tra Demucs đã cài chưa (lazy-install), quản lý trạng thái
+        nút bấm, rồi mới gọi _run_bgm_only_core() thực hiện tách nhạc."""
+        if _DEMUCS_MANAGER_OK:
+            from demucs_manager import is_demucs_ready
+            if not is_demucs_ready():
+                def _after_install():
+                    self._run_bgm_only()  # cài xong -> tự chạy lại
+                ensure_demucs_installed_ui(self, _after_install)
+                return
+
+        self.btn_bgm_only.setEnabled(False)
+        self.btn_bgm_only.setText("⏳ Đang tách nhạc nền...")
+        self._run_bgm_only_core()
+
     def _run_bgm_only_core(self):
         """Tách nhạc nền độc lập cho các video đã tải."""
         files = getattr(self, '_files_for_stt', None) or getattr(self, 'downloaded_file_paths', [])
@@ -3811,13 +3978,13 @@ class HonggouWidget(QWidget):
             else:
                 env = os.environ.copy()
                 env["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # Chống xung đột thư viện CPU
-                _n_threads = str(max(1, int(os.cpu_count() * 0.5)))
-                env["OMP_NUM_THREADS"] = _n_threads # Ép chạy 50% luồng
+                _n_threads = str(max(1, int(os.cpu_count() * 0.3)))
+                env["OMP_NUM_THREADS"] = _n_threads # Ép chạy 30% luồng cho an toàn
                 env["MKL_NUM_THREADS"] = _n_threads
                 env["NUMEXPR_NUM_THREADS"] = _n_threads
                 env["OPENBLAS_NUM_THREADS"] = _n_threads
                 device = "cpu"
-                gpu_label = "CPU (50% Công suất)"
+                gpu_label = "CPU (30% Công suất - An toàn)"
 
             # Đổi sang mdx_extra_q để xử lý cực nhanh (kể cả trên CPU)
             model_name = "mdx_extra_q" 
@@ -3888,6 +4055,8 @@ class HonggouWidget(QWidget):
                 summary = f"🎵 Tách nhạc nền xong: {ok} thành công, {failed} lỗi."
                 self.txt_stt_log.append("\n" + summary)
                 self.lbl_status.setText(summary)
+                self.btn_bgm_only.setEnabled(True)
+                self.btn_bgm_only.setText("🎵 Tách nhạc nền ngay")
 
             QTimer.singleShot(0, _done)
 
@@ -3949,7 +4118,25 @@ class HonggouWidget(QWidget):
 
     def _on_gemini_all_done(self):
         n = len(getattr(self, '_gemini_vi_map', {}))
-        self.txt_stt_log.append(f"\n✅ Dịch Gemini xong toàn bộ: {n} file.")
+        _engine_name = "DeepSeek" if (
+            DeepSeekTranslateThread is not None
+            and isinstance(getattr(self, '_gtrans_thread', None), DeepSeekTranslateThread)
+        ) else "Gemini"
+
+        # Nếu không dịch được file nào (vd: API hết tiền, lỗi kết nối...)
+        # → hiện cảnh báo thay vì popup "Dịch hoàn tất" giả gây nhầm lẫn
+        if n == 0:
+            self.txt_stt_log.append(f"\n⚠️ {_engine_name}: Không dịch được file nào. Kiểm tra API key / số dư tài khoản.")
+            QMessageBox.warning(self, f"Dịch thất bại",
+                f"{_engine_name} không dịch được file nào.\n\n"
+                f"Nguyên nhân thường gặp:\n"
+                f"• Hết số dư tài khoản (HTTP 402)\n"
+                f"• API key sai hoặc hết hạn\n"
+                f"• Mất kết nối mạng\n\n"
+                f"Kiểm tra log bên dưới để xem chi tiết lỗi.")
+            return
+
+        self.txt_stt_log.append(f"\n✅ Dịch {_engine_name} xong toàn bộ: {n} file.")
         if self._auto_dub_on:
             self._pump_dub_queue()
             if not self._dub_queue and not self._dub_running:

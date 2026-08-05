@@ -24,7 +24,7 @@ jobs:
 
     - name: Build EXE with Nuitka
       run: |
-        python -m nuitka --onefile --windows-disable-console --enable-plugin=pyqt6 --include-package=capcut_tts_api --include-module=capcut_widget --include-module=translate_tab --include-module=cenc_decrypt --include-module=demucs_manager --include-package=Crypto --include-data-files=Voice.json=Voice.json --output-filename=AnhStudio.exe --assume-yes-for-downloads honggou_tab.py
+        python -m nuitka --onefile --windows-disable-console --enable-plugin=pyqt6 --include-package=capcut_tts_api --include-module=capcut_widget --include-module=translate_tab --include-module=cenc_decrypt --include-module=demucs_manager --include-module=deepseek_translate --include-package=Crypto --include-data-files=Voice.json=Voice.json --include-data-files=rule_translate.txt=rule_translate.txt --output-filename=AnhStudio.exe --assume-yes-for-downloads honggou_tab.py
 
     # ── Tải ffmpeg + ffprobe (bản tĩnh, không cần cài) ──
     - name: Download ffmpeg
@@ -49,6 +49,7 @@ jobs:
         Copy-Item "ffprobe.exe"   -Destination $pkg
         if (Test-Path "Voice.json")        { Copy-Item "Voice.json"        -Destination $pkg }
         if (Test-Path "capcut_tts_api")    { Copy-Item "capcut_tts_api" -Destination $pkg -Recurse }
+        if (Test-Path "rule_translate.txt")  { Copy-Item "rule_translate.txt" -Destination $pkg }
         # File readme nhỏ cho khách
         "Chay AnhStudio.exe de su dung. Khong can cai dat gi them." | Out-File -FilePath "$pkg\HUONG_DAN.txt" -Encoding utf8
         Compress-Archive -Path "$pkg\*" -DestinationPath "HongguoDownloader.zip" -Force

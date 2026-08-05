@@ -32,12 +32,10 @@ GET_PIP_URL    = "https://bootstrap.pypa.io/get-pip.py"
 # Demucs CPU-only (torch nhẹ hơn GPU rất nhiều)
 TORCH_INDEX    = "https://download.pytorch.org/whl/cpu"
 
-# Thư mục cài đặt: cạnh file exe hoặc cạnh script
+# Thư mục cài đặt: AppData\Roaming\AnhStudio (tồn tại vĩnh viễn, không bị Nuitka xóa)
 def _app_dir() -> str:
-    if getattr(sys, "frozen", False):
-        # Nuitka / PyInstaller onefile: dùng thư mục chứa exe
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(appdata, "AnhStudio")
 
 def _portable_dir() -> str:
     return os.path.join(_app_dir(), "python_portable")
