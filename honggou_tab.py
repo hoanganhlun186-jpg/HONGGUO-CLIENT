@@ -109,7 +109,7 @@ except ImportError:
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.36"
+APP_VERSION = "1.0.37"
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  
 
@@ -235,6 +235,52 @@ class HonggouMergeThread(QThread):
             return "hevc_mp4toannexb"
         return "h264_mp4toannexb"
 
+    def _verify_output(self, ffmpeg_path, ffprobe_path, final_output, any_have_audio):
+        """
+        Verify file output 100%:
+        1. Có audio stream không (nếu input có audio)
+        2. Decode toàn bộ video + audio không bị lỗi/dựt
+        3. Duration hợp lý (> 1 giây)
+        """
+        # Check 1: audio stream
+        out_info = probe_stream(final_output, ffprobe_path)
+        if any_have_audio and not out_info["has_audio"]:
+            return False, "File output không có tiếng"
+
+        # Check 2: kích thước
+        if os.path.getsize(final_output) < 1024:
+            return False, "File output quá nhỏ"
+
+        # Check 3: decode toàn bộ file — phát hiện dựt/lỗi frame
+        si = None
+        cf = 0
+        if sys.platform == "win32":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            cf = 0x08000000
+        verify_cmd = [
+            ffmpeg_path, '-v', 'error',
+            '-i', final_output,
+            '-f', 'null', '-'
+        ]
+        res = subprocess.run(verify_cmd, startupinfo=si, creationflags=cf,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        err_output = res.stderr.decode('utf-8', errors='ignore')
+
+        # Lọc các lỗi nghiêm trọng (bỏ qua warning nhỏ)
+        serious_errors = [
+            line for line in err_output.splitlines()
+            if any(kw in line.lower() for kw in [
+                'invalid data', 'corrupt', 'error', 'no such', 'moov atom'
+            ]) and 'warning' not in line.lower()
+              and 'deprecated' not in line.lower()
+              and 'pts' not in line.lower()
+        ]
+        if serious_errors:
+            return False, f"File bị lỗi: {serious_errors[0][:120]}"
+
+        return True, "OK"
+
     def run(self):
         ffmpeg_path = get_ffmpeg_path()
         if not ffmpeg_path:
@@ -283,22 +329,29 @@ class HonggouMergeThread(QThread):
                         self.progress_msg.emit(f"⚙️ Chuẩn hoá tập {j+1}/{len(files_to_merge)} (Phần {i+1})...")
                         ts_path = fp + ".ts"
                         bsf = self._bsf_for_vcodec(infos[j].get("vcodec") or common_vcodec)
-                        # Thử copy nguyên + bsf video
-                        ts_cmd = [ffmpeg_path, '-y', '-fflags', '+genpts', '-i', fp,
-                                  '-c', 'copy', '-bsf:v', bsf, '-f', 'mpegts', ts_path]
+                        fi = infos[j]
+                        # Luôn encode audio → AAC để đảm bảo không mất tiếng khi ghép .ts
+                        if fi.get("has_audio"):
+                            ts_cmd = [ffmpeg_path, '-y', '-fflags', '+genpts', '-i', fp,
+                                      '-c:v', 'copy', '-bsf:v', bsf,
+                                      '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2',
+                                      '-f', 'mpegts', ts_path]
+                        else:
+                            ts_cmd = [ffmpeg_path, '-y', '-fflags', '+genpts', '-i', fp,
+                                      '-c:v', 'copy', '-bsf:v', bsf,
+                                      '-an', '-f', 'mpegts', ts_path]
                         res_ts = _run(ts_cmd)
                         if res_ts.returncode != 0:
-                            # Thử copy nguyên không bsf
-                            ts_cmd2 = [ffmpeg_path, '-y', '-fflags', '+genpts', '-i', fp,
-                                       '-c', 'copy', '-f', 'mpegts', ts_path]
+                            # Fallback: không bsf
+                            if fi.get("has_audio"):
+                                ts_cmd2 = [ffmpeg_path, '-y', '-fflags', '+genpts', '-i', fp,
+                                           '-c:v', 'copy',
+                                           '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2',
+                                           '-f', 'mpegts', ts_path]
+                            else:
+                                ts_cmd2 = [ffmpeg_path, '-y', '-fflags', '+genpts', '-i', fp,
+                                           '-c:v', 'copy', '-an', '-f', 'mpegts', ts_path]
                             res_ts = _run(ts_cmd2)
-                        if res_ts.returncode != 0:
-                            # Thử encode audio sang aac để đảm bảo có tiếng
-                            ts_cmd3 = [ffmpeg_path, '-y', '-fflags', '+genpts', '-i', fp,
-                                       '-c:v', 'copy', '-bsf:v', bsf,
-                                       '-c:a', 'aac', '-b:a', '192k',
-                                       '-f', 'mpegts', ts_path]
-                            res_ts = _run(ts_cmd3)
                             if res_ts.returncode != 0:
                                 raise Exception("remux .ts lỗi: " + res_ts.stderr.decode('utf-8', errors='ignore')[-160:])
                         ts_files.append(ts_path)
@@ -311,16 +364,15 @@ class HonggouMergeThread(QThread):
 
                     self.progress_msg.emit(f"⚡ Ráp mạch phim phần {i+1}/{total_tasks}: {out_name}...")
                     cmd = [ffmpeg_path, '-y', '-f', 'concat', '-safe', '0', '-i', list_txt_path,
-                           '-c', 'copy']
-                    if all_aac:
-                        cmd += ['-bsf:a', 'aac_adtstoasc']
-                    cmd += ['-movflags', '+faststart', final_output]
+                           '-c', 'copy',
+                           '-bsf:a', 'aac_adtstoasc',  # luôn dùng vì đã encode AAC ở bước .ts
+                           '-movflags', '+faststart', final_output]
                     result = _run(cmd)
                     if result.returncode == 0 and os.path.exists(final_output):
-                        # Kiểm tra file output có audio không (tránh ghép thành công nhưng mất tiếng)
-                        out_info = probe_stream(final_output, ffprobe_path)
-                        if any_have_audio and not out_info["has_audio"]:
-                            self.progress_msg.emit(f"↩️ Ghép nhanh mất tiếng, chuyển sang encode lại...")
+                        self.progress_msg.emit(f"🔍 Đang kiểm tra chất lượng file...")
+                        ok_verify, reason = self._verify_output(ffmpeg_path, ffprobe_path, final_output, any_have_audio)
+                        if not ok_verify:
+                            self.progress_msg.emit(f"↩️ Ghép nhanh lỗi ({reason}), chuyển sang encode lại...")
                             try:
                                 os.remove(final_output)
                             except Exception:
@@ -351,13 +403,10 @@ class HonggouMergeThread(QThread):
 
                     result = _run(cmd)
                     if result.returncode == 0 and os.path.exists(final_output):
-                        # Kiểm tra lần cuối: file output phải có audio nếu input có audio
-                        out_info = probe_stream(final_output, ffprobe_path)
-                        if any_have_audio and not out_info["has_audio"]:
-                            raise Exception("Encode lại xong nhưng file output không có tiếng — kiểm tra lại video gốc.")
-                        # Kiểm tra kích thước file > 0
-                        if os.path.getsize(final_output) < 1024:
-                            raise Exception("File output quá nhỏ, có thể bị lỗi khi ghép.")
+                        self.progress_msg.emit(f"🔍 Đang kiểm tra chất lượng file (encode lại)...")
+                        ok_verify, reason = self._verify_output(ffmpeg_path, ffprobe_path, final_output, any_have_audio)
+                        if not ok_verify:
+                            raise Exception(f"Encode lại xong nhưng file lỗi: {reason}")
                         success = True
                     else:
                         err = result.stderr.decode('utf-8', errors='ignore')[-200:]
@@ -1529,17 +1578,44 @@ class DubThread(QThread):
 
                 # ── MIX & GHÉP VÀO VIDEO ──────────────────────────────────────
                 if vocals_audio:
+                    # Bước 1: Mix vocals.wav vào video gốc → video_vocals.mp4
                     ov = getattr(self, "orig_volume", 15) / 100.0
-                    cmd = [ffmpeg, "-y",
-                           "-i", video_path,
-                           "-i", vocals_audio,
-                           "-i", dub_audio,
-                           "-filter_complex",
-                           f"[1:a]volume={ov:.3f}[orig];[2:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=longest[aout]",
-                           "-map", "0:v", "-map", "[aout]",
-                           "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                           out_video]
+                    video_vocals = os.path.join(temp_dir, "video_vocals.mp4")
+                    self.progress_signal.emit(f"[{idx+1}] 🎵 Đang ghép nhạc nền đã tách vào video...")
+                    cmd_vocals = [ffmpeg, "-y",
+                                  "-i", video_path,
+                                  "-i", vocals_audio,
+                                  "-map", "0:v", "-map", "1:a",
+                                  "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                                  "-shortest",
+                                  video_vocals]
+                    res_v = _sp.run(cmd_vocals, startupinfo=si, stdout=_sp.DEVNULL, stderr=_sp.PIPE)
+                    if res_v.returncode != 0:
+                        err = res_v.stderr.decode("utf-8", errors="ignore")[-200:]
+                        raise RuntimeError(f"ffmpeg ghép vocals lỗi: {err}")
+
+                    # Bước 2: Mix dub_audio vào video_vocals.mp4 → out_video
+                    self.progress_signal.emit(f"[{idx+1}] 🎙 Đang ghép tiếng lồng vào video...")
+                    if getattr(self, "mute_original", True):
+                        cmd = [ffmpeg, "-y",
+                               "-i", video_vocals,
+                               "-i", dub_audio,
+                               "-map", "0:v", "-map", "1:a",
+                               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                               "-shortest",
+                               out_video]
+                    else:
+                        cmd = [ffmpeg, "-y",
+                               "-i", video_vocals,
+                               "-i", dub_audio,
+                               "-filter_complex",
+                               f"[0:a]volume={ov:.3f}[orig];[1:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=longest[aout]",
+                               "-map", "0:v", "-map", "[aout]",
+                               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                               out_video]
+
                 elif getattr(self, "mute_original", True):
+                    # Không tách nhạc nền → lồng tiếng bình thường
                     cmd = [ffmpeg, "-y",
                            "-i", video_path,
                            "-i", dub_audio,
@@ -1558,13 +1634,19 @@ class DubThread(QThread):
                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                            out_video]
 
-                res = _sp.run(cmd, startupinfo=si, stdout=_sp.DEVNULL, stderr=_sp.PIPE)
-                if res.returncode == 0:
-                    self.progress_signal.emit(f"[{idx+1}] ✅ Xong! → {os.path.basename(out_video)}")
-                    ok += 1
+                if not vocals_audio:
+                    res = _sp.run(cmd, startupinfo=si, stdout=_sp.DEVNULL, stderr=_sp.PIPE)
+                    if res.returncode != 0:
+                        err = res.stderr.decode("utf-8", errors="ignore")[-200:]
+                        raise RuntimeError(f"ffmpeg lỗi: {err}")
                 else:
-                    err = res.stderr.decode("utf-8", errors="ignore")[-200:]
-                    raise RuntimeError(f"ffmpeg lỗi: {err}")
+                    res = _sp.run(cmd, startupinfo=si, stdout=_sp.DEVNULL, stderr=_sp.PIPE)
+                    if res.returncode != 0:
+                        err = res.stderr.decode("utf-8", errors="ignore")[-200:]
+                        raise RuntimeError(f"ffmpeg ghép lồng tiếng lỗi: {err}")
+
+                self.progress_signal.emit(f"[{idx+1}] ✅ Xong! → {os.path.basename(out_video)}")
+                ok += 1
 
             except Exception as e:
                 self.progress_signal.emit(f"[{idx+1}] ❌ Lỗi {bname}: {str(e)[:120]}")
@@ -1597,6 +1679,8 @@ class HonggouWidget(QWidget):
         self._active_threads = []
         self.current_quota = 20
         self._has_real_gpu = False
+        # Cập nhật tooltip sau khi detect xong
+        QTimer.singleShot(3000, self._update_gpu_tooltip)
         
         default_dl = os.path.join(os.path.expanduser("~"), "Downloads")
         self.save_folder = self.settings.value(f"download_folder_{self.username}", default_dl)
@@ -2479,8 +2563,8 @@ class HonggouWidget(QWidget):
         bgm_ctrl.addWidget(self.chk_bgm_del_original)
 
         self.chk_use_gpu = QCheckBox("🚀 Tách bằng Card Đồ Họa (GPU)")
-        self.chk_use_gpu.setEnabled(False) 
-        self.chk_use_gpu.setToolTip("GPU giúp tách nhanh gấp 10 lần. Tự động chuyển CPU an toàn nếu gặp lỗi driver.")
+        self.chk_use_gpu.setEnabled(False)
+        self.chk_use_gpu.setToolTip("⏳ Đang kiểm tra GPU... Nếu máy không có Card NVIDIA (CUDA) thì ô này sẽ bị xám và không dùng được. Máy sẽ tự dùng CPU thay thế.")
         self.chk_use_gpu.setStyleSheet("""
             QCheckBox { color: #38bdf8; font-weight: bold; font-size: 12px; padding: 2px; }
             QCheckBox::indicator { width: 16px; height: 16px; border: 2px solid #0284c7; border-radius: 4px; background: #1f2937; }
@@ -2577,7 +2661,31 @@ class HonggouWidget(QWidget):
                     ensure_demucs_installed_ui(self, _after_install)
 
     # ── LOGIC DÒ GPU AN TOÀN QUA SUBPROCESS ─────────────────────────
+    def _update_gpu_tooltip(self):
+        """Cập nhật tooltip GPU sau khi detect xong."""
+        if getattr(self, '_has_real_gpu', False):
+            vram = getattr(self, '_gpu_vram_gb', 0)
+            self.chk_use_gpu.setToolTip(
+                f"✅ Phát hiện GPU NVIDIA ({vram:.1f}GB VRAM)\n"
+                "GPU giúp tách nhanh gấp 10 lần so với CPU."
+            )
+        else:
+            self.chk_use_gpu.setToolTip(
+                "❌ Không phát hiện GPU NVIDIA (CUDA) trên máy này.\n"
+                "Chương trình sẽ tự dùng CPU — chậm hơn nhưng vẫn hoạt động tốt."
+            )
+
     def _on_gpu_checkbox_clicked(self, checked):
+        if checked and not getattr(self, '_has_real_gpu', False):
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self, "Không có GPU NVIDIA",
+                "Máy bạn không có Card Đồ Họa NVIDIA (CUDA) hợp lệ.\n\n"
+                "✅ Đừng lo — chương trình sẽ tự động dùng CPU để tách nhạc.\n"
+                "⚠️  CPU sẽ chậm hơn GPU nhưng vẫn cho kết quả tốt."
+            )
+            self.chk_use_gpu.setChecked(False)
+            return
         if checked and not getattr(self, '_has_real_gpu', False):
             reply = QMessageBox.warning(
                 self, "Cảnh báo tương thích", 

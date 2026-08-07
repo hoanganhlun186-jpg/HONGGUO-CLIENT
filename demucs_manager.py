@@ -92,6 +92,26 @@ def ensure_demucs_installed_ui(parent: QWidget, on_ready):
 
 # ─── Nội bộ ──────────────────────────────────────────────────────────────────
 
+def _cleanup_portable():
+    """Xóa thư mục python_portable nếu cài dở."""
+    d = _portable_dir()
+    if os.path.exists(d):
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+
+def _check_disk_space(min_gb: float = 2.0) -> tuple:
+    """Kiểm tra disk còn đủ dung lượng không. Trả về (ok, free_gb)."""
+    try:
+        d = _app_dir()
+        os.makedirs(d, exist_ok=True)
+        stat = shutil.disk_usage(d)
+        free_gb = stat.free / (1024 ** 3)
+        return free_gb >= min_gb, free_gb
+    except Exception:
+        return True, 99.0  # không check được thì cho qua
+
 def _si():
     """STARTUPINFO ẩn console trên Windows."""
     if sys.platform != "win32":
@@ -118,11 +138,18 @@ def _on_install_done(ok: bool, msg: str, prog_dlg: "QDialog", on_ready):
     if ok:
         on_ready()
     else:
+        # Xóa python_portable nếu cài dở để lần sau cài lại từ đầu
+        _cleanup_portable()
         from PyQt6.QtWidgets import QMessageBox
         QMessageBox.critical(
             None, "Cài đặt thất bại",
             f"Không thể cài Demucs:\n{msg}\n\n"
-            "Kiểm tra kết nối Internet rồi thử lại."
+            "Đã dọn dẹp file cài dở.\n"
+            "Kiểm tra:\n"
+            "  • Kết nối Internet còn không?\n"
+            "  • Ổ đĩa còn trống ít nhất 2GB không?\n"
+            "  • Antivirus có đang chặn không?\n\n"
+            "Thử tick lại ô Tách nhạc nền để cài lại."
         )
 
 
@@ -255,6 +282,18 @@ class _InstallWorker(QThread):
 
     def run(self):
         try:
+            # ── Kiểm tra dung lượng disk trước khi cài ──────────────────
+            self.log.emit("🔍 Đang kiểm tra dung lượng ổ đĩa...")
+            ok_disk, free_gb = _check_disk_space(2.0)
+            if not ok_disk:
+                raise RuntimeError(
+                    f"Ổ đĩa chỉ còn {free_gb:.1f}GB trống.\n"
+                    f"Cần ít nhất 2GB để cài torch + demucs.\n"
+                    f"Vui lòng xóa bớt file rồi thử lại."
+                )
+            self.log.emit(f"✅ Ổ đĩa còn {free_gb:.1f}GB — đủ dung lượng.")
+            self.progress.emit(3)
+
             # ── Bước 1: Tải & giải nén Python portable ──────────────────
             if not os.path.exists(self._py):
                 self.log.emit("📥 Đang tải Python portable (~10 MB)...")
@@ -312,10 +351,12 @@ class _InstallWorker(QThread):
             self.log.emit("✅ torch đã cài xong.")
             self.progress.emit(75)
 
-            # ── Bước 4: Cài demucs (~50 MB) ─────────────────────────────
-            self.log.emit("📥 Đang cài demucs...")
+            # ── Bước 4: Cài demucs + đầy đủ dependencies ──────────────
+            self.log.emit("📥 Đang cài demucs và các thư viện cần thiết...")
             self._run([
-                pip, "install", "demucs",
+                pip, "install",
+                "demucs", "julius", "diffq", "einops",
+                "dora-search", "hydra-core", "omegaconf",
                 "--no-warn-script-location", "-q"
             ], 75, 95)
             self.log.emit("✅ demucs đã cài xong.")
@@ -336,6 +377,8 @@ class _InstallWorker(QThread):
             self.finished.emit(True, "")
 
         except Exception as e:
+            # Xóa portable nếu cài dở để lần sau cài lại sạch
+            _cleanup_portable()
             self.finished.emit(False, str(e))
 
     def _download(self, url: str, dest: str, prog_start: int, prog_end: int):
