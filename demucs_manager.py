@@ -85,6 +85,9 @@ def ensure_demucs_installed_ui(parent: QWidget, on_ready):
     if is_demucs_ready():
         on_ready()
         return
+    # Có python_portable nhưng demucs lỗi → xóa sạch trước khi cài lại
+    if os.path.exists(_portable_dir()):
+        _cleanup_portable()
     dlg = _InstallDialog(parent)
     dlg.accepted_signal.connect(lambda: _start_install(parent, dlg, on_ready))
     dlg.exec()
@@ -351,18 +354,35 @@ class _InstallWorker(QThread):
             self.log.emit("✅ torch đã cài xong.")
             self.progress.emit(75)
 
-            # ── Bước 4: Cài demucs + đầy đủ dependencies ──────────────
-            self.log.emit("📥 Đang cài demucs và các thư viện cần thiết...")
+            # ── Bước 4: Cài dependencies trước ──────────────────────────
+            self.log.emit("📥 Đang cài các thư viện hỗ trợ...")
+            # Cài từng nhóm riêng để tránh conflict
+            for pkg_group in [
+                ["einops", "omegaconf", "hydra-core"],
+                ["julius"],
+                ["diffq"],
+                ["dora-search"],
+            ]:
+                try:
+                    self._run([
+                        pip, "install", *pkg_group,
+                        "--no-warn-script-location", "-q"
+                    ], 75, 80)
+                except Exception as _pe:
+                    # Bỏ qua nếu package optional không cài được
+                    self.log.emit(f"⚠️ Bỏ qua {pkg_group}: {str(_pe)[:60]}")
+            self.progress.emit(80)
+
+            # ── Bước 5: Cài demucs ───────────────────────────────────────
+            self.log.emit("📥 Đang cài demucs...")
             self._run([
-                pip, "install",
-                "demucs", "julius", "diffq", "einops",
-                "dora-search", "hydra-core", "omegaconf",
+                pip, "install", "demucs",
                 "--no-warn-script-location", "-q"
-            ], 75, 95)
+            ], 80, 95)
             self.log.emit("✅ demucs đã cài xong.")
             self.progress.emit(95)
 
-            # ── Bước 5: Kiểm tra ─────────────────────────────────────────
+            # ── Bước 6: Kiểm tra ─────────────────────────────────────────
             self.log.emit("🔍 Đang kiểm tra...")
             res = subprocess.run(
                 [self._py, "-c", "import demucs; print('ok')"],

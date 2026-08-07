@@ -103,13 +103,13 @@ except Exception:
 try:
     from demucs_manager import ensure_demucs_installed_ui, get_demucs_python
     _DEMUCS_MANAGER_OK = True
-except ImportError:
+except Exception:
     _DEMUCS_MANAGER_OK = False
 
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.37"
+APP_VERSION = "1.0.38"
 SERVER_URL = "http://163.61.182.119:8000"
 MAX_CONCURRENT_DOWNLOADS = 3  
 
@@ -2649,16 +2649,39 @@ class HonggouWidget(QWidget):
     def _on_chk_remove_bgm_changed(self, state):
         """Khi tick vào ô Tách nhạc nền: check demucs, hỏi cài nếu chưa có."""
         if state == 2:  # Checked
-            if _DEMUCS_MANAGER_OK:
-                from demucs_manager import is_demucs_ready
-                if not is_demucs_ready():
-                    # Chưa cài → bỏ tick tạm, hỏi cài
+            if not _DEMUCS_MANAGER_OK:
+                # demucs_manager không load được → cho tick bình thường
+                return
+            # Bỏ tick tạm, hiện loading cursor, check trong thread riêng
+            self.chk_remove_bgm.blockSignals(True)
+            self.chk_remove_bgm.setChecked(False)
+            self.chk_remove_bgm.blockSignals(False)
+            self.chk_remove_bgm.setEnabled(False)
+            self.chk_remove_bgm.setText("🎵 Đang kiểm tra...")
+
+            class _CheckThread(QThread):
+                result = pyqtSignal(bool)
+                def run(self):
+                    from demucs_manager import is_demucs_ready
+                    self.result.emit(is_demucs_ready())
+
+            def _on_check_done(ready):
+                self.chk_remove_bgm.setEnabled(True)
+                self.chk_remove_bgm.setText("🎵 Tách nhạc nền")
+                if ready:
+                    # Đã cài rồi → tick luôn
                     self.chk_remove_bgm.blockSignals(True)
-                    self.chk_remove_bgm.setChecked(False)
+                    self.chk_remove_bgm.setChecked(True)
                     self.chk_remove_bgm.blockSignals(False)
+                else:
+                    # Chưa cài → hiện popup hỏi cài
                     def _after_install():
                         self.chk_remove_bgm.setChecked(True)
                     ensure_demucs_installed_ui(self, _after_install)
+
+            self._bgm_check_thread = _CheckThread()
+            self._bgm_check_thread.result.connect(_on_check_done)
+            self._bgm_check_thread.start()
 
     # ── LOGIC DÒ GPU AN TOÀN QUA SUBPROCESS ─────────────────────────
     def _update_gpu_tooltip(self):
