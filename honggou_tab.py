@@ -109,8 +109,17 @@ except Exception:
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.38"
+APP_VERSION = "1.0.39"
 SERVER_URL = "http://163.61.182.119:8000"
+GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
+
+# Báo cho demucs_manager biết URL wheels để cài offline
+if _DEMUCS_MANAGER_OK:
+    try:
+        from demucs_manager import set_wheels_url
+        set_wheels_url(GITHUB_REPO, f"v{APP_VERSION}")
+    except Exception:
+        pass
 MAX_CONCURRENT_DOWNLOADS = 3  
 
 # ==========================================
@@ -1525,22 +1534,6 @@ class DubThread(QThread):
                     try:
                         self.progress_signal.emit(f"[{idx+1}] 🎵 Đang tách thoại gốc bằng Demucs (Tiến trình độc lập)...")
                         
-                        env = os.environ.copy()
-                        env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-                        
-                        if getattr(self, "use_gpu", False):
-                            env.pop("CUDA_VISIBLE_DEVICES", None)
-                            _device = "cuda"
-                            _dev_label = "GPU"
-                        else:
-                            _n_threads = str(max(1, int(os.cpu_count() * 0.3)))
-                            env["OMP_NUM_THREADS"] = _n_threads
-                            env["MKL_NUM_THREADS"] = _n_threads       # giới hạn thêm MKL
-                            env["NUMEXPR_NUM_THREADS"] = _n_threads
-                            env["OPENBLAS_NUM_THREADS"] = _n_threads
-                            _device = "cpu"
-                            _dev_label = "CPU (30% Công suất - An toàn)"
-                            
                         raw_wav = os.path.join(temp_dir, "orig_audio.wav")
                         _sp.run(
                             [ffmpeg, "-y", "-i", video_path, "-vn",
@@ -1551,30 +1544,89 @@ class DubThread(QThread):
                         demucs_out = os.path.join(temp_dir, "demucs_out")
                         model_name = "mdx_extra_q"
                         _demucs_py = get_demucs_python() if _DEMUCS_MANAGER_OK else _sys.executable
-                        cmd_demucs = [
-                            _demucs_py, "-m", "demucs.separate",
-                            "-n", model_name,
-                            "--two-stems", "vocals",
-                            "-d", _device,
-                            "--out", demucs_out,
-                            raw_wav
-                        ]
-                        
-                        res_d = _sp.run(cmd_demucs, env=env, startupinfo=si, stdout=_sp.PIPE, stderr=_sp.PIPE)
-                        if res_d.returncode != 0:
-                            raise RuntimeError(res_d.stderr.decode("utf-8", errors="ignore")[-200:])
-
                         stem_name = os.path.splitext(os.path.basename(raw_wav))[0]
                         vocals_path = os.path.join(demucs_out, model_name, stem_name, "vocals.wav")
-                        if os.path.exists(vocals_path):
-                            vocals_audio = vocals_path
-                            self.progress_signal.emit(f"[{idx+1}] ✅ Tách thoại xong! ({_dev_label})")
-                        else:
-                            self.progress_signal.emit(f"[{idx+1}] ⚠️ Không tìm thấy vocals.wav, bỏ qua tách nhạc.")
+
+                        # Danh sách thiết bị sẽ thử theo thứ tự. Nếu khách muốn GPU và
+                        # máy đã detect có card thật -> thử "cuda" trước, LỖI thì TỰ RỚT
+                        # về "cpu" (fallback thật sự, không crash). Máy không GPU -> chỉ chạy CPU.
+                        _want_gpu = getattr(self, "use_gpu", False) and getattr(self, "_has_real_gpu", False)
+                        _device_chain = (["cuda", "cpu"] if _want_gpu else ["cpu"])
+
+                        vocals_audio = None
+                        _last_err = ""
+                        for _device in _device_chain:
+                            env = os.environ.copy()
+                            env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+                            if _device == "cuda":
+                                env.pop("CUDA_VISIBLE_DEVICES", None)
+                                _dev_label = "GPU"
+                            else:
+                                # ép torch không thấy GPU + giới hạn luồng CPU cho an toàn máy khách
+                                env["CUDA_VISIBLE_DEVICES"] = "-1"
+                                _n_threads = str(max(1, int(os.cpu_count() * 0.3)))
+                                env["OMP_NUM_THREADS"] = _n_threads
+                                env["MKL_NUM_THREADS"] = _n_threads
+                                env["NUMEXPR_NUM_THREADS"] = _n_threads
+                                env["OPENBLAS_NUM_THREADS"] = _n_threads
+                                _dev_label = "CPU (30% Công suất - An toàn)"
+
+                            if _device == "cuda":
+                                self.progress_signal.emit(f"[{idx+1}] 🚀 Đang thử tách bằng GPU...")
+
+                            cmd_demucs = [
+                                _demucs_py, "-m", "demucs.separate",
+                                "-n", model_name,
+                                "--two-stems", "vocals",
+                                "-d", _device,
+                                "--out", demucs_out,
+                                raw_wav
+                            ]
+                            res_d = _sp.run(cmd_demucs, env=env, startupinfo=si,
+                                            stdout=_sp.PIPE, stderr=_sp.PIPE)
+
+                            if res_d.returncode == 0 and os.path.exists(vocals_path):
+                                vocals_audio = vocals_path
+                                self.progress_signal.emit(f"[{idx+1}] ✅ Tách thoại xong! ({_dev_label})")
+                                break
+                            else:
+                                _last_err = res_d.stderr.decode("utf-8", errors="ignore")[-200:]
+                                if _device == "cuda":
+                                    # GPU lỗi (hết VRAM, driver cũ, torch không thấy cuda...) -> báo & rớt về CPU
+                                    self.progress_signal.emit(
+                                        f"[{idx+1}] ⚠️ GPU tách lỗi, tự chuyển sang CPU..."
+                                    )
+                                # xóa output dở của lần GPU để lần CPU chạy sạch
+                                try:
+                                    if os.path.isdir(demucs_out):
+                                        import shutil as _shutil
+                                        _shutil.rmtree(demucs_out, ignore_errors=True)
+                                except Exception:
+                                    pass
+
+                        if not vocals_audio:
+                            raise RuntimeError(_last_err or "Không tạo được vocals.wav")
                     except ImportError:
-                        self.progress_signal.emit(f"[{idx+1}] ⚠️ Chưa cài demucs! Chạy: pip install demucs. Bỏ qua tách nhạc.")
+                        self.progress_signal.emit(f"[{idx+1}] ⚠️ Chưa cài demucs! Bỏ qua tách nhạc.")
                     except Exception as bgm_e:
-                        self.progress_signal.emit(f"[{idx+1}] ⚠️ Lỗi Demucs: {str(bgm_e)[:80]}. Bỏ qua tách nhạc.")
+                        import traceback
+                        full_err = traceback.format_exc()
+                        # Log full lỗi ra file để debug
+                        try:
+                            log_path = os.path.join(
+                                os.environ.get("APPDATA", os.path.expanduser("~")),
+                                "AnhStudio", "demucs_error.log"
+                            )
+                            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                            with open(log_path, "w", encoding="utf-8") as _lf:
+                                _lf.write(full_err)
+                        except Exception:
+                            pass
+                        short = str(bgm_e)[:200]
+                        self.progress_signal.emit(
+                            f"[{idx+1}] ⚠️ Lỗi Demucs: {short}\n"
+                            r"  Chi tiết lỗi đã lưu tại: AppData\Roaming\AnhStudio\demucs_error.log"
+                        )
 
                 # ── MIX & GHÉP VÀO VIDEO ──────────────────────────────────────
                 if vocals_audio:
@@ -2704,23 +2756,12 @@ class HonggouWidget(QWidget):
             QMessageBox.information(
                 self, "Không có GPU NVIDIA",
                 "Máy bạn không có Card Đồ Họa NVIDIA (CUDA) hợp lệ.\n\n"
-                "✅ Đừng lo — chương trình sẽ tự động dùng CPU để tách nhạc.\n"
-                "⚠️  CPU sẽ chậm hơn GPU nhưng vẫn cho kết quả tốt."
+                "✅ Đừng lo — chương trình sẽ tự động dùng CPU để tách nhạc,\n"
+                "kết quả vẫn tốt, chỉ chậm hơn GPU một chút."
             )
             self.chk_use_gpu.setChecked(False)
             return
-        if checked and not getattr(self, '_has_real_gpu', False):
-            reply = QMessageBox.warning(
-                self, "Cảnh báo tương thích", 
-                "Hệ thống không phát hiện thấy Card đồ họa NVIDIA (CUDA) hợp lệ trên máy bạn.\n\n"
-                "Nếu bạn cố tình bật, ứng dụng có thể bị crash khi tách nhạc.\n"
-                "Bạn có chắc chắn muốn bật?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.No:
-                self.chk_use_gpu.setChecked(False)
-        elif checked and getattr(self, '_has_real_gpu', False) and not getattr(self, '_gpu_is_good', False):
+        if checked and getattr(self, '_has_real_gpu', False) and not getattr(self, '_gpu_is_good', False):
             vram = getattr(self, '_gpu_vram_gb', 0.0)
             reply = QMessageBox.warning(
                 self, "Cảnh báo VRAM thấp",
@@ -2760,7 +2801,14 @@ class HonggouWidget(QWidget):
                     "else:\n"
                     "    print('0||0')\n"
                 )
-                cmd = [sys.executable, "-c", probe]
+                # QUAN TRỌNG: phải dùng portable python (nơi đã cài torch CUDA),
+                # KHÔNG dùng sys.executable (python của app Nuitka, không có torch)
+                # nếu không sẽ detect nhầm -> luôn báo "không có GPU".
+                try:
+                    _probe_py = get_demucs_python() if _DEMUCS_MANAGER_OK else sys.executable
+                except Exception:
+                    _probe_py = sys.executable
+                cmd = [_probe_py, "-c", probe]
                 si = None
                 if sys.platform == "win32":
                     si = subprocess.STARTUPINFO()

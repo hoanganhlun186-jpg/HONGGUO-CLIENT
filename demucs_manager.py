@@ -29,8 +29,19 @@ from PyQt6.QtGui import QFont
 PYTHON_ZIP_URL = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
 # pip bootstrapper
 GET_PIP_URL    = "https://bootstrap.pypa.io/get-pip.py"
-# Demucs CPU-only (torch nhẹ hơn GPU rất nhiều)
-TORCH_INDEX    = "https://download.pytorch.org/whl/cpu"
+# Demucs torch CUDA 12.1 — chạy được CẢ GPU (máy có NVIDIA) LẪN CPU (máy không có).
+# Bản này nặng hơn cpu-only (~2.5GB) nhưng tự động: có card thì tách GPU, không có thì về CPU.
+TORCH_INDEX    = "https://download.pytorch.org/whl/cu121"
+
+# ── Wheels offline — đọc từ server để luôn trỏ đúng version mới nhất ──
+# Format: https://github.com/<owner>/<repo>/releases/download/<tag>/demucs_wheels.zip
+# Được set lúc runtime bởi app (honggou_tab.py gọi set_wheels_url)
+_WHEELS_URL: str = ""
+
+def set_wheels_url(github_repo: str, tag: str):
+    """Gọi từ honggou_tab.py khi biết repo + tag hiện tại."""
+    global _WHEELS_URL
+    _WHEELS_URL = f"https://github.com/{github_repo}/releases/download/{tag}/demucs_wheels.zip"
 
 # Thư mục cài đặt: AppData\Roaming\AnhStudio (tồn tại vĩnh viễn, không bị Nuitka xóa)
 def _app_dir() -> str:
@@ -191,7 +202,8 @@ class _InstallDialog(QDialog):
         info = QLabel(
             "Tính năng này dùng AI Demucs để tách nhạc nền ra\n"
             "khỏi video, giữ lại thoại + hiệu ứng âm thanh.\n\n"
-            "⬇  Cần tải thêm ~500 MB (chỉ 1 lần duy nhất)\n"
+            "⬇  Cần tải thêm ~2.5 GB (chỉ 1 lần duy nhất)\n"
+            "🚀  Tự động dùng GPU nếu có card NVIDIA, không thì dùng CPU\n"
             "📂  Lưu vào thư mục app, không ảnh hưởng hệ thống\n"
             "🔄  Lần sau dùng ngay, không cần tải lại"
         )
@@ -287,11 +299,11 @@ class _InstallWorker(QThread):
         try:
             # ── Kiểm tra dung lượng disk trước khi cài ──────────────────
             self.log.emit("🔍 Đang kiểm tra dung lượng ổ đĩa...")
-            ok_disk, free_gb = _check_disk_space(2.0)
+            ok_disk, free_gb = _check_disk_space(7.0)
             if not ok_disk:
                 raise RuntimeError(
                     f"Ổ đĩa chỉ còn {free_gb:.1f}GB trống.\n"
-                    f"Cần ít nhất 2GB để cài torch + demucs.\n"
+                    f"Cần ít nhất 7GB để tải + giải nén torch CUDA + demucs.\n"
                     f"Vui lòng xóa bớt file rồi thử lại."
                 )
             self.log.emit(f"✅ Ổ đĩa còn {free_gb:.1f}GB — đủ dung lượng.")
@@ -343,46 +355,66 @@ class _InstallWorker(QThread):
                 self.log.emit("✅ pip đã có sẵn.")
             self.progress.emit(35)
 
-            # ── Bước 3: Cài torch CPU-only (~200 MB) ────────────────────
-            self.log.emit("📥 Đang cài torch CPU (~200 MB)... Vui lòng chờ.")
-            self._run([
-                pip, "install",
-                "torch", "torchaudio",
-                "--extra-index-url", TORCH_INDEX,
-                "--no-warn-script-location", "-q"
-            ], 35, 75)
-            self.log.emit("✅ torch đã cài xong.")
-            self.progress.emit(75)
+            # ── Bước 3: Tải wheels offline từ GitHub Release ────────────
+            wheels_dir = os.path.join(self._dir, "_wheels")
+            wheels_zip = os.path.join(self._dir, "_demucs_wheels.zip")
 
-            # ── Bước 4: Cài dependencies trước ──────────────────────────
-            self.log.emit("📥 Đang cài các thư viện hỗ trợ...")
-            # Cài từng nhóm riêng để tránh conflict
-            for pkg_group in [
-                ["einops", "omegaconf", "hydra-core"],
-                ["julius"],
-                ["diffq"],
-                ["dora-search"],
-            ]:
+            if _WHEELS_URL:
+                self.log.emit("📥 Đang tải gói cài đặt offline (~2.5 GB)...")
+                self.log.emit("   (Chỉ tải 1 lần, lần sau dùng luôn)")
+                self._download(_WHEELS_URL, wheels_zip, 35, 72)
+                self.log.emit("📦 Đang giải nén gói cài đặt...")
+                self.progress.emit(73)
+                os.makedirs(wheels_dir, exist_ok=True)
+                with zipfile.ZipFile(wheels_zip, "r") as z:
+                    z.extractall(wheels_dir)
                 try:
-                    self._run([
-                        pip, "install", *pkg_group,
-                        "--no-warn-script-location", "-q"
-                    ], 75, 80)
-                except Exception as _pe:
-                    # Bỏ qua nếu package optional không cài được
-                    self.log.emit(f"⚠️ Bỏ qua {pkg_group}: {str(_pe)[:60]}")
-            self.progress.emit(80)
+                    os.remove(wheels_zip)
+                except Exception:
+                    pass
+                self.log.emit("✅ Gói cài đặt đã sẵn sàng.")
+                self.progress.emit(75)
 
-            # ── Bước 5: Cài demucs ───────────────────────────────────────
-            self.log.emit("📥 Đang cài demucs...")
-            self._run([
-                pip, "install", "demucs",
-                "--no-warn-script-location", "-q"
-            ], 80, 95)
-            self.log.emit("✅ demucs đã cài xong.")
+                # Cài offline từ wheels
+                self.log.emit("⚙️ Đang cài torch + demucs (offline)...")
+                self._run([
+                    pip, "install",
+                    "--no-index", f"--find-links={wheels_dir}",
+                    "torch", "torchaudio", "demucs",
+                    "julius", "einops", "omegaconf", "hydra-core",
+                    "--no-warn-script-location", "-q"
+                ], 75, 95)
+                # Dọn wheels sau khi cài xong
+                try:
+                    shutil.rmtree(wheels_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            else:
+                # Fallback: cài online nếu không có wheels URL
+                self.log.emit("📥 Đang cài torch CUDA (~2.5 GB)... Vui lòng chờ.")
+                self._run([
+                    pip, "install", "torch", "torchaudio",
+                    "--index-url", TORCH_INDEX,
+                    "--no-warn-script-location", "-q"
+                ], 35, 75)
+                self.log.emit("📥 Đang cài demucs...")
+                for pkg_group in [
+                    ["einops", "omegaconf", "hydra-core"],
+                    ["julius"],
+                    ["demucs"],
+                ]:
+                    try:
+                        self._run([
+                            pip, "install", *pkg_group,
+                            "--no-warn-script-location", "-q"
+                        ], 75, 95)
+                    except Exception as _pe:
+                        self.log.emit(f"⚠️ Bỏ qua {pkg_group}: {str(_pe)[:60]}")
+
+            self.log.emit("✅ torch + demucs đã cài xong.")
             self.progress.emit(95)
 
-            # ── Bước 6: Kiểm tra ─────────────────────────────────────────
+            # ── Bước 4: Kiểm tra ─────────────────────────────────────────
             self.log.emit("🔍 Đang kiểm tra...")
             res = subprocess.run(
                 [self._py, "-c", "import demucs; print('ok')"],
