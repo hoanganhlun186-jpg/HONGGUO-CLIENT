@@ -106,10 +106,33 @@ try:
 except Exception:
     _DEMUCS_MANAGER_OK = False
 
+def _resolve_demucs_python():
+    """Trả về đường dẫn python.exe THẬT SỰ có torch/demucs đã cài, luôn xác
+    minh file tồn tại trước khi dùng - không tin mù quáng vào việc import
+    demucs_manager có thành công hay không (module có thể fail-import trong
+    1 số bản build Nuitka vì lý do khác, nhưng python_portable vẫn có sẵn
+    trên máy). Nếu mọi cách đều không tìm thấy, fallback về sys.executable
+    (Python của chính app - sẽ không có torch, chỉ dùng khi thực sự bó tay)."""
+    candidates = []
+    if _DEMUCS_MANAGER_OK:
+        try:
+            candidates.append(get_demucs_python())
+        except Exception:
+            pass
+    # Fallback cứng: đường dẫn portable python chuẩn, phòng khi
+    # demucs_manager không import được nhưng python_portable vẫn có sẵn.
+    appdata = os.getenv('APPDATA', '')
+    if appdata:
+        candidates.append(os.path.join(appdata, 'AnhStudio', 'python_portable', 'python.exe'))
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return sys.executable
+
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.40"
+APP_VERSION = "1.0.41"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -462,7 +485,7 @@ class HotMoviesLoadThread(QThread):
             params = {}
             if self.genre: params["genre"] = self.genre
 
-            res = requests.get(url, params=params, timeout=10)
+            res = requests.get(url, params=params, timeout=20)
             if res.status_code == 200:
                 movies = res.json()
                 seen_titles = set()
@@ -1547,7 +1570,7 @@ class DubThread(QThread):
                         # Windows -> pip phải tự biên dịch, cần Visual Studio Build Tools.
                         # mdx_extra chất lượng tương đương, không cần diffq gì cả.
                         model_name = "mdx_extra"
-                        _demucs_py = get_demucs_python() if _DEMUCS_MANAGER_OK else _sys.executable
+                        _demucs_py = _resolve_demucs_python()
                         stem_name = os.path.splitext(os.path.basename(raw_wav))[0]
                         vocals_path = os.path.join(demucs_out, model_name, stem_name, "vocals.wav")
 
@@ -2363,6 +2386,22 @@ class HonggouWidget(QWidget):
         self.btn_open_folder.setStyleSheet("QPushButton { padding: 8px 15px; background-color: transparent; color: #38bdf8; border: 1px solid #374151; border-radius: 6px; font-weight: bold; } QPushButton:hover { background-color: #1e293b; border: 1px solid #38bdf8; }")
         self.btn_open_folder.clicked.connect(self._open_movie_folder)
         btn_back_layout.addWidget(self.btn_open_folder)
+
+        self.chk_auto_cover = QCheckBox("🖼️ Tự động tải ảnh bìa")
+        self.chk_auto_cover.setChecked(False)
+        self.chk_auto_cover.setToolTip("Bật = tự động lưu ảnh bìa phim vào thư mục phim mỗi khi bắt đầu tải.")
+        self.chk_auto_cover.setStyleSheet("""
+            QCheckBox { color: #fcd34d; font-weight: bold; font-size: 13px; padding: 2px; }
+            QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #d97706; border-radius: 4px; background: #1f2937; }
+            QCheckBox::indicator:checked { background: #d97706; }
+        """)
+        try: self.chk_auto_cover.setChecked(self.settings.value("auto_cover", "false") == "true")
+        except Exception: pass
+        self.chk_auto_cover.stateChanged.connect(
+            lambda v: self.settings.setValue("auto_cover", "true" if v else "false")
+        )
+        btn_back_layout.addWidget(self.chk_auto_cover)
+
         detail_layout.addLayout(btn_back_layout)
 
         self.lbl_status = QLabel("Trạng thái: Sẵn sàng phục vụ...")
@@ -2807,11 +2846,10 @@ class HonggouWidget(QWidget):
                 )
                 # QUAN TRỌNG: phải dùng portable python (nơi đã cài torch CUDA),
                 # KHÔNG dùng sys.executable (python của app Nuitka, không có torch)
-                # nếu không sẽ detect nhầm -> luôn báo "không có GPU".
-                try:
-                    _probe_py = get_demucs_python() if _DEMUCS_MANAGER_OK else sys.executable
-                except Exception:
-                    _probe_py = sys.executable
+                # nếu không sẽ detect nhầm -> luôn báo "không có GPU". Dùng
+                # _resolve_demucs_python() vì nó luôn xác minh file thật tồn tại,
+                # không tin mù quáng vào việc import demucs_manager có OK hay không.
+                _probe_py = _resolve_demucs_python()
                 cmd = [_probe_py, "-c", probe]
                 si = None
                 if sys.platform == "win32":
@@ -2867,6 +2905,8 @@ class HonggouWidget(QWidget):
     def load_hot_movies_shelf(self, genre=None):
         if hasattr(self, 'hot_thread') and self.hot_thread:
             try: self.hot_thread.item_loaded_signal.disconnect()
+            except: pass
+            try: self.hot_thread.finished_signal.disconnect()
             except: pass
         if hasattr(self, 'search_thread') and self.search_thread:
             try: self.search_thread.results_signal.disconnect()
@@ -2932,9 +2972,25 @@ class HonggouWidget(QWidget):
         
         self.hot_thread = HotMoviesLoadThread(genre)
         self.hot_thread.item_loaded_signal.connect(self._render_single_hot_movie)
-        self.hot_thread.finished_signal.connect(self.loading_bar.hide)
+        self.hot_thread.finished_signal.connect(self._on_hot_movies_finished)
         self._keep_thread_alive(self.hot_thread)
         self.hot_thread.start()
+
+    def _on_hot_movies_finished(self):
+        # Cùng lý do như trên: chỉ xử lý nếu đúng là luồng hiện tại báo xong,
+        # bỏ qua tín hiệu "finished" rớt muộn từ 1 luồng đã bị thay thế.
+        if self.sender() is not getattr(self, 'hot_thread', None):
+            return
+        self.loading_bar.hide()
+        # Nếu không có phim nào load được (server lỗi/timeout/danh mục rỗng),
+        # dòng "Đang lọc phim..." sẽ bị kẹt mãi mãi nếu không xử lý ở đây.
+        if getattr(self, 'is_first_movie', False):
+            self.hot_list.clear()
+            self.is_first_movie = False
+            empty = QListWidgetItem("😢 Không tải được danh sách phim.\nCó thể do mất mạng hoặc server đang bận.\nHãy thử bấm lại danh mục này.")
+            empty.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.hot_list.addItem(empty)
 
     def _on_history_cover_ready(self, row, img_bytes):
         item = self.hot_list.item(row)
@@ -3027,6 +3083,11 @@ class HonggouWidget(QWidget):
         self._scan()
 
     def _render_single_hot_movie(self, m):
+        # Chặn tín hiệu "rớt muộn" từ 1 luồng tải CŨ (VD: bấm danh mục 2 lần liên
+        # tiếp trong lúc lần 1 chưa kịp trả lời) - chỉ nhận tín hiệu từ luồng
+        # đang là self.hot_thread hiện tại, bỏ qua mọi tín hiệu từ luồng đã cũ.
+        if self.sender() is not getattr(self, 'hot_thread', None):
+            return
         if self.is_first_movie:
             self.hot_list.clear()
             self.is_first_movie = False
@@ -3171,6 +3232,8 @@ class HonggouWidget(QWidget):
             except: pass
         if hasattr(self, 'hot_thread') and self.hot_thread:
             try: self.hot_thread.item_loaded_signal.disconnect()
+            except: pass
+            try: self.hot_thread.finished_signal.disconnect()
             except: pass
 
         self._cached_history_ids = {str(h.get('series_id', '')) for h in self._load_history()}
@@ -3425,6 +3488,9 @@ class HonggouWidget(QWidget):
 
         self.quota_used_signal.emit()
 
+        if getattr(self, 'chk_auto_cover', None) and self.chk_auto_cover.isChecked():
+            self._save_cover_image(silent=True)
+
         if getattr(self, 'monitor_thread', None):
             self.monitor_thread.stop()
             self.monitor_thread = None
@@ -3573,6 +3639,44 @@ class HonggouWidget(QWidget):
         if not os.path.isdir(folder): folder = self.save_folder
         try: os.startfile(folder)
         except Exception as e: QMessageBox.warning(self, "Lỗi", f"Không mở được thư mục: {e}")
+
+    def _save_cover_image(self, silent=False):
+        cover_url = (getattr(self, 'current_cover_url', '') or '').strip()
+        if not cover_url:
+            if not silent:
+                QMessageBox.warning(self, "Chưa có ảnh bìa",
+                    "Chưa quét phim nào hoặc phim này không có ảnh bìa.\n"
+                    "Hãy quét 1 phim trước khi tải ảnh bìa.")
+            return
+        if cover_url.startswith('//'):
+            cover_url = 'https:' + cover_url
+
+        folder = os.path.join(self.save_folder, str(getattr(self, 'current_series_id', '') or ''))
+        os.makedirs(folder, exist_ok=True)
+
+        safe_title = re.sub(r'[\\/:*?"<>|]', '_', getattr(self, 'current_title', '') or 'poster').strip() or 'poster'
+        ext = os.path.splitext(cover_url.split('?')[0])[1]
+        if not ext or len(ext) > 5:
+            ext = '.jpg'
+        dest_path = os.path.join(folder, f"{safe_title}{ext}")
+
+        if silent and os.path.exists(dest_path):
+            return  # Đã có sẵn, khỏi tải lại
+
+        try:
+            resp = requests.get(cover_url, timeout=15)
+            resp.raise_for_status()
+            with open(dest_path, 'wb') as f:
+                f.write(resp.content)
+            if not silent:
+                QMessageBox.information(self, "Đã lưu ảnh bìa",
+                    f"Đã lưu ảnh bìa vào:\n{dest_path}")
+                try: os.startfile(folder)
+                except Exception: pass
+        except Exception as e:
+            if not silent:
+                QMessageBox.warning(self, "Lỗi tải ảnh bìa", f"Không tải được ảnh bìa:\n{e}")
+            # silent mode: lỗi thì bỏ qua, không làm gián đoạn tiến trình tải phim
 
     def _bump_total_progress(self):
         if not hasattr(self, 'total_progress'): return
@@ -4192,7 +4296,7 @@ class HonggouWidget(QWidget):
                     demucs_out = os.path.join(tmp, "out")
                     
                     # Gọi Demucs bằng subprocess. KHÔNG import trực tiếp trong app
-                    _demucs_py = get_demucs_python() if _DEMUCS_MANAGER_OK else sys.executable
+                    _demucs_py = _resolve_demucs_python()
                     cmd_demucs = [
                         _demucs_py, "-m", "demucs.separate",
                         "-n", model_name,
