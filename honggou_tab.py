@@ -109,7 +109,7 @@ except Exception:
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.39"
+APP_VERSION = "1.0.40"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -1542,7 +1542,11 @@ class DubThread(QThread):
                         )
 
                         demucs_out = os.path.join(temp_dir, "demucs_out")
-                        model_name = "mdx_extra_q"
+                        # Dùng mdx_extra (KHÔNG có hậu tố _q) vì bản _q cần gói "diffq"
+                        # để giải nén weights, mà diffq không có wheel cho Python 3.11 trên
+                        # Windows -> pip phải tự biên dịch, cần Visual Studio Build Tools.
+                        # mdx_extra chất lượng tương đương, không cần diffq gì cả.
+                        model_name = "mdx_extra"
                         _demucs_py = get_demucs_python() if _DEMUCS_MANAGER_OK else _sys.executable
                         stem_name = os.path.splitext(os.path.basename(raw_wav))[0]
                         vocals_path = os.path.join(demucs_out, model_name, stem_name, "vocals.wav")
@@ -4165,8 +4169,10 @@ class HonggouWidget(QWidget):
                 device = "cpu"
                 gpu_label = "CPU (30% Công suất - An toàn)"
 
-            # Đổi sang mdx_extra_q để xử lý cực nhanh (kể cả trên CPU)
-            model_name = "mdx_extra_q" 
+            # Dùng mdx_extra (KHÔNG _q) vì bản _q cần gói "diffq" - gói này không có
+            # wheel cho Python 3.11 Windows nên pip phải tự biên dịch, cần cài thêm
+            # Visual Studio Build Tools trên máy khách. mdx_extra không cần diffq.
+            model_name = "mdx_extra"
             ok = failed = 0
             
             for idx, video_path in enumerate(files):
