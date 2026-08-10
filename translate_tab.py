@@ -196,13 +196,15 @@ class GeminiTranslateThread(QThread):
     item_failed = pyqtSignal(int, str)
     all_done = pyqtSignal()
     
-    def __init__(self, queue_items, prompt_preset_key, model_key, chunk_size=100, translate_workers=1):
+    def __init__(self, queue_items, prompt_preset_key, model_key, chunk_size=100, translate_workers=1, show_browser=False):
         super().__init__()
         self.queue_items = list(queue_items)
         self.preset_text = PROMPT_PRESETS.get(prompt_preset_key, list(PROMPT_PRESETS.values())[0])
         self.model_key = model_key
         self.chunk_size = chunk_size
         self.translate_workers = max(1, min(4, int(translate_workers)))
+        # Hiện trình duyệt Chrome khi dịch (để soi Gemini chạy) hay chạy ẩn.
+        self.show_browser = bool(show_browser)
         self._cancel = False
         
     def cancel(self): self._cancel = True
@@ -248,7 +250,7 @@ class GeminiTranslateThread(QThread):
                     ctx = pw.chromium.launch_persistent_context(
                         user_data_dir=tool_profile_path,
                         channel="chrome",
-                        headless=True,
+                        headless=not self.show_browser,
                         user_agent=UA,
                         viewport={"width": 1280, "height": 900},
                         args=BROWSER_ARGS
@@ -281,7 +283,7 @@ class GeminiTranslateThread(QThread):
                 self.log.emit(f"\n{'='*50}\n📄 [{idx+1}/{total}] Đang xử lý: {base}\n")
                 try:
                     if clean_ctx is None:
-                        clean_ctx = self._extract_shared_context(page, srt_path)
+                        clean_ctx = self._extract_shared_context(page, self._context_sample_paths())
                     self._translate_smart(clean_ctx, page, idx, video_path, srt_path)
                 except Exception as e: 
                     self.item_failed.emit(idx, str(e))
@@ -304,7 +306,7 @@ class GeminiTranslateThread(QThread):
         đụng độ luồng khác (Playwright sync API không an toàn khi dùng chung
         giữa nhiều luồng, và Chrome persistent profile không cho 2 tiến
         trình cùng mở 1 lúc)."""
-        browser = pw.chromium.launch(headless=True, channel="chrome", args=BROWSER_ARGS)
+        browser = pw.chromium.launch(headless=not self.show_browser, channel="chrome", args=BROWSER_ARGS)
         ctx = browser.new_context(
             storage_state=AUTH_FILE,
             user_agent=UA,
@@ -335,8 +337,7 @@ class GeminiTranslateThread(QThread):
                 browser_main, ctx_main = self._launch_authenticated_context(pw_main)
                 page_main = ctx_main.new_page()
                 self.log.emit("🌐 Đã khởi tạo trình duyệt Chrome ngầm (lấy bối cảnh chung).\n")
-                sample_srt = self.queue_items[0]["srt"]
-                clean_ctx = self._extract_shared_context(page_main, sample_srt)
+                clean_ctx = self._extract_shared_context(page_main, self._context_sample_paths())
             finally:
                 try:
                     if browser_main: browser_main.close()
@@ -389,37 +390,95 @@ class GeminiTranslateThread(QThread):
         self.log.emit(f"\n🏁 XONG CHIẾN DỊCH.\n")
         self.all_done.emit()
 
-    def _extract_shared_context(self, page, sample_srt_path):
-        """Phân tích bối cảnh (thể loại + xưng hô) DÙNG CHUNG cho toàn bộ
-        hàng đợi dịch song song phía sau - chỉ chạy 1 LẦN DUY NHẤT, dùng 1
-        tập làm mẫu (thường là tập đầu tiên), thay vì mỗi tập tự phân tích
-        riêng như trước (vừa tốn thời gian vừa có thể ra bối cảnh khác nhau
-        giữa các tập cùng 1 phim)."""
-        with open(sample_srt_path, "r", encoding="utf-8-sig") as f: srt_content = f.read()
-        blocks = self._parse_srt(srt_content)
-        if not blocks:
+    # Số tập đầu hàng đợi dùng làm mẫu phân tích bối cảnh dùng chung.
+    CONTEXT_SAMPLE_EPISODES = 3
+    # Giới hạn số dòng gộp lại khi lấy mẫu (an toàn nếu lỡ có tập dài bất thường).
+    CONTEXT_MAX_LINES = 400
+
+    def _extract_shared_context(self, page, sample_srt_paths):
+        """Phân tích bối cảnh (thể loại + văn phong + xưng hô + thuật ngữ)
+        DÙNG CHUNG cho toàn bộ hàng đợi. Chỉ chạy 1 LẦN DUY NHẤT.
+
+        Nhận vào DANH SÁCH đường dẫn srt (thường là 3 tập đầu hàng đợi).
+        Gộp nội dung các tập đó làm mẫu để bối cảnh sát hơn (bắt được nhiều
+        nhân vật, xưng hô ổn định hơn so với chỉ 1 tập). Tự co giãn: có bao
+        nhiêu tập trong danh sách thì dùng bấy nhiêu (1, 2 hay 3 đều chạy).
+
+        Tương thích ngược: nếu lỡ truyền vào 1 chuỗi path đơn (str) thay vì
+        list, vẫn xử lý được như 1 tập."""
+        # Chấp nhận cả str (1 tập) lẫn list (nhiều tập) cho an toàn.
+        if isinstance(sample_srt_paths, str):
+            sample_srt_paths = [sample_srt_paths]
+        sample_srt_paths = [p for p in (sample_srt_paths or []) if p]
+
+        if not sample_srt_paths:
             return "Không thể phân tích bối cảnh. Hệ thống sẽ dịch theo mặc định."
 
-        sample_blocks = blocks[:150]
-        sample_text = "\n".join([b["text"] for b in sample_blocks])
+        # ── Gộp nội dung tối đa CONTEXT_SAMPLE_EPISODES tập đầu làm mẫu ──
+        parts = []
+        used = 0
+        total_lines = 0
+        for ep_i, sp in enumerate(sample_srt_paths[:self.CONTEXT_SAMPLE_EPISODES]):
+            try:
+                with open(sp, "r", encoding="utf-8-sig") as f:
+                    srt_content = f.read()
+            except Exception as e:
+                self.log.emit(f"⚠️ Không đọc được tập mẫu {os.path.basename(str(sp))}: {e}\n")
+                continue
+            blocks = self._parse_srt(srt_content)
+            if not blocks:
+                continue
+            ep_text = "\n".join(b["text"] for b in blocks)
+            parts.append(f"[TẬP {ep_i + 1}]\n{ep_text}")
+            used += 1
+            total_lines += len(blocks)
+
+        if used == 0:
+            return "Không thể phân tích bối cảnh. Hệ thống sẽ dịch theo mặc định."
+
+        sample_text = "\n\n".join(parts)
+        # Chốt chặn an toàn: nếu gộp lại quá dài thì cắt bớt (phim ngắn 60-80
+        # dòng/tập thì gần như không bao giờ chạm ngưỡng này).
+        sample_lines = sample_text.split("\n")
+        if len(sample_lines) > self.CONTEXT_MAX_LINES:
+            sample_text = "\n".join(sample_lines[:self.CONTEXT_MAX_LINES])
 
         context_prompt = (
-            "Đọc kịch bản sau và hãy đóng vai nhà phê bình phim để trả lời NGẮN GỌN 2 câu hỏi:\n"
-            "1. Phim này thuộc thể loại gì?\n"
-            "2. Nhận diện các nhân vật xuất hiện và cách họ xưng hô với nhau sao cho chuẩn tiếng Việt nhất (Ví dụ: Lâm Xung (y/hắn), đại ca - đệ, hoàng thượng - thần thiếp, anh - em...)?\n\n"
-            "TUYỆT ĐỐI KHÔNG DỊCH VĂN BẢN. CHỈ TRẢ VỀ TÓM TẮT ĐÁNH GIÁ (Khoảng 4-5 dòng).\n"
-            f"Văn bản trích xuất:\n{sample_text}"
+            f"Dưới đây là phụ đề {used} tập đầu của một bộ phim ngắn Trung Quốc. "
+            "Hãy đọc và rút ra HỒ SƠ BỐI CẢNH để dịch cả bộ cho NHẤT QUÁN. "
+            "Chỉ trả về đúng 4 mục sau, ngắn gọn, KHÔNG dịch toàn bộ phụ đề:\n\n"
+            "1. THỂ LOẠI & BỐI CẢNH: cổ trang / hiện đại / đô thị / tiên hiệp..., không gian - thời gian chính.\n"
+            "2. VĂN PHONG: giọng phim (trang trọng hay đời thường), mức dùng Hán-Việt.\n"
+            "3. NHÂN VẬT & XƯNG HÔ: liệt kê các nhân vật chính, và giữa từng cặp thì xưng hô ra sao "
+            "(ví dụ: A gọi B là 'ca ca' -> 'anh'; B tự xưng 'muội' -> 'em'; hoàng thượng - thần thiếp...). "
+            "Chốt cố định để cả bộ dùng thống nhất.\n"
+            "4. THUẬT NGỮ RIÊNG: tên môn phái, chức tước, biệt danh, cách gọi đặc biệt + bản dịch Việt đã chốt.\n\n"
+            "TUYỆT ĐỐI KHÔNG DỊCH TOÀN BỘ PHỤ ĐỀ. CHỈ TRẢ VỀ HỒ SƠ 4 MỤC TRÊN.\n\n"
+            f"Phụ đề trích xuất:\n{sample_text}"
         )
 
-        self.log.emit("🔍 Đang phân tích kịch bản & mối quan hệ nhân vật (dùng chung cho cả hàng đợi)...\n")
+        self.log.emit(
+            f"🔍 Đang phân tích {used} tập đầu để lấy văn phong & xưng hô "
+            f"(dùng chung cho cả hàng đợi)...\n"
+        )
         context_res = self._send_and_wait(page, "Bot-Trinh-Sat", context_prompt)
 
         if "ERROR" in context_res:
             context_res = "Không thể phân tích bối cảnh. Hệ thống sẽ dịch theo mặc định."
 
         clean_ctx = re.sub(r'```[a-zA-Z]*\n?', '', context_res).replace('```', '')
-        self.log.emit("🧠 Phân tích xong bối cảnh! Bắt đầu dịch song song...\n")
+        self.log.emit("🧠 Phân tích xong bối cảnh! Bắt đầu dịch...\n")
         return clean_ctx.strip()
+
+    def _context_sample_paths(self):
+        """Lấy đường dẫn srt của tối đa CONTEXT_SAMPLE_EPISODES tập ĐẦU hàng
+        đợi để làm mẫu phân tích bối cảnh dùng chung."""
+        paths = []
+        for item in self.queue_items[:self.CONTEXT_SAMPLE_EPISODES]:
+            sp = item.get("srt")
+            if sp:
+                paths.append(sp)
+        return paths
 
     def _translate_smart(self, clean_ctx, page, idx, video_path, srt_path):
         with open(srt_path, "r", encoding="utf-8-sig") as f: srt_content = f.read()
@@ -452,22 +511,30 @@ class GeminiTranslateThread(QThread):
                 # Chỉ lấy ra đúng lượng batch_size để dịch
                 current_batch = chunk_to_translate[:batch_size]
                 lines_to_translate = [b["text"] for b in current_batch]
-                text_payload = "\n".join(lines_to_translate)
+                # ĐÁNH SỐ mỗi câu dạng [n] để AI KHÔNG gộp 2 câu giống nhau
+                # (VD 2 thán từ "嗯" liền nhau) và để app ghép lại ĐÚNG VỊ TRÍ
+                # theo số, thay vì ghép mù theo thứ tự (dễ lệch nếu thiếu 1 dòng).
+                text_payload = "\n".join(f"[{n+1}] {t}" for n, t in enumerate(lines_to_translate))
                 
                 # ====================================================
                 # BẢN FIX: ÉP BUỘC AI PHẢI DÙNG TIẾNG VIỆT CÓ DẤU
                 # ====================================================
                 strict_rules = f"""QUY TẮC TUYỆT ĐỐI (VI PHẠM SẼ LỖI PHẦN MỀM):
-1. BẮT BUỘC trả về ĐÚNG {len(lines_to_translate)} dòng. Không gộp, không tách.
-2. KHÔNG giải thích, KHÔNG CHÀO HỎI. KHÔNG dùng thẻ markdown. CHỈ TRẢ VỀ NỘI DUNG DỊCH.
+1. MỖI dòng gốc có đánh số dạng [1], [2], [3]... BẮT BUỘC trả về ĐÚNG {len(lines_to_translate)} dòng, mỗi dòng GIỮ NGUYÊN số đó ở đầu theo định dạng: [số] bản dịch tiếng Việt. Ví dụ: "[1] Xin chào". Dịch đủ từ [1] đến [{len(lines_to_translate)}], không thiếu số nào, không gộp 2 số vào 1 dòng, kể cả khi 2 câu gốc giống hệt nhau.
+2. KHÔNG giải thích, KHÔNG CHÀO HỎI. KHÔNG dùng thẻ markdown. CHỈ TRẢ VỀ các dòng "[số] nội dung".
 3. BẮT BUỘC SỬ DỤNG TIẾNG VIỆT CÓ DẤU CHUẨN CHÍNH TẢ (Ví dụ: "Không", tuyệt đối không viết "Khong"). Đảm bảo giữ nguyên các dấu thanh của tiếng Việt.
-4. DỊCH SẠCH 100%, KHÔNG ĐỂ SÓT LẠI KÝ TỰ HÁN/TRUNG QUỐC.
-5. ÁP DỤNG BỐI CẢNH VÀ XƯNG HÔ SAU ĐÂY VÀO BẢN DỊCH:
+4. DỊCH SẠCH 100%, KHÔNG ĐỂ SÓT LẠI KÝ TỰ HÁN/TRUNG QUỐC. KHÔNG để dòng nào trống - thán từ ngắn ("嗯","啊","哎") vẫn phải dịch ("Ừm","À","Ơ"...).
+5. DỊCH SÚC TÍCH VỪA PHẢI ĐỂ GIỌNG ĐỌC TTS KHÔNG BỊ DỒN:
+   - Dịch theo Ý, gọn, đủ để đọc thành tiếng thoải mái trong thời lượng câu - không dài lê thê, không cụt lủn.
+   - Bỏ từ đệm/từ thừa ("thì","mà","là","rồi","đó","vậy"...) khi bỏ đi câu vẫn tự nhiên lúc ĐỌC LÊN.
+   - Rút gọn là làm TỪNG CÂU ngắn lại, KHÔNG phải gộp dòng - vẫn giữ đúng số dòng ở quy tắc 1.
+   - Câu phải NGHE tự nhiên như lời thoại phim, đọc trôi, không vấp.
+6. ÁP DỤNG ĐÚNG BỐI CẢNH, VĂN PHONG VÀ XƯNG HÔ SAU ĐÂY VÀO BẢN DỊCH (không tự đổi xưng hô giữa chừng):
 ---
 {clean_ctx}
 ---"""
                 
-                final_prompt = f"{self.preset_text}\n\n{strict_rules}\n\nDịch {len(lines_to_translate)} dòng sau:\n{text_payload}"
+                final_prompt = f"{self.preset_text}\n\n{strict_rules}\n\nDịch {len(lines_to_translate)} dòng sau (giữ nguyên số [n] ở đầu mỗi dòng):\n{text_payload}"
                 
                 if retry_count == 0:
                     if batch_size == len(chunk):
@@ -505,21 +572,51 @@ class GeminiTranslateThread(QThread):
                     else:
                         break
                         
-                temp_lines = []
+                # ── GHÉP KẾT QUẢ THEO SỐ [n] ──────────────────────────────
+                # AI trả về dạng "[n] bản dịch". Tách số n để đặt bản dịch vào
+                # ĐÚNG vị trí thứ n, thay vì ghép mù theo thứ tự dòng (dễ lệch
+                # nếu AI thiếu/thừa 1 dòng ở giữa). Nhờ đó biết CHÍNH XÁC dòng
+                # nào bị thiếu.
+                n_expected = len(current_batch)
+                slots = [None] * n_expected      # slots[k] = bản dịch của câu thứ k+1
+                num_re = re.compile(r'^\s*\[(\d+)\]\s*(.*)$')
+                matched_any = False
                 for line in temp_lines_raw:
-                    stripped = line.strip()
-                    # Lọc bỏ dòng "rác" Gemini đôi khi tự chèn thêm dù bị cấm:
-                    # số thứ tự trần trụi (VD "1", "2") hoặc dòng timestamp tự
-                    # bịa (VD "00:00:01,000 --> 00:00:03,000") - không phải
-                    # bản dịch thật, giữ lại sẽ làm lệch vị trí ghép vào block
-                    # gốc (mỗi 3 dòng chỉ có 1 dòng thật do lỗi này).
-                    if stripped.isdigit():
+                    m = num_re.match(line)
+                    if not m:
                         continue
-                    if _TIMESTAMP_LINE_RE.match(stripped):
-                        continue
-                    clean_line = re.sub(r'(\b\w+\b)(?:\s+\1){2,}', r'\1', line, flags=re.IGNORECASE)
-                    clean_line = re.sub(r' +', ' ', clean_line)
-                    temp_lines.append(clean_line)
+                    idx_n = int(m.group(1)) - 1
+                    body = m.group(2).strip()
+                    if 0 <= idx_n < n_expected:
+                        matched_any = True
+                        # làm sạch nhẹ như logic cũ (bỏ lặp từ, gộp space)
+                        body = re.sub(r'(\b\w+\b)(?:\s+\1){2,}', r'\1', body, flags=re.IGNORECASE)
+                        body = re.sub(r' +', ' ', body).strip()
+                        if body:
+                            slots[idx_n] = body
+
+                if matched_any:
+                    # Có đánh số -> dùng cơ chế số. temp_lines chỉ gồm các dòng
+                    # ĐÃ điền được (để các bước kiểm tra CJK/độ dài phía dưới
+                    # vẫn chạy). Số ô còn None = số câu AI bỏ sót.
+                    missing_slots = [k + 1 for k, v in enumerate(slots) if v is None]
+                    temp_lines = [v for v in slots if v is not None]
+                    if missing_slots:
+                        preview = ", ".join(str(x) for x in missing_slots[:10])
+                        self.log.emit(f"🔎 Thiếu số dòng: {preview}{'...' if len(missing_slots) > 10 else ''}\n")
+                else:
+                    # AI KHÔNG trả số nào -> fallback về cách cũ (tách theo dòng,
+                    # lọc rác) để không vỡ so với hành vi trước đây.
+                    temp_lines = []
+                    for line in temp_lines_raw:
+                        stripped = line.strip()
+                        if stripped.isdigit():
+                            continue
+                        if _TIMESTAMP_LINE_RE.match(stripped):
+                            continue
+                        clean_line = re.sub(r'(\b\w+\b)(?:\s+\1){2,}', r'\1', line, flags=re.IGNORECASE)
+                        clean_line = re.sub(r' +', ' ', clean_line)
+                        temp_lines.append(clean_line)
                 
                 if len(temp_lines) == 0:
                     self.log.emit(f"⚠️ AI không trả về dòng nào hợp lệ. Thoát vào lại và thử lại...\n")

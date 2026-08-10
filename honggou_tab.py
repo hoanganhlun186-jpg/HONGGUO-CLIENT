@@ -294,7 +294,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.43"
+APP_VERSION = "1.0.44"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -494,6 +494,14 @@ class HonggouMergeThread(QThread):
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
         total_tasks = len(self.merge_tasks)
+        # Đảm bảo thư mục đích tồn tại trước khi ghi merge_list / file gộp.
+        # Tránh lỗi "No such file or directory: ...merge_list_0.txt" khi thư mục
+        # phim chưa được tạo hoặc bị xóa giữa chừng.
+        try:
+            os.makedirs(self.movie_folder, exist_ok=True)
+        except Exception as _mk_e:
+            self.error_signal.emit(f"Không tạo được thư mục ghép '{self.movie_folder}': {_mk_e}")
+            return
         for i, task in enumerate(self.merge_tasks):
             out_name = task["output_name"]
             files_to_merge = task["files"]
@@ -2073,7 +2081,7 @@ class DubThread(QThread):
                                "-i", video_vocals,
                                "-i", dub_audio,
                                "-filter_complex",
-                               f"[0:a]volume={ov:.3f}[orig];[1:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=longest[aout]",
+                               f"[0:a]volume={ov:.3f}[orig];[1:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=longest:normalize=0[aout]",
                                "-map", "0:v", "-map", "[aout]",
                                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                                out_video]
@@ -2093,7 +2101,7 @@ class DubThread(QThread):
                            "-i", video_path,
                            "-i", dub_audio,
                            "-filter_complex",
-                           f"[0:a]volume={ov:.3f}[orig];[1:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=longest[aout]",
+                           f"[0:a]volume={ov:.3f}[orig];[1:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=longest:normalize=0[aout]",
                            "-map", "0:v", "-map", "[aout]",
                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                            out_video]
@@ -2943,6 +2951,50 @@ class HonggouWidget(QWidget):
         self.cb_translate_engine.setCurrentText(_saved_engine)
         self.cb_translate_engine.currentTextChanged.connect(self._on_translate_engine_changed)
         stt_ctrl.addWidget(self.cb_translate_engine)
+
+        # ── Hiện trình duyệt khi dịch (để soi Gemini chạy) - chỉ dùng để xem/debug ──
+        self.chk_show_browser = QCheckBox("👁 Hiện trình duyệt khi dịch")
+        self.chk_show_browser.setToolTip(
+            "Bật = Chrome hiện lên cho bạn xem Gemini gõ prompt & dịch (chậm hơn, chỉ nên bật khi soi 1 tập).\n"
+            "Tắt = chạy ngầm bình thường (nhanh hơn, dùng khi dịch hàng loạt)."
+        )
+        self.chk_show_browser.setStyleSheet("""
+            QCheckBox { color: #fcd34d; font-size: 12px; padding: 4px; font-weight: bold; }
+            QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #f59e0b;
+                border-radius: 4px; background: #1e293b; }
+            QCheckBox::indicator:checked { background: #f59e0b; border-color: #f59e0b; }
+        """)
+        try:
+            self.chk_show_browser.setChecked(
+                QSettings("HongguoDownloader", "ClientApp").value("show_browser_translate", "false") == "true")
+        except Exception:
+            pass
+        self.chk_show_browser.stateChanged.connect(
+            lambda v: QSettings("HongguoDownloader", "ClientApp").setValue(
+                "show_browser_translate", "true" if v else "false"))
+        stt_ctrl.addWidget(self.chk_show_browser)
+
+        # ── Số tập dịch SONG SONG bằng Gemini (mỗi tập 1 Chrome ẩn riêng) ──
+        stt_ctrl.addWidget(QLabel("Tập song song:", styleSheet="color:#8A8D98; font-size:11px;"))
+        self.spn_trans_workers = QSpinBox()
+        self.spn_trans_workers.setRange(1, 4)
+        self.spn_trans_workers.setValue(2)   # mặc định 2 cho an toàn (RAM + tránh Google nghi)
+        self.spn_trans_workers.setFixedWidth(55)
+        self.spn_trans_workers.setToolTip(
+            "Số tập dịch CÙNG LÚC bằng Gemini (mỗi tập mở 1 Chrome ẩn riêng).\n"
+            "• 2 = an toàn cho phần lớn máy.\n"
+            "• 3-4 = nhanh hơn nhưng ngốn RAM/CPU và cùng 1 tài khoản Gemini\n"
+            "  bắn nhiều phiên dễ bị Google chèn captcha. Chỉ tăng nếu máy khỏe.\n"
+            "(Chỉ áp dụng cho engine Gemini.)"
+        )
+        self.spn_trans_workers.setStyleSheet("QSpinBox { background:#1f2937; color:#fde68a; border:1px solid #f59e0b; border-radius:6px; padding:3px; }")
+        try:
+            self.spn_trans_workers.setValue(int(QSettings("HongguoDownloader", "ClientApp").value("trans_workers", 2)))
+        except Exception:
+            pass
+        self.spn_trans_workers.valueChanged.connect(
+            lambda v: QSettings("HongguoDownloader", "ClientApp").setValue("trans_workers", int(v)))
+        stt_ctrl.addWidget(self.spn_trans_workers)
 
         self.txt_ds_key_main = QLineEdit()
         self.txt_ds_key_main.setPlaceholderText("DeepSeek API Key (sk-...)")
@@ -4463,8 +4515,22 @@ class HonggouWidget(QWidget):
             self.lbl_status.setText("✅ Đã lưu và xử lý xong!")
             return
 
-        folder_name = self.current_series_id if self.current_series_id else "Phim_Khong_Ro_ID"
-        movie_folder = os.path.join(self.save_folder, folder_name)
+        # QUAN TRỌNG: suy ra thư mục ghép từ VỊ TRÍ THẬT của file cần ghép,
+        # KHÔNG lấy theo self.current_series_id (series đang mở trên UI). Vì
+        # dịch/lồng tiếng chạy lâu; nếu giữa chừng bạn quét/mở phim khác thì
+        # current_series_id đã đổi -> ghép nhầm sang thư mục phim mới (chưa
+        # tồn tại -> lỗi "No such file: merge_list_0.txt", hoặc ghép sai chỗ).
+        movie_folder = None
+        try:
+            _first_files = merge_tasks[0].get("files") or []
+            if _first_files:
+                movie_folder = os.path.dirname(os.path.abspath(_first_files[0]))
+        except Exception:
+            movie_folder = None
+        if not movie_folder or not os.path.isdir(movie_folder):
+            # Dự phòng: quay về cách cũ nếu không suy ra được từ file.
+            folder_name = self.current_series_id if self.current_series_id else "Phim_Khong_Ro_ID"
+            movie_folder = os.path.join(self.save_folder, folder_name)
 
         self._merge_srt_files(merge_tasks, movie_folder, after_dub=after_dub)
 
@@ -4859,7 +4925,15 @@ class HonggouWidget(QWidget):
         self._dub_running = False      
         self._auto_dub_on = hasattr(self, 'chk_auto_dub') and self.chk_auto_dub.isChecked()
 
-        self._gtrans_thread = GeminiTranslateThread(queue, preset, "Auto (Mặc định)", 150)
+        _show_browser = hasattr(self, 'chk_show_browser') and self.chk_show_browser.isChecked()
+        _trans_workers = self.spn_trans_workers.value() if hasattr(self, 'spn_trans_workers') else 2
+        # An toàn: khi bật "hiện trình duyệt" mà chạy nhiều tập song song sẽ có
+        # nhiều cửa sổ Chrome bật cùng lúc, rất rối -> ép về 1 tập để dễ xem.
+        if _show_browser and _trans_workers > 1:
+            _trans_workers = 1
+            self.txt_stt_log.append("👁 Đang bật 'Hiện trình duyệt' → tạm chạy 1 tập/lượt cho dễ xem.")
+        self._gtrans_thread = GeminiTranslateThread(queue, preset, "Auto (Mặc định)", 80,
+                                                    translate_workers=_trans_workers, show_browser=_show_browser)
         self._gtrans_thread.log.connect(lambda m: self.txt_stt_log.append(m.strip()))
         def _on_item_done(idx, video_path, vi_path):
             self._gemini_vi_map[video_path] = vi_path
@@ -5085,12 +5159,57 @@ class HonggouWidget(QWidget):
             self.txt_stt_log.append("🎉 Hoàn tất tất cả: tách sub → dịch → lồng tiếng (từng tập rời)!")
             self.lbl_status.setText("🎉 Hoàn tất! Các tập đã lồng tiếng (rời).")
             return
+
         dubbed = sorted(getattr(self, '_gemini_vi_map', {}).keys())
+
+        # ── RETRY tối đa 3 LẦN các tập THIẾU bản _dubbed.mp4 TRƯỚC KHI GHÉP ──
+        # Quan trọng với chế độ ghép trọn bộ: nếu 1 tập lồng lỗi (VD hết ổ
+        # đĩa tạm thời, lỗi mạng) mà cứ ghép luôn thì bản trọn bộ sẽ THIẾU
+        # HẲN tập đó. Nên gom các tập chưa có _dubbed.mp4, đẩy lại hàng đợi
+        # lồng tiếng. Mỗi tập thử lại tối đa 3 lần (đếm bằng _dub_retry_count)
+        # để không lặp vô hạn nếu tập đó hỏng thật.
+        MAX_DUB_RETRY = 3
+        if not hasattr(self, '_dub_retry_count'):
+            self._dub_retry_count = {}
+        missing = []
+        for v in dubbed:
+            df = os.path.splitext(v)[0] + "_dubbed.mp4"
+            vi_srt = os.path.splitext(v)[0] + "_vi.srt"
+            if (not os.path.exists(df)) and os.path.exists(vi_srt) \
+                    and self._dub_retry_count.get(v, 0) < MAX_DUB_RETRY:
+                missing.append(v)
+
+        if missing:
+            for v in missing:
+                self._dub_retry_count[v] = self._dub_retry_count.get(v, 0) + 1
+                self._dub_queue.append(v)
+            _lan = self._dub_retry_count[missing[0]]
+            self.txt_stt_log.append(
+                f"🔁 Có {len(missing)} tập lồng tiếng lỗi → thử lồng lại (lần {_lan}/{MAX_DUB_RETRY}) trước khi ghép: "
+                + ", ".join(os.path.basename(x) for x in missing))
+            self._pump_dub_queue()   # lồng lại; xong sẽ tự quay lại _merge_after_dub
+            return
+
         dub_files = []
+        still_missing = []
         for v in dubbed:
             df = os.path.splitext(v)[0] + "_dubbed.mp4"
             if os.path.exists(df):
                 dub_files.append(df)
+            else:
+                still_missing.append(os.path.basename(v))
+
+        if still_missing:
+            # Vẫn còn tập chưa lồng được sau khi đã retry -> KHÔNG ghép trọn bộ
+            # (tránh bản ghép thiếu tập), KHÔNG xóa gốc (để bạn lồng lại tay).
+            self.txt_stt_log.append(
+                f"⚠️ Còn {len(still_missing)} tập chưa lồng được sau {MAX_DUB_RETRY} lần thử: "
+                + ", ".join(still_missing)
+                + ".\n   → TẠM DỪNG ghép trọn bộ để tránh thiếu tập. File gốc các tập này được GIỮ LẠI, "
+                  "bạn hãy lồng tiếng lại thủ công rồi ghép sau.")
+            self.lbl_status.setText(f"⚠️ Chưa ghép: còn {len(still_missing)} tập lồng lỗi. Đã giữ file gốc.")
+            return
+
         if len(dub_files) <= 1:
             self.txt_stt_log.append("🎉 Hoàn tất! (Không đủ file để ghép.)")
             return
