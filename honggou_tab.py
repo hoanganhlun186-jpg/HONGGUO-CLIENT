@@ -26,6 +26,15 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, pyqtSlot, QSize, QSettings, QTimer, QMetaObject
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 
+# Tab Render (chỉnh sửa & khắc sub/hiệu ứng lên video). Import an toàn: nếu
+# thiếu file render_tab.py hoặc lỗi import thì app VẪN chạy bình thường, chỉ
+# không hiện tab Render (RenderWidget = None).
+try:
+    from render_tab import RenderWidget
+except Exception as _re_err:
+    RenderWidget = None
+    print(f"[WARN] Không nạp được tab Render: {_re_err}")
+
 # Ẩn cửa sổ đen (console) khi pydub/ffmpeg chạy subprocess trên Windows.
 # QUAN TRỌNG: patch này PHẢI chạy TRƯỚC khi import pydub bên dưới, vì pydub
 # tự làm "from subprocess import Popen" ngay lúc import -> nếu patch sau,
@@ -2179,6 +2188,12 @@ class HonggouWidget(QWidget):
         self.auth_token = self.settings.value("auth_token", "")
         
         self.current_series_id = ""
+        # Trạng thái tải hàng loạt nhiều tab (xếp hàng lần lượt)
+        self._batch_running = False
+        self._batch_advancing = False
+        self._batch_tab_queue = []
+        self._batch_total = 0
+        self._batch_done = 0
         self.current_job_id = ""
         self.current_episodes = []
         self.current_title = ""
@@ -2689,7 +2704,31 @@ class HonggouWidget(QWidget):
         self.btn_scan.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_scan.setStyleSheet("QPushButton { padding: 12px 24px; font-size: 14px; background-color: #2563eb; color: white; border-radius: 8px; font-weight: bold; border: none; } QPushButton:hover { background-color: #1d4ed8; } QPushButton:disabled { background-color: #374151; color: #64748b; }")
         self.btn_scan.clicked.connect(self._scan)
+
+        # Nút "+ Bộ mới": mở 1 tab trống để dán link bộ khác và quét riêng.
+        self.btn_new_tab = QPushButton("➕ Bộ mới")
+        self.btn_new_tab.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_new_tab.setToolTip("Mở 1 tab mới để quét thêm 1 bộ phim khác (mỗi bộ 1 tab riêng).")
+        self.btn_new_tab.setStyleSheet("QPushButton { padding: 12px 18px; font-size: 14px; background-color: #334155; color: #e2e8f0; border-radius: 8px; font-weight: bold; border: none; } QPushButton:hover { background-color: #475569; }")
+        self.btn_new_tab.clicked.connect(lambda: self._new_series_tab())
+
+        # Nút "Tải hàng loạt": tải lần lượt tất cả các tab (xong bộ này sang bộ kế).
+        self.btn_batch_dl = QPushButton("📥 Tải hàng loạt")
+        self.btn_batch_dl.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch_dl.setToolTip("Tải TẤT CẢ các tab, lần lượt: xong bộ này tự sang bộ kế tiếp.")
+        self.btn_batch_dl.setStyleSheet("QPushButton { padding: 12px 18px; font-size: 14px; background-color: #7c3aed; color: white; border-radius: 8px; font-weight: bold; border: none; } QPushButton:hover { background-color: #6d28d9; } QPushButton:disabled { background-color: #374151; color: #64748b; }")
+        self.btn_batch_dl.clicked.connect(self._start_batch_download)
+
+        # Nút "Đồng bộ": copy cấu hình (tách sub/dịch/lồng...) của tab hiện tại
+        # sang TẤT CẢ các tab, để không phải chỉnh lại từng bộ.
+        self.btn_sync_cfg = QPushButton("🔄 Đồng bộ")
+        self.btn_sync_cfg.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sync_cfg.setToolTip("Áp cấu hình (tách sub/dịch/lồng tiếng/tách nhạc...) của tab hiện tại cho TẤT CẢ các bộ.")
+        self.btn_sync_cfg.setStyleSheet("QPushButton { padding: 12px 16px; font-size: 14px; background-color: #0891b2; color: white; border-radius: 8px; font-weight: bold; border: none; } QPushButton:hover { background-color: #0e7490; }")
+        self.btn_sync_cfg.clicked.connect(self._sync_config_to_all_tabs)
+
         top_bar.addWidget(self.url_input); top_bar.addWidget(self.btn_scan)
+        top_bar.addWidget(self.btn_new_tab); top_bar.addWidget(self.btn_sync_cfg); top_bar.addWidget(self.btn_batch_dl)
         master_layout.addLayout(top_bar)
 
         folder_bar = QHBoxLayout()
@@ -2843,12 +2882,30 @@ class HonggouWidget(QWidget):
         self.total_progress.hide()
         detail_layout.addWidget(self.total_progress)
 
-        self.table = QTableWidget(); self.table.setColumnCount(4); self.table.setHorizontalHeaderLabels(["Chọn Tập", "", "Tên File", "Trạng Thái Link"])
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(0, 90); self.table.setColumnWidth(1, 50); self.table.setColumnWidth(3, 170)
-        self.table.verticalHeader().setVisible(False); self.table.setShowGrid(False); self.table.setAlternatingRowColors(True); self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus); self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.table.setIconSize(QSize(40, 50))  
-        self.table.setStyleSheet("QTableWidget { background-color: #111827; alternate-background-color: #1f2937; color: #e2e8f0; border: 1px solid #374151; border-radius: 8px; outline: none; margin-top: 10px; font-size: 13px; } QHeaderView::section { background-color: #0f172a; color: #94a3b8; padding: 12px; font-weight: bold; border: none; border-bottom: 1px solid #374151; } QTableWidget::item { padding: 6px; border-bottom: 1px solid transparent; } QTableWidget::item:hover { background-color: #334155; } QTableWidget::indicator { width: 18px; height: 18px; border: 2px solid #475569; border-radius: 4px; } QTableWidget::indicator:checked { background-color: #10b981; border-color: #10b981; } QScrollBar:vertical { border: none; background: #111827; width: 8px; margin: 0px; } QScrollBar::handle:vertical { background: #374151; border-radius: 4px; min-height: 20px; } QScrollBar::handle:vertical:hover { background: #4b5563; }")
-        detail_layout.addWidget(self.table)
+        self.table = self._make_episode_table()
+
+        # ── Bọc bảng chọn-tập vào QTabWidget: mỗi bộ phim = 1 tab riêng ──
+        # self.table LUÔN trỏ tới bảng của tab đang mở, nên toàn bộ code cũ
+        # dùng self.table không phải sửa. Mỗi tab lưu series_id/title/episodes
+        # riêng trong dict self._tab_data[table].
+        self.series_tabs = QTabWidget()
+        self.series_tabs.setTabsClosable(True)
+        self.series_tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #374151; border-radius: 8px; background: #111827; top: -1px; }
+            QTabBar::tab { background: #1f2937; color: #94a3b8; padding: 7px 16px; font-weight: bold;
+                border: 1px solid #374151; border-bottom: none; margin-right: 2px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
+            QTabBar::tab:selected { background: #111827; color: #38bdf8; }
+        """)
+        self.series_tabs.tabCloseRequested.connect(self._close_series_tab)
+        # LƯU Ý: KHÔNG nối currentChanged ở đây - vì các widget cấu hình
+        # (chk_auto_stt...) chưa được tạo. Nối ở CUỐI __init__ (xem
+        # _wire_series_tab_signal) để tránh chạy _apply_config lên widget
+        # chưa tồn tại.
+        # dict: table_widget -> {series_id, title, episodes, cover_url, config}
+        self._tab_data = {}
+        self.series_tabs.addTab(self.table, "Phim 1")
+        self._tab_data[self.table] = {"series_id": "", "title": "Phim 1", "episodes": []}
+        detail_layout.addWidget(self.series_tabs)
 
         bottom_layout = QHBoxLayout()
 
@@ -3282,6 +3339,16 @@ class HonggouWidget(QWidget):
         self._history_timer = QTimer(self)
         self._history_timer.timeout.connect(self._render_history_sidebar)
         self._history_timer.start(60000)
+
+        # Mọi widget cấu hình đã dựng xong -> giờ mới an toàn để:
+        # 1) chụp cấu hình mặc định làm config cho tab đầu tiên
+        # 2) nối signal đổi tab (lưu/khôi phục cấu hình theo tab)
+        try:
+            if hasattr(self, 'table') and self.table in self._tab_data:
+                self._tab_data[self.table]["config"] = self._snapshot_config()
+            self.series_tabs.currentChanged.connect(self._on_series_tab_changed)
+        except Exception as _e:
+            print(f"[WARN] Nối signal tab lỗi: {_e}")
 
     def _on_chk_remove_bgm_changed(self, state):
         """Khi tick vào ô Tách nhạc nền: check demucs, hỏi cài nếu chưa có."""
@@ -3729,6 +3796,240 @@ class HonggouWidget(QWidget):
         match = re.search(r'(https?://\S+)', text)
         return match.group(1) if match else text
 
+    def _start_batch_download(self):
+        """Tải lần lượt TẤT CẢ các tab: xong bộ này tự sang bộ kế tiếp."""
+        if getattr(self, '_batch_running', False):
+            QMessageBox.information(self, "Đang chạy", "Đang tải hàng loạt, vui lòng đợi.")
+            return
+        # gom các tab đã quét được (có series_id + có tập trong bảng)
+        self._save_current_tab_state()
+        tabs_to_run = []
+        for i in range(self.series_tabs.count()):
+            w = self.series_tabs.widget(i)
+            d = self._tab_data.get(w, {})
+            if d.get("series_id") and w.rowCount() > 0:
+                tabs_to_run.append(i)
+        if not tabs_to_run:
+            QMessageBox.information(self, "Chưa có bộ nào",
+                "Hãy quét ít nhất 1 bộ (dán link rồi bấm Quét) trước khi tải hàng loạt.")
+            return
+        self._batch_tab_queue = tabs_to_run
+        self._batch_total = len(tabs_to_run)
+        self._batch_done = 0
+        self._batch_running = True
+        self.btn_batch_dl.setEnabled(False)
+        self.btn_batch_dl.setText(f"📥 Đang tải (0/{self._batch_total})")
+        if hasattr(self, 'txt_stt_log'):
+            self.txt_stt_log.show()
+            self.txt_stt_log.append(f"📋 Tải hàng loạt {self._batch_total} bộ (lần lượt)...")
+        self._batch_run_next_tab()
+
+    def _batch_run_next_tab(self):
+        if not self._batch_tab_queue:
+            self._batch_running = False
+            self.btn_batch_dl.setEnabled(True)
+            self.btn_batch_dl.setText("📥 Tải hàng loạt")
+            if hasattr(self, 'txt_stt_log'):
+                self.txt_stt_log.append(f"🎉 Đã tải xong toàn bộ {self._batch_total} bộ!")
+            QMessageBox.information(self, "Xong", f"Đã tải xong {self._batch_total} bộ trong hàng đợi!")
+            return
+        idx = self._batch_tab_queue.pop(0)
+        self.btn_batch_dl.setText(f"📥 Đang tải ({self._batch_done}/{self._batch_total})")
+        # chuyển sang tab đó (kích hoạt _on_series_tab_changed -> self.table + config đúng)
+        self.series_tabs.setCurrentIndex(idx)
+        # nạp đúng cấu hình riêng của tab này (phòng khi signal chưa kịp chạy)
+        d = self._tab_data.get(self.table, {})
+        if d.get("config"):
+            self._apply_config(d["config"])
+        if hasattr(self, 'txt_stt_log'):
+            self.txt_stt_log.append(f"▶️ [{self._batch_done + 1}/{self._batch_total}] Tải bộ: {self.current_title}")
+        # chọn tất cả tập rồi tải
+        t = self.table
+        for r in range(t.rowCount()):
+            it = t.item(r, 0)
+            if it and (it.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                it.setCheckState(Qt.CheckState.Checked)
+        QTimer.singleShot(400, self._download_selected)
+
+    def _batch_tab_finished(self):
+        """Gọi khi 1 bộ (1 tab) đã xử lý xong -> sang tab kế tiếp.
+        Chống gọi trùng bằng cờ _batch_advancing."""
+        if not getattr(self, '_batch_running', False):
+            return
+        if getattr(self, '_batch_advancing', False):
+            return
+        self._batch_advancing = True
+        self._batch_done += 1
+        if hasattr(self, 'txt_stt_log'):
+            self.txt_stt_log.append(f"✔️ Xong bộ {self._batch_done}/{self._batch_total}. Sang bộ kế...")
+        def _go():
+            self._batch_advancing = False
+            self._batch_run_next_tab()
+        QTimer.singleShot(2000, _go)
+
+    def _config_widgets(self):
+        """Danh sách (tên, widget, kiểu) các widget cấu hình cần nhớ theo tab.
+        kiểu: 'chk' (checkbox), 'cbo' (combo - lưu index), 'int'/'dbl' (spin)."""
+        specs = [
+            ("chk_auto_cover", "chk"), ("chk_auto_stt", "chk"), ("chk_do_translate", "chk"),
+            ("chk_auto_dub", "chk"), ("chk_remove_bgm", "chk"), ("chk_bgm_del_original", "chk"),
+            ("chk_del_original", "chk"), ("chk_mute_original", "chk"), ("chk_show_browser", "chk"),
+            ("chk_use_gpu", "chk"),
+            ("cb_translate_engine", "cbo"), ("merge_mode_combo", "cbo"), ("cmb_dub_voice", "cbo"),
+            ("chunk_spinbox", "int"), ("spn_bgm_parallel", "int"), ("spn_orig_volume", "int"),
+            ("spn_trans_workers", "int"), ("spn_tts_workers", "int"),
+            ("spn_dub_rate", "dbl"),
+        ]
+        out = []
+        for name, kind in specs:
+            w = getattr(self, name, None)
+            if w is not None:
+                out.append((name, w, kind))
+        return out
+
+    def _snapshot_config(self):
+        """Chụp cấu hình hiện tại của khu điều khiển thành dict."""
+        cfg = {}
+        for name, w, kind in self._config_widgets():
+            try:
+                if kind == "chk":
+                    cfg[name] = w.isChecked()
+                elif kind == "cbo":
+                    cfg[name] = w.currentIndex()
+                else:
+                    cfg[name] = w.value()
+            except Exception:
+                pass
+        return cfg
+
+    def _apply_config(self, cfg):
+        """Áp 1 dict cấu hình lên khu điều khiển (dùng khi đổi tab / tải hàng loạt)."""
+        if not cfg:
+            return
+        for name, w, kind in self._config_widgets():
+            if name not in cfg:
+                continue
+            try:
+                w.blockSignals(True)
+                if kind == "chk":
+                    w.setChecked(bool(cfg[name]))
+                elif kind == "cbo":
+                    w.setCurrentIndex(int(cfg[name]))
+                else:
+                    w.setValue(cfg[name])
+            except Exception:
+                pass
+            finally:
+                w.blockSignals(False)
+
+    def _save_current_tab_config(self):
+        """Lưu cấu hình hiện tại vào tab đang mở."""
+        t = getattr(self, 'table', None)
+        if t is not None and t in getattr(self, '_tab_data', {}):
+            self._tab_data[t]["config"] = self._snapshot_config()
+
+    def _sync_config_to_all_tabs(self):
+        """Nút Đồng bộ: copy cấu hình tab hiện tại sang TẤT CẢ các tab khác."""
+        cur = self._snapshot_config()
+        n = 0
+        for i in range(self.series_tabs.count()):
+            w = self.series_tabs.widget(i)
+            if w in self._tab_data:
+                self._tab_data[w]["config"] = dict(cur)
+                n += 1
+        if hasattr(self, 'txt_stt_log'):
+            self.txt_stt_log.show()
+            self.txt_stt_log.append(f"🔄 Đã đồng bộ cấu hình hiện tại sang {n} tab.")
+        QMessageBox.information(self, "Đã đồng bộ",
+            f"Đã áp cấu hình của tab hiện tại cho tất cả {n} bộ.")
+
+    def _dl_table(self):
+        """Trả về bảng của bộ ĐANG TẢI (nếu đang tải) để cập nhật trạng thái
+        đúng bộ, kể cả khi người dùng đã chuyển sang xem tab khác. Nếu không
+        có phiên tải nào, trả về bảng đang xem."""
+        t = getattr(self, '_active_dl_table', None)
+        if t is not None:
+            try:
+                # đảm bảo bảng còn tồn tại trong các tab
+                if t in getattr(self, '_tab_data', {}):
+                    return t
+            except Exception:
+                pass
+        return self.table
+
+    def _make_episode_table(self):
+        """Tạo 1 bảng chọn-tập chuẩn (dùng cho mỗi tab bộ phim)."""
+        t = QTableWidget(); t.setColumnCount(4)
+        t.setHorizontalHeaderLabels(["Chọn Tập", "", "Tên File", "Trạng Thái Link"])
+        t.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        t.setColumnWidth(0, 90); t.setColumnWidth(1, 50); t.setColumnWidth(3, 170)
+        t.verticalHeader().setVisible(False); t.setShowGrid(False); t.setAlternatingRowColors(True)
+        t.setFocusPolicy(Qt.FocusPolicy.NoFocus); t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        t.setIconSize(QSize(40, 50))
+        t.setStyleSheet("QTableWidget { background-color: #111827; alternate-background-color: #1f2937; color: #e2e8f0; border: none; outline: none; font-size: 13px; } QHeaderView::section { background-color: #0f172a; color: #94a3b8; padding: 12px; font-weight: bold; border: none; border-bottom: 1px solid #374151; } QTableWidget::item { padding: 6px; border-bottom: 1px solid transparent; } QTableWidget::item:hover { background-color: #334155; } QTableWidget::indicator { width: 18px; height: 18px; border: 2px solid #475569; border-radius: 4px; } QTableWidget::indicator:checked { background-color: #10b981; border-color: #10b981; } QScrollBar:vertical { border: none; background: #111827; width: 8px; margin: 0px; } QScrollBar::handle:vertical { background: #374151; border-radius: 4px; min-height: 20px; } QScrollBar::handle:vertical:hover { background: #4b5563; }")
+        return t
+
+    def _save_current_tab_state(self):
+        """Lưu series_id/title/episodes hiện tại vào tab đang mở (trước khi đổi tab)."""
+        t = getattr(self, 'table', None)
+        if t is None or t not in getattr(self, '_tab_data', {}):
+            return
+        self._tab_data[t].update({
+            "series_id": getattr(self, 'current_series_id', ''),
+            "title": getattr(self, 'current_title', ''),
+            "episodes": getattr(self, 'current_episodes', []),
+            "cover_url": getattr(self, 'current_cover_url', ''),
+            "total_eps": getattr(self, 'current_total_eps', 0),
+            "job_id": getattr(self, 'current_job_id', None),
+        })
+
+    def _on_series_tab_changed(self, index):
+        """Khi người dùng chuyển tab: trỏ self.table sang bảng của tab mới và
+        khôi phục series_id/title/episodes + CẤU HÌNH của tab đó."""
+        # lưu tab cũ trước (state + config)
+        self._save_current_tab_state()
+        if hasattr(self, '_config_widgets'):
+            self._save_current_tab_config()
+        w = self.series_tabs.widget(index)
+        if w is None:
+            return
+        self.table = w
+        d = self._tab_data.get(w, {})
+        self.current_series_id = d.get("series_id", "")
+        self.current_title = d.get("title", "")
+        self.current_episodes = d.get("episodes", [])
+        self.current_cover_url = d.get("cover_url", "")
+        self.current_total_eps = d.get("total_eps", 0)
+        self.current_job_id = d.get("job_id", None)
+        # nạp cấu hình riêng của tab này (nếu đã lưu)
+        if hasattr(self, '_apply_config') and d.get("config"):
+            self._apply_config(d["config"])
+
+    def _close_series_tab(self, index):
+        """Đóng 1 tab bộ phim. Luôn giữ ít nhất 1 tab."""
+        if self.series_tabs.count() <= 1:
+            QMessageBox.information(self, "Không thể đóng", "Phải còn ít nhất 1 tab.")
+            return
+        w = self.series_tabs.widget(index)
+        if w in self._tab_data:
+            del self._tab_data[w]
+        self.series_tabs.removeTab(index)
+        # cập nhật self.table theo tab hiện tại
+        self._on_series_tab_changed(self.series_tabs.currentIndex())
+
+    def _new_series_tab(self, title="Phim mới"):
+        """Tạo 1 tab bộ phim mới (bảng rỗng) và chuyển sang nó."""
+        self._save_current_tab_state()
+        if hasattr(self, '_config_widgets'):
+            self._save_current_tab_config()
+        t = self._make_episode_table()
+        # tab mới thừa hưởng cấu hình hiện tại làm mặc định (chỉnh riêng sau)
+        init_cfg = self._snapshot_config() if hasattr(self, '_snapshot_config') else {}
+        self._tab_data[t] = {"series_id": "", "title": title, "episodes": [], "config": init_cfg}
+        idx = self.series_tabs.addTab(t, title)
+        self.series_tabs.setCurrentIndex(idx)   # -> kích hoạt _on_series_tab_changed
+        return t
+
     def _scan(self):
         raw_text = self.url_input.text().strip()
         if not raw_text:
@@ -3890,6 +4191,17 @@ class HonggouWidget(QWidget):
         self.current_cover_url = data.get("cover_url", "")
         total_eps = data.get("total_episodes", 0)
         self.current_episodes = data.get("episodes", [])
+
+        # Đặt tên tab hiện tại theo tên phim + lưu state vào tab đó
+        try:
+            if hasattr(self, 'series_tabs') and hasattr(self, 'table'):
+                idx = self.series_tabs.indexOf(self.table)
+                if idx >= 0:
+                    short = (self.current_title or "Phim")[:14]
+                    self.series_tabs.setTabText(idx, short)
+                self._save_current_tab_state()
+        except Exception:
+            pass
         
         self.current_cover_pixmap = None
         self.current_cover_bytes = None
@@ -4046,6 +4358,12 @@ class HonggouWidget(QWidget):
 
         self.quota_used_signal.emit()
 
+        # KHÓA bảng của bộ ĐANG TẢI: từ đây mọi cập nhật trạng thái tải ghi vào
+        # đúng bảng này (self._active_dl_table), KHÔNG theo tab đang xem. Nhờ vậy
+        # người dùng chuyển tab xem bộ khác trong lúc tải cũng không bị loạn.
+        self._active_dl_table = self.table
+        self._active_dl_series_id = self.current_series_id
+
         if getattr(self, 'chk_auto_cover', None) and self.chk_auto_cover.isChecked():
             self._save_cover_image(silent=True)
 
@@ -4150,11 +4468,11 @@ class HonggouWidget(QWidget):
         self.server_retries[ep_num] = retry_count + 1
         
         row = ep_num - 1
-        if row < self.table.rowCount():
+        if row < self._dl_table().rowCount():
             status_item = QTableWidgetItem(f"🔄 Đang thử lại...")
             status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             status_item.setForeground(QColor("#f59e0b"))
-            self.table.setItem(row, 3, status_item)
+            self._dl_table().setItem(row, 3, status_item)
             
         thread = RetryDeadLinkThread(self.username, self.current_job_id, self.current_series_id, ep_num, self.auth_token)
         self._keep_thread_alive(thread)
@@ -4361,7 +4679,7 @@ class HonggouWidget(QWidget):
 
     def _on_download_progress(self, ep_num, percent, speed_mb):
         row = ep_num - 1
-        if row < self.table.rowCount():
+        if row < self._dl_table().rowCount():
             if percent == -1:
                 status_item = QTableWidgetItem(f"⏳ Đang xử lý...")
                 status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
@@ -4383,7 +4701,7 @@ class HonggouWidget(QWidget):
                 status_item.setForeground(QColor("#38bdf8"))
                 status_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
             
-            self.table.setItem(row, 3, status_item)
+            self._dl_table().setItem(row, 3, status_item)
 
     def _on_episode_downloaded(self, ep_num, file_path):
         row = ep_num - 1
@@ -4392,32 +4710,32 @@ class HonggouWidget(QWidget):
         info = probe_stream(file_path, get_ffprobe_path())
         if not info["has_audio"]:
             # Mất tiếng — hiển thị cảnh báo đỏ trên bảng
-            if row < self.table.rowCount():
+            if row < self._dl_table().rowCount():
                 warn_item = QTableWidgetItem("⚠️ MẤT TIẾNG")
                 warn_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 warn_item.setForeground(QColor("#f97316"))
                 warn_item.setToolTip("Tập này tải về bị mất tiếng. Thử tải lại tập này.")
                 _f = warn_item.font(); _f.setBold(True); warn_item.setFont(_f)
-                self.table.setItem(row, 3, warn_item)
+                self._dl_table().setItem(row, 3, warn_item)
             self._bump_total_progress()
             return
 
-        if row < self.table.rowCount():
+        if row < self._dl_table().rowCount():
             done_item = QTableWidgetItem("✔ ĐÃ XONG")
             done_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable); done_item.setForeground(QColor("#22d3ee")); done_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
             _f = done_item.font(); _f.setBold(True); done_item.setFont(_f)
-            self.table.setItem(row, 3, done_item)
+            self._dl_table().setItem(row, 3, done_item)
         self._bump_total_progress()
         if hasattr(self, 'btn_stt_now'):
             self.btn_stt_now.setEnabled(True)
 
     def _on_download_error(self, ep_num, error_msg):
         row = ep_num - 1
-        if row < self.table.rowCount():
+        if row < self._dl_table().rowCount():
             short_msg = error_msg[:25] + "..." if len(error_msg) > 25 else error_msg
             err_item = QTableWidgetItem(f"❌ {short_msg}")
             err_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable); err_item.setForeground(QColor("#ef4444")); err_item.setToolTip(str(error_msg)); err_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
-            self.table.setItem(row, 3, err_item)
+            self._dl_table().setItem(row, 3, err_item)
         self._bump_total_progress()
 
     def _on_all_downloads_done(self, total_downloaded):
@@ -4477,7 +4795,10 @@ class HonggouWidget(QWidget):
             self.btn_download.setText("📥 Tải đã chọn")
             self.lbl_status.setText(f"✅ Hoàn tất! Đã lưu {total_downloaded} tập phim lẻ.")
             if hasattr(self, 'lbl_downloaded_badge'): self.lbl_downloaded_badge.show()
-            QMessageBox.information(self, "Thành công", f"Đã lưu thành công {total_downloaded} tập phim về máy bạn!")
+            if getattr(self, '_batch_running', False):
+                self._batch_tab_finished()
+            else:
+                QMessageBox.information(self, "Thành công", f"Đã lưu thành công {total_downloaded} tập phim về máy bạn!")
             return
 
         self._do_merge(mode, files_to_merge)
@@ -4620,7 +4941,15 @@ class HonggouWidget(QWidget):
             for suffix, srt_suffix in [("_vi.srt", "_vi.srt"), (".srt", ".srt")]:
                 srt_files_found = []
                 for vf in video_files:
-                    srt_path = os.path.splitext(vf)[0] + suffix
+                    base = os.path.splitext(vf)[0]
+                    # Khi ghép SAU LỒNG TIẾNG, video là *_dubbed.mp4 nhưng file
+                    # sub đặt theo tên GỐC (Tap_01_vi.srt, không phải
+                    # Tap_01_dubbed_vi.srt). Bỏ hậu tố _dubbed để tìm đúng sub,
+                    # nếu không srt_files_found sẽ rỗng -> KHÔNG tạo được sub
+                    # trọn bộ.
+                    if base.endswith("_dubbed"):
+                        base = base[:-len("_dubbed")]
+                    srt_path = base + suffix
                     if os.path.exists(srt_path):
                         srt_files_found.append((vf, srt_path))
 
@@ -4674,6 +5003,8 @@ class HonggouWidget(QWidget):
             self.txt_stt_log.append("🎉 XONG TOÀN BỘ: tách sub → dịch → lồng tiếng → ghép file!")
             if n_cleaned:
                 self.txt_stt_log.append(f"🗑 Đã dọn {n_cleaned} file rác, chỉ giữ lại .srt + .mp4 hoàn chỉnh.")
+        if getattr(self, '_batch_running', False):
+            self._batch_tab_finished()
 
     def _cleanup_after_merge(self):
         """Dọn sạch mọi file lẻ từng tập (video gốc, *_dubbed.mp4, .srt, _vi.srt,
@@ -4814,6 +5145,10 @@ class HonggouWidget(QWidget):
         mode = getattr(self, '_merge_mode_after', 0)
         files = [f for f in (files or []) if os.path.exists(f)]
         if mode == 0 or len(files) <= 1:
+            # Không ghép -> đây là điểm KẾT THÚC chuỗi (chỉ tách sub, không lồng).
+            # Nếu đang tải hàng loạt thì sang bộ kế tiếp.
+            if getattr(self, '_batch_running', False):
+                self._batch_tab_finished()
             return
         self.txt_stt_log.append(f"🔗 Đang ghép {len(files)} tập theo chế độ đã chọn...")
         self._do_merge(mode, files)
@@ -5158,6 +5493,8 @@ class HonggouWidget(QWidget):
         if mode == 0:
             self.txt_stt_log.append("🎉 Hoàn tất tất cả: tách sub → dịch → lồng tiếng (từng tập rời)!")
             self.lbl_status.setText("🎉 Hoàn tất! Các tập đã lồng tiếng (rời).")
+            if getattr(self, '_batch_running', False):
+                self._batch_tab_finished()
             return
 
         dubbed = sorted(getattr(self, '_gemini_vi_map', {}).keys())
@@ -5589,7 +5926,29 @@ class MainWindow(QMainWindow):
         self.honggou_tab.balance_changed.connect(self._update_balance_display)
         self.honggou_tab.refresh_stats_signal.connect(lambda: self._fetch_balance(username))
         self.honggou_tab.quota_used_signal.connect(self._deduct_quota)
-        main_layout.addWidget(self.honggou_tab)
+
+        # ── Bọc Hongguo + Render thành các TAB trong cùng cửa sổ ──────────
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setStyleSheet("""
+            QTabWidget::pane { border: none; background: #0f172a; }
+            QTabBar::tab {
+                background: #1e293b; color: #94a3b8;
+                padding: 9px 22px; font-weight: bold; font-size: 13px;
+                border: 1px solid #334155; border-bottom: none;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected { background: #0f172a; color: #38bdf8; }
+            QTabBar::tab:hover { color: #e2e8f0; }
+        """)
+        self.main_tabs.addTab(self.honggou_tab, "📥  Tải & Xử lý")
+        # Chỉ thêm tab Render nếu nạp được module (không thì bỏ qua, app vẫn chạy)
+        if RenderWidget is not None:
+            try:
+                self.render_tab = RenderWidget()
+                self.main_tabs.addTab(self.render_tab, "🎨  Render Video")
+            except Exception as _rw_e:
+                print(f"[WARN] Không tạo được tab Render: {_rw_e}")
+        main_layout.addWidget(self.main_tabs)
 
         self.stack.addWidget(main_widget); self.stack.setCurrentWidget(main_widget)
         self._fetch_balance(username)

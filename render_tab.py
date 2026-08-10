@@ -120,8 +120,18 @@ class SingleRenderThread(QThread):
         m_l, m_r, m_v = max(0, int(self.cfg["margin_l"])), max(0, int(self.cfg["margin_r"])), max(0, int(self.cfg["margin_v"]))
         f_size = max(10, int(self.cfg["font_size"]))
         f_color = self.cfg.get("font_color", "&H0000FFFF")
-        
-        style = (f"FontName={self.cfg['font_name']},FontSize={f_size},PrimaryColour={f_color},OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,PlayResX={vid_w},PlayResY={vid_h},MarginL={m_l},MarginR={m_r},MarginV={m_v}")
+
+        # Nền ô chữ (opaque box) sau chữ: BorderStyle=3 + BackColour là màu nền.
+        # Nếu tắt -> viền thường (BorderStyle=1, outline đen).
+        if self.cfg.get("subbox_en"):
+            back = self.cfg.get("subbox_color", "&H80000000")  # mặc định đen mờ ~50%
+            style = (f"FontName={self.cfg['font_name']},FontSize={f_size},PrimaryColour={f_color},"
+                     f"OutlineColour={back},BackColour={back},BorderStyle=3,Outline=6,Shadow=0,"
+                     f"Alignment=2,PlayResX={vid_w},PlayResY={vid_h},MarginL={m_l},MarginR={m_r},MarginV={m_v}")
+        else:
+            style = (f"FontName={self.cfg['font_name']},FontSize={f_size},PrimaryColour={f_color},"
+                     f"OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,"
+                     f"Alignment=2,PlayResX={vid_w},PlayResY={vid_h},MarginL={m_l},MarginR={m_r},MarginV={m_v}")
 
         basename = os.path.basename(self.vp)
         temp_srt = ""; escaped_srt = ""
@@ -198,7 +208,7 @@ class SingleRenderThread(QThread):
             last_vid_out = "[vout]"
             
         if self.cfg.get("speed"): 
-            filter_chains.append(f"{last_vid_out} setpts=0.952*PTS [v_speed]")
+            filter_chains.append(f"{last_vid_out} setpts=PTS/1.05 [v_speed]")
             last_vid_out = "[v_speed]"
 
         audio_map = ""
@@ -222,10 +232,17 @@ class SingleRenderThread(QThread):
                     audio_map = "0:a"
 
         af_chain = []
-        if self.cfg.get("speed"): af_chain.append("atempo=1.05")
-        if self.cfg.get("pitch"): af_chain.append("asetrate=48000*1.15,aresample=48000,atempo=1/1.15")
+        speed_val = 1.05 if self.cfg.get("speed") else 1.0
+        pitch_val = 1.15 if self.cfg.get("pitch") else 1.0
+        
+        if self.cfg.get("pitch"):
+            af_chain.append(f"aresample=48000,asetrate=48000*{pitch_val},aresample=48000,atempo={speed_val}/{pitch_val}")
+        elif self.cfg.get("speed"):
+            af_chain.append(f"atempo={speed_val}")
+            
         if af_chain and audio_map: 
-            filter_chains.append(f"{audio_map} {','.join(af_chain)} [aout]")
+            pad = audio_map if audio_map.startswith("[") else f"[{audio_map}]"
+            filter_chains.append(f"{pad} {','.join(af_chain)} [aout]")
             audio_map = "[aout]"
             
         cmd = ["ffmpeg", "-y"] + inputs; temp_filter = ""
@@ -528,8 +545,12 @@ class RenderWidget(QWidget):
         self.cards = []                 # danh sách EpisodeCard trong grid
         self.selected_card = None
         self.blur_boxes = []
+        self.sample_sub = None
+        self.logo_item = None
+        self._design_locked = None
         self._render_queue = []         # hàng đợi render (các card)
         self._render_running = False
+        self._stopping = False
         self.render_thread = None
 
         self.setStyleSheet("""
@@ -552,7 +573,14 @@ class RenderWidget(QWidget):
         left = QFrame(); left.setMinimumWidth(300); left.setMaximumWidth(340)
         left.setStyleSheet("background:#151821; border-radius:8px; border:1px solid #1F222D;")
         ll = QVBoxLayout(left); ll.setContentsMargins(10, 10, 10, 10)
-        ll.addWidget(QLabel("🎞️ Hàng đợi Render", styleSheet="font-size:14px; font-weight:bold; color:#F37021; border:none;"))
+        head_q = QHBoxLayout()
+        head_q.addWidget(QLabel("🎞️ Hàng đợi Render", styleSheet="font-size:14px; font-weight:bold; color:#F37021; border:none;"))
+        head_q.addStretch()
+        self.btn_open_folder = QPushButton("📂 Mở thư mục đang render")
+        self.btn_open_folder.setStyleSheet("QPushButton { background:#2D303D; color:#E5E6E8; padding:6px 10px; font-size:11px; border-radius:6px; border:1px solid #3B3E4D; } QPushButton:hover { background:#3B3E4D; border:1px solid #7452FF; color:white; }")
+        self.btn_open_folder.clicked.connect(self._open_render_folder)
+        head_q.addWidget(self.btn_open_folder)
+        ll.addLayout(head_q)
 
         btnrow = QHBoxLayout()
         b_folder = QPushButton("📁 Chọn thư mục"); b_folder.clicked.connect(self._pick_folder)
@@ -650,6 +678,33 @@ class RenderWidget(QWidget):
         self.cb_color.setCurrentText(self.settings.value("font_color_name", "Trắng (White)"))
         cb.addWidget(self.cb_color); rl.addLayout(cb)
 
+        # ── Nền ô chữ (dạng hộp màu sau chữ) ──
+        box_row = QHBoxLayout()
+        self.chk_subbox = QCheckBox("Nền ô chữ")
+        self.chk_subbox.setChecked(self.settings.value("subbox_en", False, type=bool))
+        self.chk_subbox.setStyleSheet("color:#93c5fd; font-weight:bold;")
+        box_row.addWidget(self.chk_subbox)
+        box_row.addWidget(QLabel("Màu nền:"))
+        self.cb_subbox_color = QComboBox()
+        self.cb_subbox_color.addItems(["Đen", "Xám đậm", "Xanh đen", "Trắng"])
+        self.cb_subbox_color.setCurrentText(self.settings.value("subbox_color_name", "Đen"))
+        box_row.addWidget(self.cb_subbox_color)
+        rl.addLayout(box_row)
+
+        op_row = QHBoxLayout()
+        op_row.addWidget(QLabel("Độ mờ nền:"))
+        self.spn_subbox_opacity = QSpinBox()
+        self.spn_subbox_opacity.setRange(0, 100)
+        self.spn_subbox_opacity.setValue(int(self.settings.value("subbox_opacity", 60)))
+        self.spn_subbox_opacity.setSuffix(" %")
+        self.spn_subbox_opacity.setToolTip("0% = trong suốt (không thấy nền), 100% = nền đặc kín.")
+        op_row.addWidget(self.spn_subbox_opacity); op_row.addStretch()
+        rl.addLayout(op_row)
+        # đổi font/cỡ/màu -> cập nhật ngay ô chữ mẫu trên preview
+        self.cb_font.currentTextChanged.connect(lambda *_: self._restyle_sample_sub())
+        self.spin_size.valueChanged.connect(lambda *_: self._restyle_sample_sub())
+        self.cb_color.currentTextChanged.connect(lambda *_: self._restyle_sample_sub())
+
         bl = QHBoxLayout()
         self.chk_blur = QCheckBox("Bật Khung Mờ"); self.chk_blur.setChecked(self.settings.value("bp_blur_en", False, type=bool))
         self.chk_blur.setStyleSheet("color:#F37021; font-weight:bold;")
@@ -672,6 +727,10 @@ class RenderWidget(QWidget):
         bg2 = QPushButton("Chọn"); bg2.setFixedWidth(55); bg2.clicked.connect(self._select_logo)
         lgl.addWidget(self.chk_logo); lgl.addWidget(self.logo_input); lgl.addWidget(bg2); rl.addLayout(lgl)
 
+        # Hook hiển thị ảnh logo
+        self.chk_logo.stateChanged.connect(lambda: self._update_logo_preview())
+        self.logo_input.textChanged.connect(lambda: self._update_logo_preview())
+
         rl.addWidget(QLabel("🎛️ Bộ lọc Bypass FX:", styleSheet="font-weight:bold; margin-top:10px; color:#8A8D98;"))
         self.chk_flip = QCheckBox("Lật ngang"); self.chk_zoom = QCheckBox("Phóng to 4%")
         self.chk_color = QCheckBox("Kích màu sáng"); self.chk_noise = QCheckBox("Nhiễu hạt")
@@ -689,15 +748,49 @@ class RenderWidget(QWidget):
         rl.addLayout(gb)
         rl.addStretch()
 
+        # Nút Đồng bộ: chốt cấu hình canh chỉnh hiện tại (vị trí sub + ô che +
+        # font/màu) làm chuẩn áp cho TẤT CẢ các tập khi render.
+        self.btn_sync_design = QPushButton("🔄 Đồng bộ canh chỉnh cho tất cả file")
+        self.btn_sync_design.setStyleSheet("QPushButton { background:#0891b2; color:white; padding:9px; font-size:12px; border-radius:8px; border:none; } QPushButton:hover { background:#0e7490; }")
+        self.btn_sync_design.clicked.connect(self._sync_design_all)
+        rl.addWidget(self.btn_sync_design)
+
         self.btn_run = QPushButton("🔥 RENDER TẤT CẢ (0)")
         self.btn_run.setStyleSheet("QPushButton { background:#F37021; color:white; padding:12px; font-size:14px; border-radius:8px; border:none; } QPushButton:hover { background:#e05f10; }")
         self.btn_run.clicked.connect(self._start_render_all)
         rl.addWidget(self.btn_run)
+
+        self.btn_stop = QPushButton("⛔ DỪNG RENDER")
+        self.btn_stop.setStyleSheet("QPushButton { background:#7F1D1D; color:white; padding:10px; font-size:13px; border-radius:8px; border:none; } QPushButton:hover { background:#991B1B; } QPushButton:disabled { background:#3B2020; color:#8A8D98; }")
+        self.btn_stop.clicked.connect(self._stop_render)
+        self.btn_stop.setEnabled(False)
+        rl.addWidget(self.btn_stop)
         main.addWidget(right)
 
     # ============ LOG ============
     def _log(self, msg):
         self.txt_log.append(str(msg).strip())
+
+    # ============ MỞ THƯ MỤC ĐANG RENDER ============
+    def _open_render_folder(self):
+        """Mở thư mục chứa file đang/đã render. Ưu tiên thư mục render gần
+        nhất; nếu chưa render thì lấy thư mục của file đầu trong hàng đợi."""
+        folder = getattr(self, "_last_render_dir", None)
+        if not folder and self.cards:
+            folder = os.path.dirname(self.cards[0].video_path)
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.information(self, "Chưa có thư mục",
+                "Chưa có file nào để mở. Hãy thêm video hoặc bắt đầu render trước.")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(folder)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi", f"Không mở được thư mục:\n{e}")
 
     # ============ GHÉP CẶP VIDEO + SRT ============
     def _pick_folder(self):
@@ -854,16 +947,88 @@ class RenderWidget(QWidget):
             self.video_item.setSize(size)
             self.scene.setSceneRect(0, 0, size.width(), size.height())
             self.preview.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self._ensure_sample_sub()   # hiện ô chữ mẫu để canh vị trí sub
+            self._update_logo_preview() # hiện logo nếu có
 
     def _reset_pos(self):
         self.preview.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     # ============ KHUNG MỜ / FRAME / LOGO ============
     def _add_blur_box(self):
+        # Lấy kích thước vùng làm việc: ưu tiên sceneRect, nếu chưa có (video
+        # chưa load xong) thì lấy nativeSize của video, cuối cùng mặc định
+        # 1080x1920 (dọc - hợp phim ngắn). Nhờ vậy ô che LUÔN hiện đủ to để
+        # nhìn thấy và kéo, kể cả khi thêm trước lúc video sẵn sàng.
         rect = self.scene.sceneRect()
-        w = max(50, rect.width() * 0.3); h = max(30, rect.height() * 0.08)
-        box = DraggableBlurBox(rect.width() * 0.35, rect.height() * 0.8, w, h)
+        W = rect.width(); H = rect.height()
+        if W < 10 or H < 10:
+            ns = self.video_item.nativeSize()
+            if ns.width() > 10 and ns.height() > 10:
+                W, H = ns.width(), ns.height()
+            else:
+                W, H = 1080, 1920
+            # đảm bảo scene có kích thước để đặt item
+            self.scene.setSceneRect(0, 0, W, H)
+        w = max(120, W * 0.5); h = max(60, H * 0.10)
+        # đặt ô che ở GIỮA màn hình cho dễ thấy
+        x = (W - w) / 2; y = (H - h) / 2
+        box = DraggableBlurBox(x, y, w, h)
+        box.setSelected(True)          # chọn sẵn để thấy handle + kéo ngay
         self.scene.addItem(box); self.blur_boxes.append(box)
+        # canh lại khung nhìn để chắc chắn ô nằm trong vùng thấy
+        try:
+            self.preview.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        except Exception:
+            pass
+
+    def _ensure_sample_sub(self):
+        """Tạo (nếu chưa có) ô CHỮ MẪU sub tiếng Việt trên preview để canh vị
+        trí. Chữ kéo được, phóng to được."""
+        rect = self.scene.sceneRect()
+        W = rect.width() or 1080; H = rect.height() or 1920
+        if getattr(self, 'sample_sub', None) is None:
+            self.sample_sub = ScalableTextItem("Chữ Dịch Tiếng Việt (kéo tôi đi đâu cũng được!)")
+            self.sample_sub.setZValue(5)
+            self.scene.addItem(self.sample_sub)
+            self.sample_sub.setPos(W * 0.08, H * 0.80)
+        self._restyle_sample_sub()
+
+    def _restyle_sample_sub(self):
+        """Áp font/cỡ/màu đang chọn lên ô chữ mẫu."""
+        if getattr(self, 'sample_sub', None) is None:
+            return
+        try:
+            font = QFont(self.cb_font.currentText(), int(self.spin_size.value()))
+            font.setBold(True)
+            self.sample_sub.setFont(font)
+            qt_color = COLOR_PRESETS.get(self.cb_color.currentText(), {}).get("qt", "#FFFFFF")
+            self.sample_sub.setDefaultTextColor(QColor(qt_color))
+        except Exception:
+            pass
+            
+    def _update_logo_preview(self):
+        """Khởi tạo và hiển thị ảnh Logo lên màn hình Preview"""
+        path = self.logo_input.text().strip()
+        if not self.chk_logo.isChecked() or not os.path.exists(path):
+            if getattr(self, 'logo_item', None):
+                self.scene.removeItem(self.logo_item)
+                self.logo_item = None
+            return
+
+        if getattr(self, 'logo_item', None) is None:
+            self.logo_item = ScalablePixmapItem()
+            self.logo_item.setZValue(6) # Đặt lớp trên cùng để dễ kéo
+            self.scene.addItem(self.logo_item)
+            
+            # Căn góc logo lúc mới hiện
+            scene_rect = self.scene.sceneRect()
+            W = scene_rect.width() or 1080
+            H = scene_rect.height() or 1920
+            self.logo_item.setPos(W * 0.05, H * 0.05)
+
+        pixmap = QPixmap(path)
+        if not pixmap.isNull():
+            self.logo_item.setPixmap(pixmap)
 
     def _clear_blur_boxes(self):
         for b in self.blur_boxes:
@@ -889,18 +1054,61 @@ class RenderWidget(QWidget):
         for b in self.blur_boxes:
             r = b.sceneBoundingRect()
             blur_list.append({"x": int(r.x()), "y": int(r.y()), "w": int(r.width()), "h": int(r.height())})
-        # lưu settings để lần sau nhớ
+            
+        scene = self.scene.sceneRect()
+        SW = scene.width() or 1080; SH = scene.height() or 1920
+
+        # Lấy thông số tọa độ + scale của Logo
+        logo_pos = None
+        if getattr(self, 'logo_item', None) is not None and self.chk_logo.isChecked():
+            lr = self.logo_item.sceneBoundingRect()
+            logo_pos = {
+                "x": lr.x(), "y": lr.y(), "scale": self.logo_item.scale()
+            }
+
+        # Đọc VỊ TRÍ + CỠ chữ mẫu (nếu người dùng đã kéo canh) để render sub
+        # đúng chỗ + đúng cỡ. Quy ước theo hệ toạ độ scene = kích thước video.
+        sub_pos = None
+        try:
+            if getattr(self, 'sample_sub', None) is not None:
+                r = self.sample_sub.sceneBoundingRect()   # đã tính cả scale
+                # Lấy trực tiếp chiều cao pixel của ô chữ trên màn hình làm chuẩn.
+                # Nhân 0.75 để bù trừ khoảng trắng (padding/line-height) mặc định của Qt
+                eff_size = int(r.height() * 0.75)
+                sub_pos = {
+                    "cx": r.center().x(), "cy": r.center().y(),
+                    "left": r.left(), "bottom": r.bottom(),
+                    "SW": SW, "SH": SH, "eff_size": eff_size,
+                }
+        except Exception:
+            sub_pos = None
+
         self.settings.setValue("font_name", self.cb_font.currentText())
         self.settings.setValue("font_size", self.spin_size.value())
         self.settings.setValue("font_color_name", color_name)
         self.settings.setValue("render_quality", self.cb_quality.currentText())
         self.settings.setValue("hardsub_en", self.chk_hardsub.isChecked())
+
+        # Nền ô chữ -> mã màu ASS &HAABBGGRR (AA=alpha: 00 đặc, FF trong).
+        subbox_en = self.chk_subbox.isChecked()
+        _box_bgr = {"Đen": "000000", "Xám đậm": "202020", "Xanh đen": "301500", "Trắng": "FFFFFF"}
+        bgr = _box_bgr.get(self.cb_subbox_color.currentText(), "000000")
+        opac = int(self.spn_subbox_opacity.value())          # 0..100 (100 = đặc)
+        alpha = int(round((100 - opac) * 255 / 100))         # ASS alpha: 0 đặc, 255 trong
+        subbox_color = f"&H{alpha:02X}{bgr}"
+        self.settings.setValue("subbox_en", subbox_en)
+        self.settings.setValue("subbox_color_name", self.cb_subbox_color.currentText())
+        self.settings.setValue("subbox_opacity", opac)
         return {
             "hardsub_en": self.chk_hardsub.isChecked(),
             "render_quality": self.cb_quality.currentText(),
             "font_name": self.cb_font.currentText(),
             "font_size": self.spin_size.value(),
             "font_color": color_ass,
+            "sub_pos": sub_pos,
+            "logo_pos": logo_pos,
+            "SW": SW, "SH": SH,
+            "subbox_en": subbox_en, "subbox_color": subbox_color,
             "bp_blur_en": self.chk_blur.isChecked(), "blur_list": blur_list,
             "bp_frame_en": self.chk_frame.isChecked(), "frame_path": self.frame_input.text().strip(),
             "bp_logo_en": self.chk_logo.isChecked(), "logo_path": self.logo_input.text().strip(),
@@ -924,19 +1132,50 @@ class RenderWidget(QWidget):
             pass
         if design.get("bp_zoom"):
             W *= 0.96; H *= 0.96
-        # sub canh giữa dưới (mặc định) - đơn giản: margin đối xứng, cách đáy ~8%
+            
+        SW = design.get("SW", W); SH = design.get("SH", H)
+        sy = H / SH; sx = W / SW
+
+        # Vị trí + cỡ chữ: nếu người dùng đã kéo canh chữ mẫu (sub_pos) thì
+        # dùng đúng vị trí/cỡ đó; nếu không thì mặc định giữa-dưới, cách đáy 8%.
+        eff_font = int(design.get("font_size", 24))
         margin_v = int(H * 0.08)
+        sp = design.get("sub_pos")
+        if sp:
+            try:
+                # libass Alignment=2 neo ĐÁY dòng chữ cách đáy màn hình = MarginV.
+                # Dùng đáy chữ (bottom) trên scene, quy về pixel video.
+                margin_v = int(max(0, (SH - sp["bottom"]) * sy))
+                eff_font = int(max(8, sp["eff_size"] * sy))
+                self._log(
+                    f"   🔧 [canh sub] scene={int(SW)}x{int(SH)} video={int(W)}x{int(H)} "
+                    f"| đáy_chữ={int(sp['bottom'])} | margin_v={margin_v} "
+                    f"| cỡ_gốc={design.get('font_size')} scale~{sp['eff_size']/max(1,design.get('font_size',24)):.2f} eff_font={eff_font}\n"
+                )
+            except Exception as _e:
+                self._log(f"   ⚠️ [canh sub] lỗi tính vị trí: {_e}\n")
+                
+        # Quy đổi vị trí + Cỡ Logo từ Preview sang chuẩn FFmpeg
+        lx, ly, lscale = 20, 20, 1.0
+        lp = design.get("logo_pos")
+        if lp:
+            lx = int(max(0, lp["x"] * sx))
+            ly = int(max(0, lp["y"] * sy))
+            lscale = lp["scale"] * sx
+
         return {
             "scene_w": int(W), "scene_h": int(H),
             "blur_en": design["bp_blur_en"], "blur_list": design["blur_list"],
             "frame_en": design["bp_frame_en"], "frame_path": design["frame_path"],
             "logo_en": design["bp_logo_en"], "logo_path": design["logo_path"],
-            "logo_x": 20, "logo_y": 20, "logo_scale": 1.0,
+            "logo_x": lx, "logo_y": ly, "logo_scale": lscale,
             "flip": design["bp_flip"], "zoom": design["bp_zoom"], "color": design["bp_color"],
             "noise": design["bp_noise"], "speed": design["bp_speed"], "pitch": design["bp_pitch"],
             "rotate_en": design["bp_rotate"],
-            "font_name": design["font_name"], "font_size": design["font_size"],
+            "font_name": design["font_name"], "font_size": eff_font,
             "font_color": design["font_color"],
+            "subbox_en": design.get("subbox_en", False),
+            "subbox_color": design.get("subbox_color", "&H80000000"),
             "margin_l": 0, "margin_r": 0, "margin_v": margin_v,
             "hardsub_en": design["hardsub_en"],
             "render_quality": design["render_quality"],
@@ -944,6 +1183,19 @@ class RenderWidget(QWidget):
         }
 
     # ============ RENDER HÀNG LOẠT ============
+    def _sync_design_all(self):
+        """Chốt cấu hình canh chỉnh hiện tại (vị trí sub + ô che + font/màu/FX)
+        làm chuẩn dùng cho TẤT CẢ các tập khi render."""
+        if not self.cards:
+            QMessageBox.information(self, "Chưa có file", "Hãy thêm video vào hàng đợi trước.")
+            return
+        self._design_locked = self._collect_design()
+        n_blur = len(self._design_locked.get("blur_list", []))
+        self._log(f"🔄 Đã chốt canh chỉnh (vị trí sub + {n_blur} ô che) áp cho tất cả {len(self.cards)} tập.")
+        QMessageBox.information(self, "Đã đồng bộ",
+            f"Đã lưu canh chỉnh hiện tại làm chuẩn cho tất cả {len(self.cards)} tập.\n"
+            f"Bấm 'RENDER TẤT CẢ' để render đồng loạt theo canh chỉnh này.")
+
     def _start_render_all(self):
         if self._render_running:
             QMessageBox.information(self, "Đang render", "Đang render, vui lòng đợi xong.")
@@ -951,20 +1203,43 @@ class RenderWidget(QWidget):
         if not self.cards:
             QMessageBox.information(self, "Chưa có video", "Hãy thêm video vào hàng đợi trước.")
             return
-        self._design = self._collect_design()
+        # Ưu tiên cấu hình ĐÃ ĐỒNG BỘ (nếu bấm nút Đồng bộ trước đó); nếu chưa
+        # đồng bộ thì lấy canh chỉnh hiện tại. Dù cách nào cũng áp CHUNG cho mọi tập.
+        self._design = getattr(self, '_design_locked', None) or self._collect_design()
         self._render_queue = list(self.cards)
         self._render_running = True
+        self._stopping = False
         self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self._log(f"🚀 Bắt đầu render {len(self._render_queue)} tập...")
         self._render_next()
 
+    def _stop_render(self):
+        if not self._render_running:
+            return
+        self._stopping = True
+        self._render_queue = []          # xóa các tập chưa render
+        self.btn_stop.setEnabled(False)
+        self._log("⛔ Đang dừng render... (đợi tập hiện tại thoát)")
+        if self.render_thread and self.render_thread.isRunning():
+            self.render_thread.cancel()  # hủy tập đang render (xóa file dở)
+
     def _render_next(self):
-        if not self._render_queue:
+        if self._stopping or not self._render_queue:
+            stopped = self._stopping
             self._render_running = False
+            self._stopping = False
+            self._render_queue = []
             self.btn_run.setEnabled(True)
-            self.step_render.set_status("success", 100)
-            self._log("🎉 Đã render xong tất cả!")
-            QMessageBox.information(self, "Xong", "Đã render xong tất cả các tập!")
+            self.btn_stop.setEnabled(False)
+            if stopped:
+                self.step_render.set_status("error", 0)
+                self._log("⛔ Đã dừng render.")
+                QMessageBox.information(self, "Đã dừng", "Đã dừng render theo yêu cầu.")
+            else:
+                self.step_render.set_status("success", 100)
+                self._log("🎉 Đã render xong tất cả!")
+                QMessageBox.information(self, "Xong", "Đã render xong tất cả các tập!")
             return
         card = self._render_queue.pop(0)
         card.set_status("đang render")
@@ -972,6 +1247,7 @@ class RenderWidget(QWidget):
         vp = card.video_path
         sp = card.srt_path
         out_dir = os.path.dirname(vp)
+        self._last_render_dir = out_dir
         stem = os.path.splitext(os.path.basename(vp))[0]
         if stem.endswith("_dubbed"):
             stem = stem[:-len("_dubbed")]
@@ -984,5 +1260,8 @@ class RenderWidget(QWidget):
         self.render_thread.start()
 
     def _on_one_done(self, ok, card):
-        card.set_status("xong" if ok else "lỗi")
+        if self._stopping and not ok:
+            card.set_status("đã dừng")
+        else:
+            card.set_status("xong" if ok else "lỗi")
         self._render_next()
