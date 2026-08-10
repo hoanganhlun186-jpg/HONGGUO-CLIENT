@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QTextEdit, QTabWidget, QSplitter, QAbstractItemView,
     QTreeWidget, QTreeWidgetItem, QDoubleSpinBox, QScrollArea, QFrame, QSizePolicy, QDialog
 )
-from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize, QSettings, QTimer
+from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, pyqtSlot, QSize, QSettings, QTimer, QMetaObject
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor
 
 # Ẩn cửa sổ đen (console) khi pydub/ffmpeg chạy subprocess trên Windows.
@@ -294,7 +294,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.42"
+APP_VERSION = "1.0.43"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -827,19 +827,29 @@ class HonggouScanThread(QThread):
                 "title": title, "cover_url": cover_url
             }
             
-            res = requests.post(f"{SERVER_URL}/api/client/add_job", json=payload, headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=10)
-            
+            # Auto-retry khi server quá tải (503/502/504) - tối đa 3 lần
+            _RETRY_CODES = {502, 503, 504}
+            res = None
+            for _attempt in range(1, 4):
+                res = requests.post(f"{SERVER_URL}/api/client/add_job", json=payload,
+                                    headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=15)
+                if res.status_code not in _RETRY_CODES:
+                    break
+                if _attempt < 3:
+                    time.sleep(_attempt * 3)  # 3s, 6s
+
             if res.status_code == 200:
                 data = res.json()
                 data["title"] = title
                 data["cover_url"] = cover_url
                 data["total_episodes"] = total_episodes
                 self.scan_result.emit(data)
-            else: 
+            else:
                 err_msg = res.text
                 try: err_msg = res.json().get("detail", res.text)
                 except: pass
-                self.error_signal.emit(f"Máy chủ từ chối (Mã {res.status_code}):\n{err_msg}")
+                suffix = "\n(Server quá tải, đã tự thử lại 3 lần)" if res.status_code in _RETRY_CODES else ""
+                self.error_signal.emit(f"Máy chủ từ chối (Mã {res.status_code}):\n{err_msg}{suffix}")
 
         except requests.exceptions.RequestException as e: 
             self.error_signal.emit(f"Lỗi kết nối web gốc: {str(e)}")
@@ -3303,10 +3313,33 @@ class HonggouWidget(QWidget):
     # khi chạy Demucs -> ép về CPU (throttled) cho an toàn với máy khách.
     MIN_GPU_VRAM_GB_FOR_AUTO = 4.0
 
+    @pyqtSlot()
+    def _apply_gpu_detect_result(self):
+        """Được gọi trên main thread sau khi detect GPU xong (qua invokeMethod).
+        FIX: QTimer.singleShot từ background thread KHÔNG chạy trên main thread
+        -> callback bị Qt bỏ qua lặng lẽ -> checkbox kẹt disabled mãi."""
+        if not hasattr(self, 'chk_use_gpu'):
+            return
+        self.chk_use_gpu.setEnabled(True)
+        self._update_gpu_tooltip()
+        if getattr(self, '_gpu_is_good', False):
+            self.chk_use_gpu.setChecked(True)
+            self.chk_use_gpu.setText(
+                f"🚀 Tách bằng GPU ({self._gpu_name}, {self._gpu_vram_gb:.1f}GB VRAM) - Nhanh hơn CPU ~10 lần"
+            )
+        elif getattr(self, '_has_real_gpu', False):
+            self.chk_use_gpu.setChecked(False)
+            self.chk_use_gpu.setText(
+                f"⚠️ GPU yếu ({self._gpu_name}, {self._gpu_vram_gb:.1f}GB VRAM) - Có thể bật nhưng cẩn thận VRAM"
+            )
+        else:
+            self.chk_use_gpu.setChecked(False)
+            self.chk_use_gpu.setText("🖥 Tách bằng CPU (Không tìm thấy GPU NVIDIA)")
+
     def _detect_bgm_device(self):
         """Dò GPU ngầm bằng Subprocess để không làm sập App chính.
-        Không chỉ check có CUDA hay không, mà còn lấy VRAM để phân loại
-        GPU đủ khỏe (an toàn khi bật) hay GPU yếu (nên giữ CPU cho chắc)."""
+        FIX: dùng QMetaObject.invokeMethod thay QTimer.singleShot để update UI
+        từ thread phụ an toàn - tránh checkbox kẹt disabled dù detect GPU thành công."""
         import threading, subprocess, sys
 
         def _check():
@@ -3323,19 +3356,13 @@ class HonggouWidget(QWidget):
                     "else:\n"
                     "    print('0||0')\n"
                 )
-                # QUAN TRỌNG: phải dùng portable python (nơi đã cài torch CUDA),
-                # KHÔNG dùng sys.executable (python của app Nuitka, không có torch)
-                # nếu không sẽ detect nhầm -> luôn báo "không có GPU". Dùng
-                # _resolve_demucs_python() vì nó luôn xác minh file thật tồn tại,
-                # không tin mù quáng vào việc import demucs_manager có OK hay không.
                 _probe_py = _resolve_demucs_python()
-                env = _clean_subprocess_env(_probe_py)  # tránh xung đột DLL với app Nuitka
+                env = _clean_subprocess_env(_probe_py)
                 cmd = [_probe_py, "-c", probe]
                 si = None
                 if sys.platform == "win32":
                     si = subprocess.STARTUPINFO()
                     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
                 res = subprocess.run(cmd, env=env, capture_output=True, text=True, startupinfo=si, timeout=30)
                 parts = res.stdout.strip().split('|')
                 if len(parts) == 3 and parts[0] == '1':
@@ -3343,9 +3370,6 @@ class HonggouWidget(QWidget):
                     self._gpu_name = parts[1]
                     self._gpu_vram_gb = float(parts[2])
                 else:
-                    # Không detect được GPU -> ghi lại đầy đủ để debug, không
-                    # phải đoán mò lần sau. stderr chứa traceback Python thật
-                    # nếu import torch bị lỗi (vd xung đột DLL, thiếu module...).
                     _debug_info = (
                         f"probe_py: {_probe_py}\n"
                         f"returncode: {res.returncode}\n"
@@ -3354,43 +3378,24 @@ class HonggouWidget(QWidget):
                     )
             except Exception as e:
                 _debug_info = f"Exception khi detect GPU: {e}\n"
-
-            if _debug_info:
-                try:
-                    appdata = os.getenv('APPDATA', '')
-                    if appdata:
-                        log_path = os.path.join(appdata, 'AnhStudio', 'gpu_detect_debug.log')
-                        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-                        with open(log_path, 'w', encoding='utf-8') as f:
-                            f.write(_debug_info)
-                except Exception:
-                    pass
-
-            # GPU "xịn" = có CUDA thật SỰ + đủ VRAM. GPU yếu (VRAM thấp) coi như
-            # không đạt, để tránh out-of-memory / quá tải khi chạy Demucs trên máy khách.
-            self._gpu_is_good = self._has_real_gpu and self._gpu_vram_gb >= self.MIN_GPU_VRAM_GB_FOR_AUTO
-
-            def _update_ui():
-                if hasattr(self, 'chk_use_gpu'):
-                    self.chk_use_gpu.setEnabled(True)
-                    if self._gpu_is_good:
-                        self.chk_use_gpu.setChecked(True)
-                        self.chk_use_gpu.setText(
-                            f"🚀 Tách bằng GPU ({self._gpu_name}, {self._gpu_vram_gb:.1f}GB VRAM) - Nhanh hơn CPU ~10 lần"
-                        )
-                    elif self._has_real_gpu:
-                        # Có CUDA nhưng VRAM quá thấp -> không tự bật, để khách tự quyết định
-                        self.chk_use_gpu.setChecked(False)
-                        self.chk_use_gpu.setText(
-                            f"⚠️ GPU yếu ({self._gpu_name}, {self._gpu_vram_gb:.1f}GB VRAM) - Khuyên dùng CPU"
-                        )
-                    else:
-                        self.chk_use_gpu.setChecked(False)
-                        self.chk_use_gpu.setText("🖥 Tách bằng CPU (Không tìm thấy GPU)")
-
-            QTimer.singleShot(0, _update_ui)
+            finally:
+                if _debug_info:
+                    try:
+                        appdata = os.getenv('APPDATA', '')
+                        if appdata:
+                            log_path = os.path.join(appdata, 'AnhStudio', 'gpu_detect_debug.log')
+                            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                            with open(log_path, 'w', encoding='utf-8') as f:
+                                f.write(_debug_info)
+                    except Exception:
+                        pass
+                self._gpu_is_good = self._has_real_gpu and self._gpu_vram_gb >= self.MIN_GPU_VRAM_GB_FOR_AUTO
+                # Gọi slot trên main thread qua invokeMethod - KHÔNG dùng QTimer từ thread phụ
+                QMetaObject.invokeMethod(self, "_apply_gpu_detect_result",
+                                         Qt.ConnectionType.QueuedConnection)
 
         threading.Thread(target=_check, daemon=True).start()
+
 
     def _update_genre_styles(self, active_btn):
         for btn in self.genre_buttons:
