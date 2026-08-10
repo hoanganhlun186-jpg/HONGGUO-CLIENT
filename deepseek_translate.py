@@ -40,7 +40,6 @@ import urllib.error
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_MODEL = "deepseek-v4-pro"          # đổi thành "deepseek-v4-flash" nếu muốn rẻ/nhanh hơn
-RULE_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "rule_translate.txt")
 
 # Số dòng phụ đề mỗi khối gửi đi 1 lần gọi API.
 # DeepSeek V4 Pro cho phép output tối đa 384.000 token, nên chunk 300-500 dòng
@@ -112,23 +111,11 @@ class SeriesContext:
     genre: str = "Phụ đề phim"
     target_style: str = "Tự nhiên, dễ nghe"
     output_requirements: str = "Phụ đề phim, câu ngắn gọn dễ đọc"
-    glossary: Dict[str, str] = field(default_factory=dict)       # {"师尊": "sư tôn", ...}
-    character_profiles: str = ""                                   # cập nhật dần qua từng tập
-    plot_summary_so_far: str = ""                                   # tóm tắt diễn biến tính đến tập gần nhất
-    previous_context: str = ""                                      # vài câu dịch gần nhất (trong-tập, nối khối)
-    last_episode_done: int = 0                                      # tập cuối cùng đã xử lý xong
-
-    # ---- dùng khi build prompt cho 1 khối dịch ----
-    def glossary_as_text(self) -> str:
-        if not self.glossary:
-            return "(chưa có thuật ngữ nào được khóa — tự chọn cách dịch nhất quán)"
-        return "\n".join(f"* {zh} → {vi}" for zh, vi in self.glossary.items())
-
-    def character_profiles_as_text(self) -> str:
-        base = self.character_profiles or "(chưa có hồ sơ nhân vật)"
-        if self.plot_summary_so_far:
-            base += f"\n\nDiễn biến câu chuyện tính đến tập gần nhất:\n{self.plot_summary_so_far}"
-        return base
+    glossary: Dict[str, str] = field(default_factory=dict)       # giữ lại để tương thích ngược, không dùng khi build prompt nữa
+    character_profiles: str = ""    # lưu đoạn phân tích thể loại + xưng hô (y hệt "clean_ctx" bên Gemini)
+    plot_summary_so_far: str = ""   # tóm tắt diễn biến tính đến tập gần nhất
+    previous_context: str = ""      # vài câu dịch gần nhất (trong-tập, nối khối)
+    last_episode_done: int = 0      # tập cuối cùng đã xử lý xong
 
     def update_previous_context(self, translated_lines: List[str]) -> None:
         """Giữ lại N câu dịch cuối cùng để nối mạch giữa các KHỐI trong cùng 1 tập."""
@@ -208,113 +195,208 @@ def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# BƯỚC 1: PHÂN TÍCH NGỮ CẢNH TOÀN BỘ PHIM (GỌI 1 LẦN DUY NHẤT)
+# BƯỚC 1: PHÂN TÍCH BỐI CẢNH — Y HỆT CÁCH GEMINI ĐANG LÀM (GỌI 1 LẦN)
 # ─────────────────────────────────────────────────────────────────────────
+# Dùng ĐÚNG nguyên văn câu hỏi mà GeminiTranslateThread._translate_smart()
+# đang gửi, lấy mẫu 150 dòng đầu (đúng số dòng Gemini đang lấy), để 2 engine
+# cho ra bối cảnh cùng "chất lượng" và cùng cách suy luận, không lệch nhau.
 
-_ANALYZE_SYSTEM_PROMPT = """Bạn là trợ lý phân tích kịch bản phim tiếng Trung.
-Nhiệm vụ: đọc toàn bộ lời thoại được cung cấp và trả về DUY NHẤT 1 JSON object
-với 2 khóa:
-- "glossary": object ánh xạ thuật ngữ/danh xưng đặc thù Hán-Việt sang bản dịch
-  tiếng Việt cố định (ví dụ {"师尊": "sư tôn", "宗门": "tông môn"}). Chỉ liệt kê
-  thuật ngữ lặp lại nhiều lần hoặc quan trọng, không cần liệt kê từ thông dụng.
-- "character_profiles": chuỗi text mô tả ngắn gọn từng nhân vật xuất hiện
-  (tên, giới tính, tuổi tác ước lượng, địa vị, quan hệ với các nhân vật khác,
-  cách xưng hô giữa họ). Viết bằng tiếng Việt, súc tích, dùng gạch đầu dòng.
+CONTEXT_SAMPLE_LINES = 150   # số dòng lấy mẫu để phân tích - KHỚP với Gemini
 
-CHỈ trả về JSON hợp lệ, không thêm giải thích, không thêm markdown code fence."""
+
+def _build_context_prompt(sample_text: str) -> str:
+    """Nguyên văn prompt phân tích bối cảnh, copy y hệt từ GeminiTranslateThread."""
+    return (
+        "Đọc kịch bản sau và hãy đóng vai nhà phê bình phim để trả lời NGẮN GỌN 2 câu hỏi:\n"
+        "1. Phim này thuộc thể loại gì?\n"
+        "2. Nhận diện các nhân vật xuất hiện và cách họ xưng hô với nhau sao cho chuẩn "
+        "tiếng Việt nhất (Ví dụ: Lâm Xung (y/hắn), đại ca - đệ, hoàng thượng - thần thiếp, "
+        "anh - em...)?\n\n"
+        "TUYỆT ĐỐI KHÔNG DỊCH VĂN BẢN. CHỈ TRẢ VỀ TÓM TẮT ĐÁNH GIÁ (Khoảng 4-5 dòng).\n"
+        f"Văn bản trích xuất:\n{sample_text}"
+    )
 
 
 def analyze_movie_context(api_key: str, full_script_text: str,
                            ctx: SeriesContext) -> None:
-    """
-    Gọi DeepSeek 1 lần với toàn bộ kịch bản (tận dụng cửa sổ ngữ cảnh 1M token)
-    để trích xuất glossary + hồ sơ nhân vật, rồi lưu thẳng vào `ctx`.
-    Đây chính là bước "lưu ngữ cảnh cho nguyên bộ phim" — chỉ làm 1 lần,
-    kết quả được tái sử dụng cho MỌI khối dịch phía sau.
-    """
-    raw = _call_deepseek(
-        api_key=api_key,
-        system_prompt=_ANALYZE_SYSTEM_PROMPT,
-        user_prompt=full_script_text,
-        max_tokens=3000,
-        temperature=0.1,
-    )
-
-    # DeepSeek đôi khi vẫn bọc kết quả trong ```json ... ``` dù đã dặn không làm vậy
-    cleaned = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    """Gọi DeepSeek 1 lần với mẫu 150 dòng đầu (y hệt Gemini), lấy về đoạn tóm
+    tắt thể loại + xưng hô, lưu vào ctx.character_profiles để dùng lại cho
+    MỌI khối dịch phía sau — cùng cơ chế "phân tích 1 lần, dịch xuyên suốt"
+    như Gemini đang làm."""
+    sample_lines = full_script_text.splitlines()[:CONTEXT_SAMPLE_LINES]
+    sample_text = "\n".join(sample_lines)
+    context_prompt = _build_context_prompt(sample_text)
 
     try:
-        parsed = json.loads(cleaned)
-        ctx.merge_glossary(parsed.get("glossary", {}) or {})
-        ctx.character_profiles = (parsed.get("character_profiles", "") or "").strip()
-    except json.JSONDecodeError:
-        # Nếu model trả sai định dạng, không chặn tiến trình — dịch vẫn chạy
-        # được, chỉ là thiếu phần glossary/hồ sơ nhân vật tự động.
-        ctx.character_profiles = ctx.character_profiles or "(không phân tích được tự động)"
+        raw = _call_deepseek(
+            api_key=api_key,
+            system_prompt="Bạn là nhà phê bình phim chuyên nghiệp, trả lời đúng theo yêu cầu, không dịch văn bản.",
+            user_prompt=context_prompt,
+            max_tokens=500,
+            temperature=0.3,
+        )
+    except DeepSeekAPIError:
+        ctx.character_profiles = "Không thể phân tích bối cảnh. Hệ thống sẽ dịch theo mặc định."
+        return
+
+    clean_ctx = re.sub(r'```[a-zA-Z]*\n?', '', raw).replace('```', '')
+    ctx.character_profiles = clean_ctx.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # BƯỚC 2: DỊCH TỪNG KHỐI, DÙNG LẠI NGỮ CẢNH ĐÃ LƯU
 # ─────────────────────────────────────────────────────────────────────────
 
-def _load_rule_prompt() -> str:
-    with open(RULE_PROMPT_PATH, "r", encoding="utf-8") as f:
-        return f.read()
+# ─────────────────────────────────────────────────────────────────────────
+# BƯỚC 2: DỊCH TỪNG KHỐI — BUILD PROMPT + XỬ LÝ PHẢN HỒI Y HỆT GEMINI
+# ─────────────────────────────────────────────────────────────────────────
+# Toàn bộ phần dưới đây port lại chính xác logic trong
+# GeminiTranslateThread._translate_smart() (translate_tab.py), chỉ đổi nơi
+# gọi từ trình duyệt Gemini sang gọi thẳng API DeepSeek. Không dùng file
+# rule_translate.txt hay hệ placeholder riêng nào nữa — 2 engine giờ dùng
+# chung 1 bộ quy tắc, chỉ khác kênh gọi.
+
+# Các câu mở đầu thừa mà model hay tự thêm dù đã dặn không làm - cắt bỏ y hệt
+# Gemini đang làm ("Phẫu thuật sub").
+_FORBIDDEN_STARTS = ("dạ,", "dạ ", "vâng", "đây là bản", "bản dịch",
+                     "dưới đây là", "chắc chắn", "tất nhiên", "theo yêu cầu")
+
+# Tỷ lệ ký tự Hán/Trung còn sót tối đa cho phép trước khi coi là "AI lười dịch"
+# và bắt dịch lại - khớp ngưỡng 3% Gemini đang dùng.
+_CJK_LEFTOVER_MAX_RATIO = 0.03
+
+MAX_CHUNK_RETRIES = 5
 
 
-def _fill_rule_prompt(rule_template: str, ctx: SeriesContext,
-                       source_text: str, raw_translation: str = "") -> str:
-    """Điền các placeholder {{...}} trong rule_translate.txt bằng dữ liệu thật."""
-    filled = rule_template
-    filled = filled.replace("{{SOURCE_TEXT}}", source_text)
-    filled = filled.replace("{{RAW_TRANSLATION}}", raw_translation or "(chưa có bản dịch thô)")
-    filled = filled.replace("{{GENRE}}", ctx.genre)
-    filled = filled.replace("{{TARGET_STYLE}}", ctx.target_style)
-    filled = filled.replace("{{GLOSSARY}}", ctx.glossary_as_text())
-    filled = filled.replace("{{CHARACTER_PROFILES}}", ctx.character_profiles_as_text())
-    filled = filled.replace("{{PREVIOUS_CONTEXT}}", ctx.previous_context or "(đây là khối đầu tiên của phim)")
-    filled = filled.replace("{{OUTPUT_REQUIREMENTS}}", ctx.output_requirements)
-    return filled
+def _build_strict_rules(n_lines: int, context_text: str) -> str:
+    """Nguyên văn 5 quy tắc cứng, copy y hệt từ GeminiTranslateThread."""
+    return f"""QUY TẮC TUYỆT ĐỐI (VI PHẠM SẼ LỖI PHẦN MỀM):
+1. BẮT BUỘC trả về ĐÚNG {n_lines} dòng. Không gộp, không tách.
+2. KHÔNG giải thích, KHÔNG CHÀO HỎI. KHÔNG dùng thẻ markdown. CHỈ TRẢ VỀ NỘI DUNG DỊCH.
+3. BẮT BUỘC SỬ DỤNG TIẾNG VIỆT CÓ DẤU CHUẨN CHÍNH TẢ (Ví dụ: "Không", tuyệt đối không viết "Khong"). Đảm bảo giữ nguyên các dấu thanh của tiếng Việt.
+4. DỊCH SẠCH 100%, KHÔNG ĐỂ SÓT LẠI KÝ TỰ HÁN/TRUNG QUỐC.
+5. ÁP DỤNG BỐI CẢNH VÀ XƯNG HÔ SAU ĐÂY VÀO BẢN DỊCH:
+---
+{context_text}
+---"""
+
+
+def _clean_ai_response(raw: str) -> List[str]:
+    """Dọn phản hồi y hệt logic 'Phẫu thuật sub' bên Gemini: bỏ code fence,
+    bỏ dấu *, cắt câu chào hỏi thừa ở đầu, dồn khoảng trắng/từ lặp, lọc bỏ
+    dòng "rác" AI tự chèn thêm (số đếm trần trụi / dòng timestamp tự bịa)."""
+    res_clean = re.sub(r'```[a-zA-Z]*\n?', '', raw)
+    res_clean = res_clean.replace('```', '').replace('*', '')
+    temp_lines_raw = [l.strip() for l in res_clean.split('\n') if l.strip()]
+
+    while temp_lines_raw:
+        first_line = temp_lines_raw[0].strip().lower()
+        if first_line.startswith(_FORBIDDEN_STARTS):
+            temp_lines_raw.pop(0)
+        else:
+            break
+
+    temp_lines = []
+    _timestamp_line_re = re.compile(r'^\d{1,2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{3}$')
+    for line in temp_lines_raw:
+        stripped = line.strip()
+        # Lọc bỏ dòng "rác" AI đôi khi tự chèn thêm dù bị cấm: số thứ tự trần
+        # trụi (VD "1", "2") hoặc dòng timestamp tự bịa - không phải bản dịch
+        # thật, giữ lại sẽ làm lệch vị trí ghép vào block gốc.
+        if stripped.isdigit():
+            continue
+        if _timestamp_line_re.match(stripped):
+            continue
+        clean_line = re.sub(r'(\b\w+\b)(?:\s+\1){2,}', r'\1', line, flags=re.IGNORECASE)
+        clean_line = re.sub(r' +', ' ', clean_line)
+        temp_lines.append(clean_line)
+    return temp_lines
+
+
+def _cjk_leftover_ratio(lines: List[str]) -> float:
+    joined = " ".join(lines)
+    total_chars = len(re.sub(r"\s", "", joined))
+    if total_chars == 0:
+        return 0.0
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7a3]", joined))
+    return cjk_count / total_chars
 
 
 def translate_chunk(api_key: str, ctx: SeriesContext,
-                     rule_template: str, blocks: List[SrtBlock]) -> List[str]:
-    """
-    Dịch 1 khối gồm nhiều SrtBlock. Trả về danh sách text tiếng Việt theo
-    ĐÚNG thứ tự block đầu vào (dùng số dòng để model không lẫn lộn).
-    """
-    numbered_source = "\n".join(f"[{i+1}] {b.text}" for i, b in enumerate(blocks))
-    system_prompt = _fill_rule_prompt(rule_template, ctx, source_text=numbered_source)
+                     blocks: List[SrtBlock], log_callback=None) -> List[str]:
+    """Dịch 1 khối SrtBlock. Build prompt + retry + kiểm tra chất lượng y hệt
+    GeminiTranslateThread._translate_smart(), chỉ đổi kênh gọi sang DeepSeek."""
+    def _log(msg):
+        if log_callback:
+            log_callback(msg)
 
-    # Yêu cầu model trả về đúng format [n] để mình parse lại theo thứ tự,
-    # tránh trường hợp model gộp/tách câu làm lệch số dòng.
-    user_prompt = (
-        "Dịch các dòng phụ đề sau sang tiếng Việt theo đúng system prompt đã cho.\n"
-        "Trả về ĐÚNG số dòng, mỗi dòng theo format: [số] bản dịch\n"
-        "KHÔNG thêm giải thích, không gộp dòng, không đổi thứ tự.\n\n"
-        f"{numbered_source}"
-    )
+    context_text = ctx.character_profiles or "(chưa phân tích được bối cảnh)"
+    if ctx.previous_context:
+        context_text += f"\n\nCâu dịch ngay trước đó (để nối mạch tự nhiên):\n{ctx.previous_context}"
 
-    raw = _call_deepseek(
-        api_key=api_key,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        max_tokens=16000,   # đủ dư cho chunk tới ~500 dòng (~8-9k token output thực tế)
-        temperature=0.3,
-    )
+    remaining = list(blocks)
+    batch_size = len(remaining)
+    retry_count = 0
+    result_lines: List[str] = []
 
-    # Parse lại theo format "[n] nội dung"
-    result_map: Dict[int, str] = {}
-    for line in raw.splitlines():
-        m = re.match(r"^\[(\d+)\]\s*(.*)$", line.strip())
-        if m:
-            result_map[int(m.group(1))] = m.group(2).strip()
+    while remaining and retry_count < MAX_CHUNK_RETRIES:
+        current_batch = remaining[:batch_size]
+        lines_to_translate = [b.text for b in current_batch]
+        text_payload = "\n".join(lines_to_translate)
 
-    translated = []
-    for i in range(len(blocks)):
-        translated.append(result_map.get(i + 1, blocks[i].text))  # fallback: giữ nguyên gốc nếu thiếu dòng
+        strict_rules = _build_strict_rules(len(lines_to_translate), context_text)
+        system_prompt = f"{ctx.genre}\n\n{strict_rules}"
+        user_prompt = f"Dịch {len(lines_to_translate)} dòng sau:\n{text_payload}"
 
-    return translated
+        try:
+            raw = _call_deepseek(
+                api_key=api_key,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=16000,
+                temperature=0.3,
+            )
+        except DeepSeekAPIError as e:
+            _log(f"⚠️ Lỗi gọi DeepSeek: {e}\n")
+            retry_count += 1
+            time.sleep(RETRY_DELAY_SEC)
+            continue
+
+        temp_lines = _clean_ai_response(raw)
+
+        if not temp_lines:
+            _log("⚠️ AI không trả về dòng nào hợp lệ. Thử lại...\n")
+            retry_count += 1
+            continue
+
+        ratio = _cjk_leftover_ratio(temp_lines)
+        if ratio > _CJK_LEFTOVER_MAX_RATIO:
+            _log(f"⚠️ AI lười dịch, sót chữ Hán ({ratio*100:.1f}% > 3%). Ép dịch lại!\n")
+            if retry_count >= 2 and batch_size > 20:
+                batch_size = max(1, batch_size // 2)
+                _log(f"✂️ Tự động chia nhỏ: {batch_size} câu để AI bớt lười...\n")
+            retry_count += 1
+            continue
+
+        if len(temp_lines) < len(current_batch):
+            _log(f"⚠️ AI dịch thiếu ({len(temp_lines)}/{len(current_batch)} dòng). Chia nhỏ dịch lại...\n")
+            if batch_size > 15:
+                batch_size = max(1, batch_size // 2)
+            retry_count += 1
+            continue
+
+        # Đủ dòng, sạch chữ Hán -> chấp nhận, tiến sang phần còn lại
+        result_lines.extend(temp_lines[:len(current_batch)])
+        remaining = remaining[len(current_batch):]
+        batch_size = len(remaining)
+        retry_count = 0  # reset đếm lỗi khi 1 batch đã qua thành công
+
+    # Còn sót block chưa dịch được sau khi hết lượt retry -> giữ nguyên bản gốc
+    # (an toàn, không làm crash tiến trình, tương tự Gemini fallback).
+    while len(result_lines) < len(blocks):
+        result_lines.append(blocks[len(result_lines)].text)
+
+    return result_lines
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -336,7 +418,6 @@ class DeepSeekTranslator:
         if not api_key:
             raise ValueError("Thiếu DeepSeek API key.")
         self.api_key = api_key
-        self.rule_template = _load_rule_prompt()
 
     # ---- dùng nội bộ: dịch 1 danh sách block đã có sẵn ctx, cập nhật progress ----
     def _translate_blocks(self, ctx: SeriesContext, blocks: List[SrtBlock],
@@ -344,7 +425,7 @@ class DeepSeekTranslator:
         done = done_offset
         for start in range(0, len(blocks), LINES_PER_CHUNK):
             chunk = blocks[start:start + LINES_PER_CHUNK]
-            translated_texts = translate_chunk(self.api_key, ctx, self.rule_template, chunk)
+            translated_texts = translate_chunk(self.api_key, ctx, chunk)
 
             for b, vi_text in zip(chunk, translated_texts):
                 b.text = vi_text

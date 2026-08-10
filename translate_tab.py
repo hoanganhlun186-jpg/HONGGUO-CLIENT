@@ -171,6 +171,22 @@ class GoogleManualLoginThread(QThread):
         except Exception as e:
             self.log.emit(f"❌ Lỗi: {e} (Hãy chắc chắn bạn đã cài đặt Google Chrome trên máy tính)\n"); self.finished_signal.emit(False)
 
+_TIMESTAMP_LINE_RE = re.compile(r'^\d{1,2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{3}$')
+
+def _count_real_lines(text):
+    """Đếm số dòng THẬT (không tính rác Gemini hay tự chèn thêm: số thứ tự
+    trần trụi, dòng timestamp tự bịa). Dùng chung cho cả bước chờ Gemini
+    dịch xong (_send_and_wait) lẫn bước ghép kết quả (_translate_smart) -
+    tránh 2 nơi đếm khác kiểu gây lệch pha."""
+    count = 0
+    for l in text.split('\n'):
+        s = l.strip()
+        if not s: continue
+        if s.isdigit(): continue
+        if _TIMESTAMP_LINE_RE.match(s): continue
+        count += 1
+    return count
+
 class GeminiTranslateThread(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(int)
@@ -180,12 +196,13 @@ class GeminiTranslateThread(QThread):
     item_failed = pyqtSignal(int, str)
     all_done = pyqtSignal()
     
-    def __init__(self, queue_items, prompt_preset_key, model_key, chunk_size=100):
+    def __init__(self, queue_items, prompt_preset_key, model_key, chunk_size=100, translate_workers=1):
         super().__init__()
         self.queue_items = list(queue_items)
         self.preset_text = PROMPT_PRESETS.get(prompt_preset_key, list(PROMPT_PRESETS.values())[0])
         self.model_key = model_key
         self.chunk_size = chunk_size
+        self.translate_workers = max(1, min(4, int(translate_workers)))
         self._cancel = False
         
     def cancel(self): self._cancel = True
@@ -202,11 +219,21 @@ class GeminiTranslateThread(QThread):
         return blocks
 
     def run(self):
-        total = len(self.queue_items)
-        done = 0
         if not os.path.exists(AUTH_FILE):
             self.log.emit("❌ Lỗi: Bạn chưa Đăng nhập Google.\n"); self.all_done.emit(); return
-            
+        if self.translate_workers <= 1:
+            self._run_sequential()
+        else:
+            self._run_parallel()
+
+    def _run_sequential(self):
+        """Chế độ CŨ (1 Chrome, dịch tuần tự từng tập) - giữ nguyên hành vi
+        mặc định khi khách để 'Số tập dịch song song' = 1, tránh rủi ro hồi
+        quy cho trường hợp phổ biến nhất. Bối cảnh vẫn chỉ phân tích 1 lần
+        (dùng tập đầu tiên làm mẫu) rồi tái sử dụng cho các tập sau, thay vì
+        mỗi tập tự phân tích riêng như bản cũ - tiết kiệm thời gian."""
+        total = len(self.queue_items)
+        done = 0
         ctx, pw = None, None
         try:
             from playwright.sync_api import sync_playwright
@@ -246,13 +273,16 @@ class GeminiTranslateThread(QThread):
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             self.log.emit("🌐 Đã khởi tạo trình duyệt Chrome ngầm (Standalone Profile).\n")
             
+            clean_ctx = None
             for idx, item in enumerate(self.queue_items):
                 if self._cancel: break
                 video_path, srt_path = item["video"], item["srt"]
                 base = os.path.basename(srt_path)
                 self.log.emit(f"\n{'='*50}\n📄 [{idx+1}/{total}] Đang xử lý: {base}\n")
-                try: 
-                    page = self._translate_smart(ctx, page, idx, video_path, srt_path)
+                try:
+                    if clean_ctx is None:
+                        clean_ctx = self._extract_shared_context(page, srt_path)
+                    self._translate_smart(clean_ctx, page, idx, video_path, srt_path)
                 except Exception as e: 
                     self.item_failed.emit(idx, str(e))
                 done += 1
@@ -267,15 +297,112 @@ class GeminiTranslateThread(QThread):
         self.log.emit(f"\n🏁 XONG CHIẾN DỊCH.\n")
         self.all_done.emit()
 
-    def _translate_smart(self, ctx, page, idx, video_path, srt_path):
-        with open(srt_path, "r", encoding="utf-8-sig") as f: srt_content = f.read()
+    def _launch_authenticated_context(self, pw):
+        """Mở 1 Chrome ẨN ĐỘC LẬP (không dùng chung profile bị khóa), đăng
+        nhập sẵn bằng storage_state đã lưu (AUTH_FILE) từ lúc đăng nhập ban
+        đầu. Mỗi luồng dịch song song gọi hàm này để có Chrome RIÊNG, không
+        đụng độ luồng khác (Playwright sync API không an toàn khi dùng chung
+        giữa nhiều luồng, và Chrome persistent profile không cho 2 tiến
+        trình cùng mở 1 lúc)."""
+        browser = pw.chromium.launch(headless=True, channel="chrome", args=BROWSER_ARGS)
+        ctx = browser.new_context(
+            storage_state=AUTH_FILE,
+            user_agent=UA,
+            viewport={"width": 1280, "height": 900}
+        )
+        ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        return browser, ctx
+
+    def _run_parallel(self):
+        """Dịch NHIỀU TẬP CÙNG LÚC (self.translate_workers luồng, mỗi luồng
+        1 Chrome ẩn riêng biệt). Bối cảnh chỉ phân tích 1 LẦN DUY NHẤT (dùng
+        tập đầu tiên trong hàng đợi làm mẫu), áp dụng chung cho mọi tập dịch
+        song song phía sau."""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        total = len(self.queue_items)
+        done = 0
+        done_lock = threading.Lock()
+
+        try:
+            from playwright.sync_api import sync_playwright
+
+            # BƯỚC 1: Lấy bối cảnh 1 LẦN, dùng tập đầu tiên trong hàng đợi làm mẫu.
+            pw_main = sync_playwright().start()
+            browser_main = None
+            try:
+                browser_main, ctx_main = self._launch_authenticated_context(pw_main)
+                page_main = ctx_main.new_page()
+                self.log.emit("🌐 Đã khởi tạo trình duyệt Chrome ngầm (lấy bối cảnh chung).\n")
+                sample_srt = self.queue_items[0]["srt"]
+                clean_ctx = self._extract_shared_context(page_main, sample_srt)
+            finally:
+                try:
+                    if browser_main: browser_main.close()
+                except Exception: pass
+                try: pw_main.stop()
+                except Exception: pass
+
+            if self._cancel:
+                self.all_done.emit(); return
+
+            # BƯỚC 2: Dịch song song self.translate_workers tập cùng lúc.
+            self.log.emit(f"🚀 Dịch song song {self.translate_workers} tập/lúc ({total} tập trong hàng đợi)...\n")
+
+            def _worker(idx, item):
+                nonlocal done
+                if self._cancel: return
+                video_path, srt_path = item["video"], item["srt"]
+                base = os.path.basename(srt_path)
+                self.log.emit(f"\n{'='*50}\n📄 [{idx+1}/{total}] Đang xử lý (song song): {base}\n")
+
+                pw_w = sync_playwright().start()
+                browser_w = None
+                try:
+                    browser_w, ctx_w = self._launch_authenticated_context(pw_w)
+                    page_w = ctx_w.new_page()
+                    self._translate_smart(clean_ctx, page_w, idx, video_path, srt_path)
+                except Exception as e:
+                    self.item_failed.emit(idx, str(e))
+                finally:
+                    try:
+                        if browser_w: browser_w.close()
+                    except Exception: pass
+                    try: pw_w.stop()
+                    except Exception: pass
+                with done_lock:
+                    done += 1
+                    self.progress.emit(done)
+
+            with ThreadPoolExecutor(max_workers=self.translate_workers) as ex:
+                futs = [ex.submit(_worker, idx, item) for idx, item in enumerate(self.queue_items)]
+                for fut in as_completed(futs):
+                    if self._cancel: break
+                    try: fut.result()
+                    except Exception as e:
+                        self.log.emit(f"⚠️ Lỗi luồng: {e}\n")
+
+        except Exception as e:
+            self.log.emit(f"❌ Lỗi nghiêm trọng trong luồng dịch thuật: {e}\n")
+
+        self.log.emit(f"\n🏁 XONG CHIẾN DỊCH.\n")
+        self.all_done.emit()
+
+    def _extract_shared_context(self, page, sample_srt_path):
+        """Phân tích bối cảnh (thể loại + xưng hô) DÙNG CHUNG cho toàn bộ
+        hàng đợi dịch song song phía sau - chỉ chạy 1 LẦN DUY NHẤT, dùng 1
+        tập làm mẫu (thường là tập đầu tiên), thay vì mỗi tập tự phân tích
+        riêng như trước (vừa tốn thời gian vừa có thể ra bối cảnh khác nhau
+        giữa các tập cùng 1 phim)."""
+        with open(sample_srt_path, "r", encoding="utf-8-sig") as f: srt_content = f.read()
         blocks = self._parse_srt(srt_content)
         if not blocks:
-            self.item_failed.emit(idx, "File trống hoặc sai định dạng SRT."); return page
-            
+            return "Không thể phân tích bối cảnh. Hệ thống sẽ dịch theo mặc định."
+
         sample_blocks = blocks[:150]
         sample_text = "\n".join([b["text"] for b in sample_blocks])
-        
+
         context_prompt = (
             "Đọc kịch bản sau và hãy đóng vai nhà phê bình phim để trả lời NGẮN GỌN 2 câu hỏi:\n"
             "1. Phim này thuộc thể loại gì?\n"
@@ -283,16 +410,24 @@ class GeminiTranslateThread(QThread):
             "TUYỆT ĐỐI KHÔNG DỊCH VĂN BẢN. CHỈ TRẢ VỀ TÓM TẮT ĐÁNH GIÁ (Khoảng 4-5 dòng).\n"
             f"Văn bản trích xuất:\n{sample_text}"
         )
-        
-        self.log.emit("🔍 Đang phân tích kịch bản & mối quan hệ nhân vật...\n")
+
+        self.log.emit("🔍 Đang phân tích kịch bản & mối quan hệ nhân vật (dùng chung cho cả hàng đợi)...\n")
         context_res = self._send_and_wait(page, "Bot-Trinh-Sat", context_prompt)
-        
+
         if "ERROR" in context_res:
             context_res = "Không thể phân tích bối cảnh. Hệ thống sẽ dịch theo mặc định."
-        
+
         clean_ctx = re.sub(r'```[a-zA-Z]*\n?', '', context_res).replace('```', '')
-        self.context_extracted.emit(idx, clean_ctx.strip())
-        self.log.emit("🧠 Phân tích xong bối cảnh! Bắt đầu dịch...\n")
+        self.log.emit("🧠 Phân tích xong bối cảnh! Bắt đầu dịch song song...\n")
+        return clean_ctx.strip()
+
+    def _translate_smart(self, clean_ctx, page, idx, video_path, srt_path):
+        with open(srt_path, "r", encoding="utf-8-sig") as f: srt_content = f.read()
+        blocks = self._parse_srt(srt_content)
+        if not blocks:
+            self.item_failed.emit(idx, "File trống hoặc sai định dạng SRT."); return
+
+        self.context_extracted.emit(idx, clean_ctx)
 
         chunks = [blocks[i:i + self.chunk_size] for i in range(0, len(blocks), self.chunk_size)]
         translated_results = {} 
@@ -349,7 +484,7 @@ class GeminiTranslateThread(QThread):
                     self.log.emit(f"⚙️ Đang Thoát vào lại (Mở trang mới) để reset AI...\n")
                     try: page.close()
                     except Exception: pass
-                    try: page = ctx.new_page(); page.goto("about:blank")
+                    try: page = page.context.new_page(); page.goto("about:blank")
                     except Exception: pass
                     retry_count += 1
                     time.sleep(2)
@@ -372,6 +507,16 @@ class GeminiTranslateThread(QThread):
                         
                 temp_lines = []
                 for line in temp_lines_raw:
+                    stripped = line.strip()
+                    # Lọc bỏ dòng "rác" Gemini đôi khi tự chèn thêm dù bị cấm:
+                    # số thứ tự trần trụi (VD "1", "2") hoặc dòng timestamp tự
+                    # bịa (VD "00:00:01,000 --> 00:00:03,000") - không phải
+                    # bản dịch thật, giữ lại sẽ làm lệch vị trí ghép vào block
+                    # gốc (mỗi 3 dòng chỉ có 1 dòng thật do lỗi này).
+                    if stripped.isdigit():
+                        continue
+                    if _TIMESTAMP_LINE_RE.match(stripped):
+                        continue
                     clean_line = re.sub(r'(\b\w+\b)(?:\s+\1){2,}', r'\1', line, flags=re.IGNORECASE)
                     clean_line = re.sub(r' +', ' ', clean_line)
                     temp_lines.append(clean_line)
@@ -380,7 +525,7 @@ class GeminiTranslateThread(QThread):
                     self.log.emit(f"⚠️ AI không trả về dòng nào hợp lệ. Thoát vào lại và thử lại...\n")
                     try: page.close()
                     except Exception: pass
-                    try: page = ctx.new_page(); page.goto("about:blank")
+                    try: page = page.context.new_page(); page.goto("about:blank")
                     except Exception: pass
                     retry_count += 1
                     time.sleep(2)
@@ -402,7 +547,7 @@ class GeminiTranslateThread(QThread):
 
                     try: page.close()
                     except Exception: pass
-                    try: page = ctx.new_page(); page.goto("about:blank")
+                    try: page = page.context.new_page(); page.goto("about:blank")
                     except Exception: pass
                     retry_count += 1
                     time.sleep(2)
@@ -419,7 +564,7 @@ class GeminiTranslateThread(QThread):
                     retry_count += 1
                     try: page.close()
                     except Exception: pass
-                    try: page = ctx.new_page(); page.goto("about:blank")
+                    try: page = page.context.new_page(); page.goto("about:blank")
                     except Exception: pass
                     time.sleep(2)
                     continue
@@ -440,7 +585,7 @@ class GeminiTranslateThread(QThread):
                 if len(chunk_to_translate) > 0:
                     try: page.close()
                     except Exception: pass
-                    try: page = ctx.new_page(); page.goto("about:blank")
+                    try: page = page.context.new_page(); page.goto("about:blank")
                     except Exception: pass
 
             # Nếu nỗ lực thử lại đều thất bại, giữ nguyên gốc
@@ -460,7 +605,7 @@ class GeminiTranslateThread(QThread):
                 self.log.emit("⏸️ Đã nhận kết quả, nghỉ 1 giây trước khi gửi tiếp...\n")
                 page.wait_for_timeout(1000)
 
-        if self._cancel: return page
+        if self._cancel: return
         
         final_srt_content = ""
         for b in blocks:
@@ -478,8 +623,6 @@ class GeminiTranslateThread(QThread):
         else:
             self.log.emit(f"✅ Đã lưu file khớp 100% Timeline: {os.path.basename(vi_path)}\n")
             self.item_done.emit(idx, video_path, vi_path)
-
-        return page
 
     def _send_and_wait(self, page, bot_name, prompt_message, expected_min_lines=None):
         try:
@@ -520,7 +663,13 @@ class GeminiTranslateThread(QThread):
                     stable += 1
                     required_stable = 8
                     if expected_min_lines:
-                        got_lines = len([l for l in cur.split('\n') if l.strip()])
+                        # QUAN TRỌNG: đếm dòng THẬT (loại rác số đếm/timestamp
+                        # Gemini tự chèn) - nếu đếm thô, rác làm phồng số dòng
+                        # lên ~3 lần, khiến code tưởng "đã đủ dòng" quá sớm và
+                        # DỪNG CHỜ TRƯỚC KHI GEMINI DỊCH XONG THẬT - đây chính
+                        # là nguyên nhân gây "AI dịch thiếu" dù đã tăng thời
+                        # gian chờ, vì bị cắt ngang chứ không phải AI lười.
+                        got_lines = _count_real_lines(cur)
                         if got_lines < expected_min_lines:
                             required_stable = 30
                     if stable >= required_stable: return cur
@@ -556,15 +705,12 @@ class DeepSeekTranslateThread(QThread):
         self.target_style = target_style
         self.full_series_mode = full_series_mode
         self._cancel = False
-        self.rule_template = dst._load_rule_prompt()
 
     def cancel(self):
         self._cancel = True
 
     def _ctx_display_text(self, ctx) -> str:
-        gl = ctx.glossary_as_text()
-        cp = ctx.character_profiles or "(chưa có hồ sơ nhân vật)"
-        return f"📖 GLOSSARY:\n{gl}\n\n🎭 NHÂN VẬT / DIỄN BIẾN:\n{cp}"
+        return ctx.character_profiles or "(chưa có bối cảnh)"
 
     def _translate_one_episode(self, idx, video_path, srt_path, ctx, done_offset, total_lines):
         """Dịch 1 tập bằng ctx đã có sẵn (dùng chung cho cả 'each' lẫn 'full').
@@ -582,7 +728,7 @@ class DeepSeekTranslateThread(QThread):
                 return done
             chunk = blocks[start:start + dst.LINES_PER_CHUNK]
             try:
-                texts = dst.translate_chunk(self.api_key, ctx, self.rule_template, chunk)
+                texts = dst.translate_chunk(self.api_key, ctx, chunk, log_callback=self.log.emit)
             except dst.DeepSeekAPIError as e:
                 self.item_failed.emit(idx, f"Lỗi gọi DeepSeek: {e}")
                 return done
@@ -815,7 +961,23 @@ class TranslateWidget(QWidget):
         self.spin_chunk.setSingleStep(10)
         self.spin_chunk.setValue(int(self.settings.value("chunk_size", 100)))
         ll.addWidget(self.spin_chunk)
-        
+
+        ll.addWidget(QLabel("Số tập dịch song song (Gemini):", styleSheet="color: #8A8D98; font-size: 11px; margin-top: 5px;"))
+        self.spin_translate_workers = QSpinBox()
+        self.spin_translate_workers.setRange(1, 4)
+        self.spin_translate_workers.setValue(int(self.settings.value("translate_workers", 1)))
+        self.spin_translate_workers.setToolTip(
+            "Số tập dịch CÙNG LÚC bằng Gemini (mỗi tập 1 trình duyệt Chrome ẩn\n"
+            "riêng). Phân tích bối cảnh chỉ làm 1 LẦN DUY NHẤT (dùng tập đầu\n"
+            "tiên trong hàng đợi làm mẫu), áp dụng chung cho mọi tập dịch song\n"
+            "song phía sau.\n"
+            "⚠️ Mỗi luồng = 1 Chrome ẩn riêng - chọn cao tốn thêm RAM/CPU rõ rệt."
+        )
+        self.spin_translate_workers.valueChanged.connect(
+            lambda v: self.settings.setValue("translate_workers", v)
+        )
+        ll.addWidget(self.spin_translate_workers)
+
         auth_box = QHBoxLayout()
         self.lbl_auth_status = QLabel("🔴 Chưa Login Gemini" if not os.path.exists(AUTH_FILE) else "🟢 Đã Login Gemini")
         self.lbl_auth_status.setStyleSheet("font-size: 11px; font-weight: bold;")
@@ -1107,8 +1269,10 @@ class TranslateWidget(QWidget):
             self.pbar.setMaximum(max(1, total_lines)); self.pbar.setValue(0)
 
             api_key = self.txt_deepseek_key.text().strip()
-            # Rút gọn preset text (bỏ số thứ tự/emoji) làm "genre" mô tả cho DeepSeek
-            genre = re.sub(r"^[^\wÀ-ỹ]*\d*\.?\s*", "", preset_key).strip() or "Phụ đề phim"
+            # Gửi NGUYÊN VĂN hướng dẫn thể loại (giống hệt Gemini đang dùng qua
+            # PROMPT_PRESETS), không chỉ tên rút gọn - để giữ đúng hướng dẫn từ
+            # vựng/xưng hô đặc thù từng thể loại (VD: "ưu tiên đạo hữu, bổn tọa...").
+            genre = PROMPT_PRESETS.get(preset_key, list(PROMPT_PRESETS.values())[0])
             full_series = self.chk_full_series.isChecked()
 
             self._translate_thread = DeepSeekTranslateThread(
@@ -1118,7 +1282,8 @@ class TranslateWidget(QWidget):
             self.pbar.setMaximum(len(self._queue)); self.pbar.setValue(0)
             model_key = self.model_combo.currentText()
             chunk_val = self.spin_chunk.value()
-            self._translate_thread = GeminiTranslateThread(self._queue, preset_key, model_key, chunk_val)
+            workers_val = self.spin_translate_workers.value() if hasattr(self, 'spin_translate_workers') else 1
+            self._translate_thread = GeminiTranslateThread(self._queue, preset_key, model_key, chunk_val, translate_workers=workers_val)
 
         self._translate_thread.log.connect(self._log)
         self._translate_thread.progress.connect(self.pbar.setValue)

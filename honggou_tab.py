@@ -106,6 +106,112 @@ try:
 except Exception:
     _DEMUCS_MANAGER_OK = False
 
+# "Cổng" giới hạn số Demucs chạy song song DÙNG CHUNG TOÀN APP - khác Lock()
+# cứng ở chỗ giới hạn (limit) có thể ĐỔI ĐƯỢC lúc đang chạy (khách chỉnh ô
+# "Tách nhạc song song" 1-5), áp dụng cho MỌI nơi gọi Demucs (DubThread nhiều
+# video CapCut, BgmPrecomputeThread chạy nền, BgmStandaloneThread...).
+# Mặc định = 1 (an toàn nhất, giống Lock() cũ). Khách tự chọn cao hơn (kể cả
+# khi dùng GPU) thì tự chịu rủi ro tràn VRAM nếu máy yếu.
+import threading as _threading_global
+
+class _DemucsConcurrencyGate:
+    def __init__(self, limit=1):
+        self._cond = _threading_global.Condition()
+        self._active = 0
+        self.limit = max(1, int(limit))
+
+    def acquire(self):
+        with self._cond:
+            while self._active >= self.limit:
+                self._cond.wait()
+            self._active += 1
+
+    def release(self):
+        with self._cond:
+            self._active -= 1
+            self._cond.notify()
+
+    def __enter__(self):
+        self.acquire(); return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+_GLOBAL_DEMUCS_GATE = _DemucsConcurrencyGate(limit=1)
+
+def _get_vocals_cache_path(video_path):
+    """Đường dẫn file cache lưu vocals.wav đã tách sẵn cho 1 video, để
+    BgmPrecomputeThread tách trước (chạy ngầm song song lúc dịch) và
+    DubThread dùng lại khi tới lượt lồng tiếng - khỏi tách lại từ đầu."""
+    base = os.path.splitext(video_path)[0]
+    return base + ".vocals_cache.wav"
+
+def _separate_vocals_demucs(video_path, use_gpu, dest_vocals_path, progress_cb=None):
+    """Tách vocals (giọng gốc, không nhạc nền) cho 1 video bằng Demucs, lưu
+    kết quả vào dest_vocals_path. Trả về True/False. Tự xin phép qua
+    _GLOBAL_DEMUCS_GATE (giới hạn số Demucs chạy song song theo cấu hình
+    khách chọn). Dùng chung cho BgmPrecomputeThread và BgmStandaloneThread."""
+    import subprocess as _sp, sys as _sys, tempfile, shutil
+    ffmpeg = get_ffmpeg_path()
+    if not ffmpeg:
+        return False
+    si = None
+    if _sys.platform == "win32":
+        si = _sp.STARTUPINFO()
+        si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+    temp_dir = tempfile.mkdtemp(prefix="bgm_sep_")
+    try:
+        with _GLOBAL_DEMUCS_GATE:
+            if progress_cb:
+                progress_cb(f"🎵 Đang tách: {os.path.basename(video_path)}...")
+            raw_wav = os.path.join(temp_dir, "orig_audio.wav")
+            _sp.run([ffmpeg, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", raw_wav],
+                    startupinfo=si, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+
+            demucs_out = os.path.join(temp_dir, "demucs_out")
+            model_name = "mdx_extra"
+            _demucs_py = _resolve_demucs_python()
+            env = _clean_subprocess_env(_demucs_py)
+            env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+            device_chain = (["cuda", "cpu"] if use_gpu else ["cpu"])
+            stem_name = os.path.splitext(os.path.basename(raw_wav))[0]
+            vocals_path = os.path.join(demucs_out, model_name, stem_name, "vocals.wav")
+
+            ok_sep = False
+            for device in device_chain:
+                env2 = dict(env)
+                if device == "cuda":
+                    env2.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    env2["CUDA_VISIBLE_DEVICES"] = "-1"
+                    n_threads = str(max(1, int(os.cpu_count() * 0.3)))
+                    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+                        env2[k] = n_threads
+
+                cmd = [_demucs_py, "-m", "demucs.separate", "-n", model_name,
+                       "--two-stems", "vocals", "-d", device, "--out", demucs_out, raw_wav]
+                res = _sp.run(cmd, env=env2, startupinfo=si, stdout=_sp.PIPE, stderr=_sp.PIPE)
+                if res.returncode == 0 and os.path.exists(vocals_path):
+                    ok_sep = True
+                    break
+                else:
+                    try:
+                        if os.path.isdir(demucs_out):
+                            shutil.rmtree(demucs_out, ignore_errors=True)
+                    except Exception:
+                        pass
+
+            if ok_sep:
+                shutil.copy2(vocals_path, dest_vocals_path)
+                return True
+            return False
+    except Exception:
+        return False
+    finally:
+        try: shutil.rmtree(temp_dir)
+        except Exception: pass
+
 def _resolve_demucs_python():
     """Trả về đường dẫn python.exe THẬT SỰ có torch/demucs đã cài, luôn xác
     minh file tồn tại trước khi dùng - không tin mù quáng vào việc import
@@ -129,10 +235,66 @@ def _resolve_demucs_python():
             return c
     return sys.executable
 
+
+def _clean_subprocess_env(python_exe_path):
+    """Trả về dict env() an toàn để gọi python_portable làm subprocess từ
+    bên trong app Nuitka. QUAN TRỌNG: app Nuitka tự thêm thư mục giải nén
+    tạm của chính nó vào đầu PATH -> nếu copy nguyên PATH đó cho tiến trình
+    con, python_portable có thể nạp NHẦM DLL của app cha (vd python3xx.dll,
+    hoặc DLL CUDA/torch khác version) thay vì DLL đúng trong thư mục của
+    chính nó -> import torch chết lặng lẽ, không báo lỗi rõ, GPU luôn bị
+    detect sai "không có". Fix: đưa thư mục chứa python_portable lên ĐẦU
+    PATH để nó luôn ưu tiên nạp đúng DLL của chính mình trước."""
+    env = os.environ.copy()
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    py_dir = os.path.dirname(python_exe_path)
+    if py_dir and os.path.isdir(py_dir):
+        old_path = env.get("PATH", "")
+        env["PATH"] = py_dir + os.pathsep + old_path
+    return env
+
+# ==========================================
+# GIỌNG EDGE TTS (Online, miễn phí) - port nguyên từ workflow_tab.py
+# Mỗi giọng: (voice_id Edge, pitch, rate offset %) - dùng cùng 1 giọng gốc
+# NamMinh/HoaiMy nhưng chỉnh pitch/rate khác nhau để tạo nhiều "chất giọng".
+# ==========================================
+EDGE_TTS_VOICES = {
+    "VN - Nam Minh (Nam - Truyền cảm)":      ("vi-VN-NamMinhNeural", "+0Hz",  "+0%"),
+    "VN - Đạo Hữu (Nam - Recap/Tu Tiên)":    ("vi-VN-NamMinhNeural", "+15Hz", "+15%"),
+    "VN - Hùng Dũng (Nam - Trầm/Lạnh đạm)": ("vi-VN-NamMinhNeural", "-15Hz", "+0%"),
+    "VN - Bá Vương (Nam - Oai phong)":       ("vi-VN-NamMinhNeural", "-25Hz", "+0%"),
+    "VN - Thiếu Niên (Nam - Trẻ/Vui)":      ("vi-VN-NamMinhNeural", "+25Hz", "+20%"),
+    "VN - Hoài My (Nữ - Nhẹ nhàng)":        ("vi-VN-HoaiMyNeural", "+0Hz",  "+0%"),
+    "VN - Vy Vy (Nữ - Review Phim)":         ("vi-VN-HoaiMyNeural", "+15Hz", "+30%"),
+    "VN - Hạ Mây (Nữ - Tâm sự/Chữa lành)": ("vi-VN-HoaiMyNeural", "-5Hz",  "+0%"),
+    "VN - Băng Nhi (Nữ - Lạnh/Kiêu)":       ("vi-VN-HoaiMyNeural", "-20Hz", "+0%"),
+    "VN - Tiểu Yến (Nữ - Trẻ con/Cute)":    ("vi-VN-HoaiMyNeural", "+30Hz", "+25%"),
+    "VN - Tố Nương (Nữ - Cổ trang/Đài)":    ("vi-VN-HoaiMyNeural", "+8Hz",  "+0%"),
+}
+
+def _clamp_edge_pitch(pitch_str):
+    """Giới hạn pitch trong khoảng an toàn Edge TTS chấp nhận, y hệt
+    validate_edge_tts_kwargs bên workflow_tab.py."""
+    try:
+        val = int(str(pitch_str).replace('Hz', '').replace('+', ''))
+        val = max(-200, min(200, val))
+        return f"{val:+d}Hz" if val != 0 else None
+    except Exception:
+        return None
+
+def _clamp_edge_rate(rate_pct):
+    """Giới hạn rate % trong khoảng an toàn Edge TTS chấp nhận."""
+    try:
+        val = int(rate_pct)
+        val = max(-50, min(100, val))
+        return f"{val:+d}%" if val != 0 else None
+    except Exception:
+        return None
+
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.41"
+APP_VERSION = "1.0.42"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -1225,7 +1387,10 @@ class SttBatchThread(QThread):
     def run(self):
         try:
             from capcut_tts_api import CapCutClient
-            client = CapCutClient(device=_get_capcut_device())
+            # Không truyền device cố định nữa - dùng CapCutClient() trần y
+            # hệt tool CapCut TTS/STT gốc, tránh 1 device_id bị dùng lặp đi
+            # lặp lại quá nhiều lần có thể khiến server giảm ưu tiên xử lý.
+            client = CapCutClient()
         except Exception as e:
             self.progress_signal.emit(f"❌ Không khởi tạo được CapCutClient: {e}")
             self.finished_signal.emit(0, len(self.file_paths))
@@ -1325,17 +1490,170 @@ class SttBatchThread(QThread):
         self.finished_signal.emit(ok, failed)
 
 # ==========================================
+# BGM PRECOMPUTE THREAD — Tách nhạc nền NGẦM, chạy SONG SONG với bước dịch,
+# lưu kết quả vào cache để DubThread dùng lại sau (khỏi tách lại từ đầu lúc
+# lồng tiếng, tiết kiệm phần lớn thời gian chờ ở bước lồng tiếng).
+# ==========================================
+class BgmPrecomputeThread(QThread):
+    progress_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal()
+
+    def __init__(self, video_paths, use_gpu=False):
+        super().__init__()
+        self.video_paths = list(video_paths)
+        self.use_gpu = use_gpu
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        todo = [v for v in self.video_paths
+                if os.path.exists(v) and not os.path.exists(_get_vocals_cache_path(v))]
+
+        def _one(video_path):
+            if self._stop:
+                return
+            cache_path = _get_vocals_cache_path(video_path)
+            bname = os.path.basename(video_path)
+            try:
+                ok = _separate_vocals_demucs(
+                    video_path, self.use_gpu, cache_path,
+                    progress_cb=lambda m: self.progress_signal.emit(f"[Tách nền ngầm] {m}")
+                )
+            except Exception:
+                ok = False
+            if ok:
+                self.progress_signal.emit(f"⚡ [Tách nền ngầm] Xong: {bname}")
+            else:
+                self.progress_signal.emit(f"⚠️ [Tách nền ngầm] Lỗi, bỏ qua: {bname} (sẽ tự tách lại lúc lồng tiếng)")
+
+        # Nộp TẤT CẢ video cùng lúc vào pool 5 luồng - số Demucs THẬT SỰ chạy
+        # song song do _GLOBAL_DEMUCS_GATE quyết định (khách chỉnh ô "Tách
+        # song song" 1-5), ở đây chỉ là số luồng SẴN SÀNG chờ tới lượt.
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futs = [ex.submit(_one, v) for v in todo]
+            for _ in as_completed(futs):
+                pass
+
+        self.finished_signal.emit()
+
+# ==========================================
+# BGM STANDALONE THREAD — Xuất video RIÊNG chỉ có giọng gốc, KHÔNG nhạc nền.
+# Dùng khi khách tick "Tách nhạc nền" nhưng KHÔNG tick "Lồng tiếng" - tức chỉ
+# muốn bản không nhạc nền, không cần lồng tiếng gì cả. Chạy nhiều video song
+# song theo số khách chọn ở ô "Tách song song" (qua _GLOBAL_DEMUCS_GATE).
+# ==========================================
+class BgmStandaloneThread(QThread):
+    progress_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(int, int)
+
+    def __init__(self, video_paths, use_gpu=False, del_original=False):
+        super().__init__()
+        self.video_paths = list(video_paths)
+        self.use_gpu = use_gpu
+        self.del_original = del_original
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import subprocess as _sp, sys as _sys
+
+        ffmpeg = get_ffmpeg_path()
+        if not ffmpeg:
+            self.progress_signal.emit("❌ Không tìm thấy ffmpeg!")
+            self.finished_signal.emit(0, len(self.video_paths)); return
+
+        si = None
+        if _sys.platform == "win32":
+            si = _sp.STARTUPINFO()
+            si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+
+        ok_lock = _threading_global.Lock()
+        ok = failed = 0
+
+        def _tally(result):
+            nonlocal ok, failed
+            if result is None:
+                return
+            with ok_lock:
+                if result: ok += 1
+                else: failed += 1
+
+        def _one(idx, video_path):
+            if self._stop:
+                return None
+            if not os.path.exists(video_path):
+                self.progress_signal.emit(f"[{idx+1}] ⏭ Bỏ qua: thiếu file")
+                return False
+
+            bname = os.path.basename(video_path)
+            temp_vocals = video_path + ".tmp_vocals.wav"
+            try:
+                ok_sep = _separate_vocals_demucs(
+                    video_path, self.use_gpu, temp_vocals,
+                    progress_cb=lambda m: self.progress_signal.emit(f"[{idx+1}] {m}")
+                )
+                if not ok_sep:
+                    self.progress_signal.emit(f"[{idx+1}] ❌ Lỗi tách nhạc nền: {bname}")
+                    return False
+
+                out_video = os.path.splitext(video_path)[0] + "_vocals.mp4"
+                res = _sp.run(
+                    [ffmpeg, "-y", "-i", video_path, "-i", temp_vocals,
+                     "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                     "-c:a", "aac", "-b:a", "192k", "-shortest", out_video],
+                    startupinfo=si, stdout=_sp.DEVNULL, stderr=_sp.PIPE
+                )
+                if res.returncode != 0 or not os.path.exists(out_video):
+                    self.progress_signal.emit(f"[{idx+1}] ❌ Lỗi ghép video: {bname}")
+                    return False
+
+                if self.del_original:
+                    try:
+                        os.remove(video_path)
+                        os.rename(out_video, video_path)
+                        self.progress_signal.emit(f"[{idx+1}] ✅ Xong! Đã ghi đè: {bname} (không nhạc nền)")
+                    except Exception as e:
+                        self.progress_signal.emit(f"[{idx+1}] ⚠️ Xong nhưng lỗi ghi đè: {str(e)[:100]}")
+                else:
+                    self.progress_signal.emit(f"[{idx+1}] ✅ Xong! → {os.path.basename(out_video)}")
+                return True
+            except Exception as e:
+                self.progress_signal.emit(f"[{idx+1}] ❌ Lỗi {bname}: {str(e)[:120]}")
+                return False
+            finally:
+                try:
+                    if os.path.exists(temp_vocals): os.remove(temp_vocals)
+                except Exception:
+                    pass
+
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futs = {ex.submit(_one, idx, v): idx for idx, v in enumerate(self.video_paths)}
+            for fut in as_completed(futs):
+                _tally(fut.result())
+
+        self.finished_signal.emit(ok, failed)
+
+# ==========================================
 # DUB THREAD — Lồng tiếng từ SRT vào video
 # ==========================================
 class DubThread(QThread):
     progress_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(int, int)   
 
-    def __init__(self, tasks, voice_type="BV074_streaming", rate="1.0", mute_original=True, orig_volume=15, remove_bgm=False, use_gpu=False):
+    def __init__(self, tasks, voice_type="BV074_streaming", rate="1.0", pitch="+0Hz", mute_original=True, orig_volume=15, remove_bgm=False, use_gpu=False, tts_workers=4):
         super().__init__()
         self.tasks      = tasks
         self.voice_type = voice_type
         self.rate       = rate
+        self.pitch      = pitch
+        self.tts_workers = max(1, int(tts_workers))
         self.mute_original = mute_original
         self.remove_bgm = remove_bgm
         self.use_gpu = use_gpu
@@ -1380,16 +1698,29 @@ class DubThread(QThread):
         return entries
 
     def run(self):
-        import urllib.request, shutil, json
+        import urllib.request, shutil, json, threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from pydub import AudioSegment
         from pydub.effects import speedup
 
-        try:
-            from capcut_tts_api import CapCutClient
-            client = CapCutClient(device=_get_capcut_device())
-        except Exception as e:
-            self.progress_signal.emit(f"❌ Không khởi tạo được CapCutClient: {e}")
-            self.finished_signal.emit(0, len(self.tasks)); return
+        is_neural = "Neural" in self.voice_type
+
+        # QUAN TRỌNG: chỉ khởi tạo CapCutClient khi THẬT SỰ cần dùng giọng
+        # CapCut. Nếu khách chọn giọng 🌐 Edge TTS thì không cần CapCut chút
+        # nào - Edge TTS phải chạy độc lập, không phụ thuộc CapCut có đăng
+        # nhập/còn hạn hay không.
+        client = None
+        if not is_neural:
+            try:
+                from capcut_tts_api import CapCutClient
+                # Không truyền device cố định nữa - dùng CapCutClient() trần
+                # y hệt tool CapCut TTS/STT gốc, tránh 1 device_id bị dùng
+                # lặp đi lặp lại quá nhiều lần có thể khiến server giảm ưu
+                # tiên xử lý (nghi vấn chính gây lồng tiếng chậm hơn tool cũ).
+                client = CapCutClient()
+            except Exception as e:
+                self.progress_signal.emit(f"❌ Không khởi tạo được CapCutClient: {e}")
+                self.finished_signal.emit(0, len(self.tasks)); return
 
         ffmpeg = get_ffmpeg_path()
         if not ffmpeg:
@@ -1400,19 +1731,22 @@ class DubThread(QThread):
         AudioSegment.converter = ffmpeg
 
         ok = failed = 0
+        ok_lock = threading.Lock()
         SUCCEED = {"succeed","success","completed","done","finish"}
         FAIL    = {"failed","error","fail"}
-        is_neural = "Neural" in self.voice_type
 
-        for idx, task in enumerate(self.tasks):
+        def _process_one_task(idx, task):
+            """Xử lý lồng tiếng cho ĐÚNG 1 video. Trả về True/False (thành
+            công/thất bại). Tách thành hàm riêng để có thể gọi tuần tự (Edge
+            TTS) hoặc song song nhiều video cùng lúc (CapCut, xem dưới)."""
             if self._stop:
-                self.progress_signal.emit("🛑 Đã dừng."); break
+                return None  # bị hủy giữa chừng, không tính thành công/thất bại
 
             video_path = task["video"]
             srt_path   = task["srt"]
             if not os.path.exists(video_path) or not os.path.exists(srt_path):
                 self.progress_signal.emit(f"[{idx+1}] ⏭ Bỏ qua: thiếu file video hoặc SRT")
-                failed += 1; continue
+                return False
 
             bname = os.path.basename(video_path)
             self.progress_signal.emit(f"[{idx+1}/{len(self.tasks)}] 🎙 Bắt đầu lồng tiếng: {bname}")
@@ -1420,9 +1754,11 @@ class DubThread(QThread):
             entries = self._parse_srt(srt_path)
             if not entries:
                 self.progress_signal.emit(f"[{idx+1}] ⚠️ SRT rỗng: {os.path.basename(srt_path)}")
-                failed += 1; continue
+                return False
 
             temp_dir = tempfile.mkdtemp(prefix="dub_")
+            _vocals_from_cache = False  # khai báo sớm nhất có thể, tránh NameError
+            # trong finally nếu lỗi xảy ra trước khi tới đoạn tách nhạc nền bên dưới.
             try:
                 total_ms = entries[-1][1] + 500
 
@@ -1443,36 +1779,56 @@ class DubThread(QThread):
                                 import asyncio, edge_tts
                                 r = float(self.rate)
                                 pct = int((r-1.0)*100)
-                                rate_str = f"+{pct}%" if pct>=0 else f"{pct}%"
+                                _rate_clamped = _clamp_edge_rate(pct)
+                                _pitch_clamped = _clamp_edge_pitch(self.pitch)
+                                _edge_kwargs = {}
+                                if _rate_clamped: _edge_kwargs['rate'] = _rate_clamped
+                                if _pitch_clamped: _edge_kwargs['pitch'] = _pitch_clamped
                                 async def _run_edge():
-                                    comm = edge_tts.Communicate(text=text, voice=self.voice_type, rate=rate_str)
+                                    comm = edge_tts.Communicate(text=text, voice=self.voice_type, **_edge_kwargs)
                                     await comm.save(seg_path)
                                 asyncio.run(_run_edge())
                             else:
+                                # Port Y HỆT logic từ capcut_widget.py (_tts_get_url) đã
+                                # xác nhận chạy nhanh - đảm bảo 100% giống hệt, không còn
+                                # nghi ngờ có khác biệt tinh vi nào. Thêm log chi tiết từng
+                                # lần poll để so sánh trực tiếp thời gian với tool gốc.
+                                self.progress_signal.emit(f"[{idx+1}] Dòng {i+1}: Gửi request...")
                                 create = client.create_tts_task(texts=text, voice=self.voice_type, rate=self.rate)
                                 tasks_r = (create.get("data") or {}).get("tasks") or []
                                 if not tasks_r: raise RuntimeError("Không có TTS task")
                                 tid, tok = tasks_r[0]["id"], tasks_r[0]["token"]
+                                self.progress_signal.emit(f"[{idx+1}] Dòng {i+1}: task_id={tid}")
+
                                 url = None
-                                for _ in range(120): # Tăng số lần thử nghiệm lên 120
-                                    time.sleep(0.5)  # Rút ngắn thời gian chờ xuống 0.5 giây
+                                st = ""
+                                for _poll_attempt in range(60):
+                                    time.sleep(2)  # y hệt tool cũ (2s/lần) để so sánh công bằng
                                     q = client.query_tts_task(tid, tok)
                                     qt = (q.get("data") or {}).get("tasks") or []
                                     if not qt: continue
-                                    st = qt[0].get("status","")
+                                    st = qt[0].get("status", "")
+                                    prog = qt[0].get("progress", 0)
+                                    self.progress_signal.emit(f"[{idx+1}] Dòng {i+1}: Poll {_poll_attempt+1} | status={st!r} | progress={prog}%")
                                     if st in SUCCEED:
-                                        raw = qt[0].get("payload","{}")
-                                        pl = json.loads(raw) if isinstance(raw,str) else raw
+                                        raw = qt[0].get("payload", "{}")
+                                        pl = json.loads(raw) if isinstance(raw, str) else raw
                                         subs2 = pl.get("audio_subtitles") or []
-                                        if subs2: url = subs2[0].get("speech_url","")
+                                        if subs2:
+                                            url = subs2[0].get("speech_url", "")
+                                            if url: break
+                                        for k in ("audio_list", "url_list"):
+                                            for u in (pl.get(k) or []):
+                                                url = (u.get("url") or u.get("audio_url") or u.get("speech_url")) if isinstance(u, dict) else str(u)
+                                                if url: break
+                                            if url: break
                                         if not url:
-                                            for k in ("audio_list","url_list"):
-                                                for u in (pl.get(k) or []):
-                                                    url = (u.get("url") or u.get("speech_url")) if isinstance(u,dict) else str(u)
-                                                    if url: break
-                                            break
-                                    elif st in FAIL: raise RuntimeError(f"TTS fail: {st}")
-                                if not url: raise RuntimeError("Timeout TTS")
+                                            raise RuntimeError("Task succeed nhưng không tìm thấy URL")
+                                        break
+                                    elif st in FAIL:
+                                        raise RuntimeError(f"TTS fail: {st}")
+                                if not url:
+                                    raise RuntimeError(f"Timeout 120s. Status cuối: {st!r}")
                                 urllib.request.urlretrieve(url, seg_path)
 
                             try:
@@ -1499,7 +1855,16 @@ class DubThread(QThread):
                     self.progress_signal.emit(f"[{idx+1}] ❌ Dòng {i+1} lỗi sau 3 lần: {last_err}")
                     return (i, start_ms, None)
                 
-                luong_tts = getattr(self, "tts_workers", 4)
+                # Edge TTS: dùng đúng số luồng khách chỉnh ở ô "Luồng" (miễn phí,
+                # ít giới hạn). CapCut: LUÔN khóa cứng 4 luồng bất kể khách chỉnh
+                # gì trong ô "Luồng" - CapCut có giới hạn API riêng, tăng luồng
+                # cao dễ bị lỗi/limit tài khoản.
+                # Cả Edge TTS lẫn CapCut đều dùng chung số luồng khách chỉnh ở
+                # ô "Luồng". Trước đây CapCut bị khóa cứng 4 luồng để an toàn,
+                # nhưng thực tế tool CapCut TTS/STT gốc chạy nhiều luồng hơn
+                # vẫn ổn định và nhanh hơn hẳn - bỏ khóa cứng, để khách tự
+                # điều chỉnh theo tài khoản/giới hạn API thực tế của họ.
+                luong_tts = self.tts_workers
                 done_cnt = 0
                 segments_to_mix = [] 
                 
@@ -1514,9 +1879,8 @@ class DubThread(QThread):
                             segments_to_mix.append((start_ms, seg))
                         self.progress_signal.emit(f"[{idx+1}] 🔊 {done_cnt}/{len(entries)} dòng")
 
-                if self._stop: break
-                
-                # --- PHÉP NỐI CHUẨN XÁC VÀ AN TOÀN NHẤT ---
+                if self._stop:
+                    return None
                 segments_to_mix.sort(key=lambda x: x[0])
                 for start_ms, seg in segments_to_mix:
                     if self._stop: break
@@ -1537,8 +1901,9 @@ class DubThread(QThread):
                 # Bơm nốt khoảng lặng cho đủ độ dài video
                 if current_pos < total_ms:
                     combined += AudioSegment.silent(duration=(total_ms - current_pos))
-    
-                    if self._stop: break
+
+                if self._stop:
+                    return None
 
                 dub_audio = os.path.join(temp_dir, "dub_final.mp3")
                 combined.export(dub_audio, format="mp3")
@@ -1552,108 +1917,118 @@ class DubThread(QThread):
                     si.dwFlags |= _sp.STARTF_USESHOWWINDOW
 
                 # --- TÁCH NHẠC NỀN AN TOÀN BẰNG SUBPROCESS DEMUCS ---------------
-                vocals_audio = None 
+                vocals_audio = None
                 if getattr(self, "remove_bgm", False):
-                    try:
-                        self.progress_signal.emit(f"[{idx+1}] 🎵 Đang tách thoại gốc bằng Demucs (Tiến trình độc lập)...")
-                        
-                        raw_wav = os.path.join(temp_dir, "orig_audio.wav")
-                        _sp.run(
-                            [ffmpeg, "-y", "-i", video_path, "-vn",
-                             "-acodec", "pcm_s16le", raw_wav],
-                            startupinfo=si, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
-                        )
-
-                        demucs_out = os.path.join(temp_dir, "demucs_out")
-                        # Dùng mdx_extra (KHÔNG có hậu tố _q) vì bản _q cần gói "diffq"
-                        # để giải nén weights, mà diffq không có wheel cho Python 3.11 trên
-                        # Windows -> pip phải tự biên dịch, cần Visual Studio Build Tools.
-                        # mdx_extra chất lượng tương đương, không cần diffq gì cả.
-                        model_name = "mdx_extra"
-                        _demucs_py = _resolve_demucs_python()
-                        stem_name = os.path.splitext(os.path.basename(raw_wav))[0]
-                        vocals_path = os.path.join(demucs_out, model_name, stem_name, "vocals.wav")
-
-                        # Danh sách thiết bị sẽ thử theo thứ tự. Nếu khách muốn GPU và
-                        # máy đã detect có card thật -> thử "cuda" trước, LỖI thì TỰ RỚT
-                        # về "cpu" (fallback thật sự, không crash). Máy không GPU -> chỉ chạy CPU.
-                        _want_gpu = getattr(self, "use_gpu", False) and getattr(self, "_has_real_gpu", False)
-                        _device_chain = (["cuda", "cpu"] if _want_gpu else ["cpu"])
-
-                        vocals_audio = None
-                        _last_err = ""
-                        for _device in _device_chain:
-                            env = os.environ.copy()
-                            env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-                            if _device == "cuda":
-                                env.pop("CUDA_VISIBLE_DEVICES", None)
-                                _dev_label = "GPU"
-                            else:
-                                # ép torch không thấy GPU + giới hạn luồng CPU cho an toàn máy khách
-                                env["CUDA_VISIBLE_DEVICES"] = "-1"
-                                _n_threads = str(max(1, int(os.cpu_count() * 0.3)))
-                                env["OMP_NUM_THREADS"] = _n_threads
-                                env["MKL_NUM_THREADS"] = _n_threads
-                                env["NUMEXPR_NUM_THREADS"] = _n_threads
-                                env["OPENBLAS_NUM_THREADS"] = _n_threads
-                                _dev_label = "CPU (30% Công suất - An toàn)"
-
-                            if _device == "cuda":
-                                self.progress_signal.emit(f"[{idx+1}] 🚀 Đang thử tách bằng GPU...")
-
-                            cmd_demucs = [
-                                _demucs_py, "-m", "demucs.separate",
-                                "-n", model_name,
-                                "--two-stems", "vocals",
-                                "-d", _device,
-                                "--out", demucs_out,
-                                raw_wav
-                            ]
-                            res_d = _sp.run(cmd_demucs, env=env, startupinfo=si,
-                                            stdout=_sp.PIPE, stderr=_sp.PIPE)
-
-                            if res_d.returncode == 0 and os.path.exists(vocals_path):
-                                vocals_audio = vocals_path
-                                self.progress_signal.emit(f"[{idx+1}] ✅ Tách thoại xong! ({_dev_label})")
-                                break
-                            else:
-                                _last_err = res_d.stderr.decode("utf-8", errors="ignore")[-200:]
-                                if _device == "cuda":
-                                    # GPU lỗi (hết VRAM, driver cũ, torch không thấy cuda...) -> báo & rớt về CPU
-                                    self.progress_signal.emit(
-                                        f"[{idx+1}] ⚠️ GPU tách lỗi, tự chuyển sang CPU..."
-                                    )
-                                # xóa output dở của lần GPU để lần CPU chạy sạch
-                                try:
-                                    if os.path.isdir(demucs_out):
-                                        import shutil as _shutil
-                                        _shutil.rmtree(demucs_out, ignore_errors=True)
-                                except Exception:
-                                    pass
-
-                        if not vocals_audio:
-                            raise RuntimeError(_last_err or "Không tạo được vocals.wav")
-                    except ImportError:
-                        self.progress_signal.emit(f"[{idx+1}] ⚠️ Chưa cài demucs! Bỏ qua tách nhạc.")
-                    except Exception as bgm_e:
-                        import traceback
-                        full_err = traceback.format_exc()
-                        # Log full lỗi ra file để debug
+                    _cache_path = _get_vocals_cache_path(video_path)
+                    if os.path.exists(_cache_path):
+                        # Đã có sẵn từ BgmPrecomputeThread (tách ngầm song song
+                        # lúc đang dịch) -> dùng luôn, khỏi tách lại từ đầu,
+                        # tiết kiệm gần như toàn bộ thời gian chờ Demucs ở đây.
+                        vocals_audio = _cache_path
+                        _vocals_from_cache = True
+                        self.progress_signal.emit(f"[{idx+1}] ⚡ Dùng vocals đã tách sẵn (cache), bỏ qua bước tách...")
+                    else:
+                      with _GLOBAL_DEMUCS_GATE:  # khóa GPU dùng chung toàn app, tránh mọi nơi tranh chấp GPU cùng lúc
                         try:
-                            log_path = os.path.join(
-                                os.environ.get("APPDATA", os.path.expanduser("~")),
-                                "AnhStudio", "demucs_error.log"
+                            self.progress_signal.emit(f"[{idx+1}] 🎵 Đang tách thoại gốc bằng Demucs (Tiến trình độc lập)...")
+                        
+                            raw_wav = os.path.join(temp_dir, "orig_audio.wav")
+                            _sp.run(
+                                [ffmpeg, "-y", "-i", video_path, "-vn",
+                                 "-acodec", "pcm_s16le", raw_wav],
+                                startupinfo=si, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
                             )
-                            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-                            with open(log_path, "w", encoding="utf-8") as _lf:
-                                _lf.write(full_err)
-                        except Exception:
-                            pass
-                        short = str(bgm_e)[:200]
-                        self.progress_signal.emit(
-                            f"[{idx+1}] ⚠️ Lỗi Demucs: {short}\n"
-                            r"  Chi tiết lỗi đã lưu tại: AppData\Roaming\AnhStudio\demucs_error.log"
-                        )
+
+                            demucs_out = os.path.join(temp_dir, "demucs_out")
+                            # Dùng mdx_extra (KHÔNG có hậu tố _q) vì bản _q cần gói "diffq"
+                            # để giải nén weights, mà diffq không có wheel cho Python 3.11 trên
+                            # Windows -> pip phải tự biên dịch, cần Visual Studio Build Tools.
+                            # mdx_extra chất lượng tương đương, không cần diffq gì cả.
+                            model_name = "mdx_extra"
+                            _demucs_py = _resolve_demucs_python()
+                            stem_name = os.path.splitext(os.path.basename(raw_wav))[0]
+                            vocals_path = os.path.join(demucs_out, model_name, stem_name, "vocals.wav")
+
+                            # Danh sách thiết bị sẽ thử theo thứ tự. Nếu khách muốn GPU và
+                            # máy đã detect có card thật -> thử "cuda" trước, LỖI thì TỰ RỚT
+                            # về "cpu" (fallback thật sự, không crash). Máy không GPU -> chỉ chạy CPU.
+                            _want_gpu = getattr(self, "use_gpu", False) and getattr(self, "_has_real_gpu", False)
+                            _device_chain = (["cuda", "cpu"] if _want_gpu else ["cpu"])
+
+                            vocals_audio = None
+                            _last_err = ""
+                            for _device in _device_chain:
+                                env = _clean_subprocess_env(_demucs_py)  # tránh xung đột DLL với app Nuitka
+                                env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+                                if _device == "cuda":
+                                    env.pop("CUDA_VISIBLE_DEVICES", None)
+                                    _dev_label = "GPU"
+                                else:
+                                    # ép torch không thấy GPU + giới hạn luồng CPU cho an toàn máy khách
+                                    env["CUDA_VISIBLE_DEVICES"] = "-1"
+                                    _n_threads = str(max(1, int(os.cpu_count() * 0.3)))
+                                    env["OMP_NUM_THREADS"] = _n_threads
+                                    env["MKL_NUM_THREADS"] = _n_threads
+                                    env["NUMEXPR_NUM_THREADS"] = _n_threads
+                                    env["OPENBLAS_NUM_THREADS"] = _n_threads
+                                    _dev_label = "CPU (30% Công suất - An toàn)"
+
+                                if _device == "cuda":
+                                    self.progress_signal.emit(f"[{idx+1}] 🚀 Đang thử tách bằng GPU...")
+
+                                cmd_demucs = [
+                                    _demucs_py, "-m", "demucs.separate",
+                                    "-n", model_name,
+                                    "--two-stems", "vocals",
+                                    "-d", _device,
+                                    "--out", demucs_out,
+                                    raw_wav
+                                ]
+                                res_d = _sp.run(cmd_demucs, env=env, startupinfo=si,
+                                                stdout=_sp.PIPE, stderr=_sp.PIPE)
+
+                                if res_d.returncode == 0 and os.path.exists(vocals_path):
+                                    vocals_audio = vocals_path
+                                    self.progress_signal.emit(f"[{idx+1}] ✅ Tách thoại xong! ({_dev_label})")
+                                    break
+                                else:
+                                    _last_err = res_d.stderr.decode("utf-8", errors="ignore")[-200:]
+                                    if _device == "cuda":
+                                        # GPU lỗi (hết VRAM, driver cũ, torch không thấy cuda...) -> báo & rớt về CPU
+                                        self.progress_signal.emit(
+                                            f"[{idx+1}] ⚠️ GPU tách lỗi, tự chuyển sang CPU..."
+                                        )
+                                    # xóa output dở của lần GPU để lần CPU chạy sạch
+                                    try:
+                                        if os.path.isdir(demucs_out):
+                                            import shutil as _shutil
+                                            _shutil.rmtree(demucs_out, ignore_errors=True)
+                                    except Exception:
+                                        pass
+
+                            if not vocals_audio:
+                                raise RuntimeError(_last_err or "Không tạo được vocals.wav")
+                        except ImportError:
+                            self.progress_signal.emit(f"[{idx+1}] ⚠️ Chưa cài demucs! Bỏ qua tách nhạc.")
+                        except Exception as bgm_e:
+                            import traceback
+                            full_err = traceback.format_exc()
+                            # Log full lỗi ra file để debug
+                            try:
+                                log_path = os.path.join(
+                                    os.environ.get("APPDATA", os.path.expanduser("~")),
+                                    "AnhStudio", "demucs_error.log"
+                                )
+                                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                                with open(log_path, "w", encoding="utf-8") as _lf:
+                                    _lf.write(full_err)
+                            except Exception:
+                                pass
+                            short = str(bgm_e)[:200]
+                            self.progress_signal.emit(
+                                f"[{idx+1}] ⚠️ Lỗi Demucs: {short}\n"
+                                r"  Chi tiết lỗi đã lưu tại: AppData\Roaming\AnhStudio\demucs_error.log"
+                            )
 
                 # ── MIX & GHÉP VÀO VIDEO ──────────────────────────────────────
                 if vocals_audio:
@@ -1725,14 +2100,50 @@ class DubThread(QThread):
                         raise RuntimeError(f"ffmpeg ghép lồng tiếng lỗi: {err}")
 
                 self.progress_signal.emit(f"[{idx+1}] ✅ Xong! → {os.path.basename(out_video)}")
-                ok += 1
+                return True
 
             except Exception as e:
                 self.progress_signal.emit(f"[{idx+1}] ❌ Lỗi {bname}: {str(e)[:120]}")
-                failed += 1
+                return False
             finally:
                 try: shutil.rmtree(temp_dir)
                 except: pass
+                # Dọn file cache vocals đã dùng xong (dù thành công hay lỗi),
+                # tránh để rác .vocals_cache.wav nằm lại cạnh video mãi mãi.
+                if _vocals_from_cache:
+                    try:
+                        _cp = _get_vocals_cache_path(video_path)
+                        if os.path.exists(_cp): os.remove(_cp)
+                    except Exception:
+                        pass
+
+        # ── ĐIỀU PHỐI: Edge TTS chạy TUẦN TỰ từng video (bản thân nó đã đa
+        # luồng ở mức từng câu thoại rồi, không cần thêm lớp song song ở đây).
+        # CapCut chạy SONG SONG NHIỀU VIDEO cùng lúc (mặc định 4) để tăng tốc
+        # tổng thể, vì mỗi video chỉ dùng 4 luồng/segment (khóa cứng phía trên)
+        # -> gộp lại vẫn nằm trong giới hạn an toàn cho API CapCut.
+        is_neural_outer = "Neural" in self.voice_type
+
+        def _tally(result):
+            nonlocal ok, failed
+            if result is None:
+                return  # bị hủy giữa chừng, không tính
+            with ok_lock:
+                if result: ok += 1
+                else: failed += 1
+
+        if is_neural_outer:
+            for idx, task in enumerate(self.tasks):
+                if self._stop:
+                    self.progress_signal.emit("🛑 Đã dừng."); break
+                _tally(_process_one_task(idx, task))
+        else:
+            VIDEO_PARALLEL_CAPCUT = 4
+            with ThreadPoolExecutor(max_workers=VIDEO_PARALLEL_CAPCUT) as vid_ex:
+                futs = {vid_ex.submit(_process_one_task, idx, task): idx
+                        for idx, task in enumerate(self.tasks)}
+                for fut in as_completed(futs):
+                    _tally(fut.result())
 
         self.finished_signal.emit(ok, failed)
 
@@ -2484,14 +2895,18 @@ class HonggouWidget(QWidget):
         """)
         stt_ctrl.addWidget(self.chk_auto_stt)
 
-        stt_ctrl.addWidget(QLabel("  Tiếng gốc:"))
+        lbl_stt_src = QLabel("  Tiếng gốc:")
+        lbl_stt_src.setStyleSheet("color: #e2e8f0; font-weight: bold;")
+        stt_ctrl.addWidget(lbl_stt_src)
         self.cmb_stt_src = QComboBox()
         self.cmb_stt_src.addItems(["zh-CN","en-US","vi-VN","ja-JP","ko-KR","fr-FR"])
         self.cmb_stt_src.setToolTip("Ngôn ngữ gốc trong phim")
         self.cmb_stt_src.setStyleSheet("QComboBox { background:#1f2937; color:#f8fafc; border:1px solid #374151; border-radius:6px; padding:4px 8px; } QComboBox QAbstractItemView { background:#1e293b; color:#f8fafc; }")
         stt_ctrl.addWidget(self.cmb_stt_src)
 
-        stt_ctrl.addWidget(QLabel("→ Dịch sang:"))
+        lbl_stt_out = QLabel("→ Dịch sang:")
+        lbl_stt_out.setStyleSheet("color: #e2e8f0; font-weight: bold;")
+        stt_ctrl.addWidget(lbl_stt_out)
         self.cmb_stt_out = QComboBox()
         self.cmb_stt_out.addItems(["vi-VN","en-US","zh-CN","ja-JP","ko-KR"])
         self.cmb_stt_out.setToolTip("Ngôn ngữ phụ đề cần dịch sang")
@@ -2540,7 +2955,8 @@ class HonggouWidget(QWidget):
         stt_ctrl.addStretch()
         detail_layout.addLayout(stt_ctrl)
 
-        dub_ctrl = QHBoxLayout(); dub_ctrl.setSpacing(8)
+        dub_ctrl = QHBoxLayout(); dub_ctrl.setSpacing(8)  # HÀNG 1: control cốt lõi
+        dub_ctrl2 = QHBoxLayout(); dub_ctrl2.setSpacing(8)  # HÀNG 2: tinh chỉnh âm thanh
         self.chk_auto_dub = QCheckBox("🎙 Lồng tiếng sau khi tách sub")
         self.chk_auto_dub.setStyleSheet("""
             QCheckBox { color: #fde68a; font-size: 12px; padding: 4px; font-weight: bold; }
@@ -2550,14 +2966,18 @@ class HonggouWidget(QWidget):
         """)
         dub_ctrl.addWidget(self.chk_auto_dub)
 
-        dub_ctrl.addWidget(QLabel("  Giọng:"))
+        lbl_giong = QLabel("  Giọng:")
+        lbl_giong.setStyleSheet("color: #fde68a; font-weight: bold;")
+        dub_ctrl.addWidget(lbl_giong)
         self.cmb_dub_voice = QComboBox()
         self._load_dub_voices()
         self.cmb_dub_voice.setToolTip("Giọng lồng tiếng (đọc từ Voice.json)")
         self.cmb_dub_voice.setStyleSheet("QComboBox { background:#1f2937; color:#fde68a; border:1px solid #f59e0b; border-radius:6px; padding:4px 8px; } QComboBox QAbstractItemView { background:#1e293b; color:#fde68a; }")
         dub_ctrl.addWidget(self.cmb_dub_voice)
 
-        dub_ctrl.addWidget(QLabel("Tốc độ:"))
+        lbl_toc_do = QLabel("Tốc độ:")
+        lbl_toc_do.setStyleSheet("color: #fde68a; font-weight: bold;")
+        dub_ctrl.addWidget(lbl_toc_do)
         self.spn_dub_rate = QDoubleSpinBox()
         self.spn_dub_rate.setRange(0.5, 2.0); self.spn_dub_rate.setSingleStep(0.1)
         self.spn_dub_rate.setValue(1.0); self.spn_dub_rate.setDecimals(1)
@@ -2565,7 +2985,47 @@ class HonggouWidget(QWidget):
         self.spn_dub_rate.setStyleSheet("QDoubleSpinBox { background:#1f2937; color:#fde68a; border:1px solid #f59e0b; border-radius:6px; padding:3px; }")
         dub_ctrl.addWidget(self.spn_dub_rate)
 
-        dub_ctrl.addWidget(QLabel("🔊 Tiếng gốc:"))
+        lbl_luong = QLabel("Luồng:")
+        lbl_luong.setStyleSheet("color: #fde68a; font-weight: bold;")
+        dub_ctrl.addWidget(lbl_luong)
+        self.spn_tts_workers = QSpinBox()
+        # Edge TTS chịu được nhiều luồng song song hơn CapCut (giới hạn API riêng),
+        # nhưng để 1 ô chung cho gọn - khách tự cân chỉnh theo engine đang chọn.
+        self.spn_tts_workers.setRange(1, 100)
+        self.spn_tts_workers.setSingleStep(5)
+        try:
+            _saved_workers = int(self.settings.value("tts_workers", 10))
+        except Exception:
+            _saved_workers = 10
+        self.spn_tts_workers.setValue(_saved_workers)
+        self.spn_tts_workers.setFixedWidth(65)
+        self.spn_tts_workers.setToolTip(
+            "Số luồng lồng tiếng chạy song song.\n"
+            "Edge TTS: có thể để cao (20-50) vì miễn phí, ít giới hạn.\n"
+            "CapCut: nên để thấp (4-10) để tránh lỗi giới hạn API."
+        )
+        self.spn_tts_workers.setStyleSheet("QSpinBox { background:#1f2937; color:#fde68a; border:1px solid #f59e0b; border-radius:6px; padding:3px; }")
+        self.spn_tts_workers.valueChanged.connect(
+            lambda v: self.settings.setValue("tts_workers", v)
+        )
+        dub_ctrl.addWidget(self.spn_tts_workers)
+
+        # Ô "Luồng" CHỈ áp dụng cho Edge TTS - giọng CapCut luôn khóa cứng 4
+        # luồng trong code, nên làm mờ ô này khi khách chọn giọng CapCut để
+        # tránh hiểu nhầm là chỉnh được cho cả CapCut.
+        self.cmb_dub_voice.currentTextChanged.connect(self._on_dub_voice_changed)
+        self._on_dub_voice_changed(self.cmb_dub_voice.currentText())
+
+        self.btn_dub_now = QPushButton("🎙 Lồng tiếng ngay")
+        self.btn_dub_now.setEnabled(False)
+        self.btn_dub_now.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_dub_now.setStyleSheet("QPushButton { padding: 8px 18px; background-color: #b45309; color: white; border-radius: 8px; font-weight: bold; font-size: 13px; border: none; } QPushButton:hover { background-color: #92400e; } QPushButton:disabled { background-color: #374151; color: #64748b; }")
+        self.btn_dub_now.clicked.connect(self._run_dub_on_downloaded)
+        dub_ctrl.addWidget(self.btn_dub_now)
+
+        lbl_tieng_goc2 = QLabel("🔊 Tiếng gốc:")
+        lbl_tieng_goc2.setStyleSheet("color: #fde68a; font-weight: bold;")
+        dub_ctrl2.addWidget(lbl_tieng_goc2)
         self.spn_orig_volume = QSpinBox()
         self.spn_orig_volume.setRange(0, 100)
         self.spn_orig_volume.setSingleStep(5)
@@ -2579,7 +3039,7 @@ class HonggouWidget(QWidget):
             "• 0% = gần như câm tiếng gốc\n"
             "(Không ảnh hưởng khi ghép video thường hoặc khi đã tick 'Tắt tiếng gốc'.)")
         self.spn_orig_volume.setStyleSheet("QSpinBox { background:#1f2937; color:#fde68a; border:1px solid #f59e0b; border-radius:6px; padding:3px; }")
-        dub_ctrl.addWidget(self.spn_orig_volume)
+        dub_ctrl2.addWidget(self.spn_orig_volume)
 
         self.chk_mute_original = QCheckBox("🔇 Tắt tiếng gốc")
         self.chk_mute_original.setChecked(True)
@@ -2589,7 +3049,7 @@ class HonggouWidget(QWidget):
             QCheckBox::indicator { width:18px; height:18px; border:2px solid #f59e0b; border-radius:4px; background:#1f2937; }
             QCheckBox::indicator:checked { background:#f59e0b; }
         """)
-        dub_ctrl.addWidget(self.chk_mute_original)
+        dub_ctrl2.addWidget(self.chk_mute_original)
 
         self.chk_remove_bgm = QCheckBox("🎵 Tách nhạc nền")
         self.chk_remove_bgm.setChecked(False)
@@ -2606,7 +3066,31 @@ class HonggouWidget(QWidget):
             QCheckBox::indicator:checked { background: #10b981; }
         """)
         self.chk_remove_bgm.stateChanged.connect(self._on_chk_remove_bgm_changed)
-        dub_ctrl.addWidget(self.chk_remove_bgm)
+        dub_ctrl2.addWidget(self.chk_remove_bgm)
+
+        lbl_tach_ss = QLabel("Tách song song:")
+        lbl_tach_ss.setStyleSheet("color: #6ee7b7; font-weight: bold;")
+        dub_ctrl2.addWidget(lbl_tach_ss)
+        self.spn_bgm_parallel = QSpinBox()
+        self.spn_bgm_parallel.setRange(1, 5)
+        try:
+            _saved_bgm_parallel = int(self.settings.value("bgm_parallel", 1))
+        except Exception:
+            _saved_bgm_parallel = 1
+        self.spn_bgm_parallel.setValue(max(1, min(5, _saved_bgm_parallel)))
+        _GLOBAL_DEMUCS_GATE.limit = self.spn_bgm_parallel.value()
+        self.spn_bgm_parallel.setFixedWidth(50)
+        self.spn_bgm_parallel.setToolTip(
+            "Số video tách nhạc nền (Demucs) chạy song song cùng lúc.\n"
+            "1 = an toàn nhất (mặc định).\n"
+            "⚠️ Chọn cao hơn với GPU có thể tràn VRAM tùy máy - tự cân nhắc theo cấu hình card."
+        )
+        self.spn_bgm_parallel.setStyleSheet("QSpinBox { background:#1f2937; color:#6ee7b7; border:1px solid #10b981; border-radius:6px; padding:3px; }")
+        def _on_bgm_parallel_changed(v):
+            _GLOBAL_DEMUCS_GATE.limit = v
+            self.settings.setValue("bgm_parallel", v)
+        self.spn_bgm_parallel.valueChanged.connect(_on_bgm_parallel_changed)
+        dub_ctrl2.addWidget(self.spn_bgm_parallel)
 
         self.chk_del_original = QCheckBox("🗑 Xóa file gốc")
         self.chk_del_original.setChecked(False) 
@@ -2616,16 +3100,12 @@ class HonggouWidget(QWidget):
             QCheckBox::indicator { width:18px; height:18px; border:2px solid #ef4444; border-radius:4px; background:#1f2937; }
             QCheckBox::indicator:checked { background:#ef4444; }
         """)
-        dub_ctrl.addWidget(self.chk_del_original)
+        dub_ctrl2.addWidget(self.chk_del_original)
+        dub_ctrl2.addStretch()
 
-        self.btn_dub_now = QPushButton("🎙 Lồng tiếng ngay")
-        self.btn_dub_now.setEnabled(False)
-        self.btn_dub_now.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_dub_now.setStyleSheet("QPushButton { padding: 8px 18px; background-color: #b45309; color: white; border-radius: 8px; font-weight: bold; font-size: 13px; border: none; } QPushButton:hover { background-color: #92400e; } QPushButton:disabled { background-color: #374151; color: #64748b; }")
-        self.btn_dub_now.clicked.connect(self._run_dub_on_downloaded)
-        dub_ctrl.addWidget(self.btn_dub_now)
         dub_ctrl.addStretch()
         detail_layout.addLayout(dub_ctrl)
+        detail_layout.addLayout(dub_ctrl2)
 
         # ── HÀNG TÁCH NHẠC NỀN ĐỘC LẬP ─────────────────────────────
         bgm_ctrl = QHBoxLayout(); bgm_ctrl.setSpacing(8)
@@ -2833,9 +3313,8 @@ class HonggouWidget(QWidget):
             self._has_real_gpu = False
             self._gpu_name = ""
             self._gpu_vram_gb = 0.0
+            _debug_info = ""
             try:
-                env = os.environ.copy()
-                env.pop("CUDA_VISIBLE_DEVICES", None)
                 probe = (
                     "import torch\n"
                     "if torch.cuda.is_available():\n"
@@ -2850,6 +3329,7 @@ class HonggouWidget(QWidget):
                 # _resolve_demucs_python() vì nó luôn xác minh file thật tồn tại,
                 # không tin mù quáng vào việc import demucs_manager có OK hay không.
                 _probe_py = _resolve_demucs_python()
+                env = _clean_subprocess_env(_probe_py)  # tránh xung đột DLL với app Nuitka
                 cmd = [_probe_py, "-c", probe]
                 si = None
                 if sys.platform == "win32":
@@ -2862,8 +3342,29 @@ class HonggouWidget(QWidget):
                     self._has_real_gpu = True
                     self._gpu_name = parts[1]
                     self._gpu_vram_gb = float(parts[2])
-            except Exception:
-                pass
+                else:
+                    # Không detect được GPU -> ghi lại đầy đủ để debug, không
+                    # phải đoán mò lần sau. stderr chứa traceback Python thật
+                    # nếu import torch bị lỗi (vd xung đột DLL, thiếu module...).
+                    _debug_info = (
+                        f"probe_py: {_probe_py}\n"
+                        f"returncode: {res.returncode}\n"
+                        f"stdout: {res.stdout!r}\n"
+                        f"stderr: {res.stderr[-2000:]!r}\n"
+                    )
+            except Exception as e:
+                _debug_info = f"Exception khi detect GPU: {e}\n"
+
+            if _debug_info:
+                try:
+                    appdata = os.getenv('APPDATA', '')
+                    if appdata:
+                        log_path = os.path.join(appdata, 'AnhStudio', 'gpu_detect_debug.log')
+                        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                        with open(log_path, 'w', encoding='utf-8') as f:
+                            f.write(_debug_info)
+                except Exception:
+                    pass
 
             # GPU "xịn" = có CUDA thật SỰ + đủ VRAM. GPU yếu (VRAM thấp) coi như
             # không đạt, để tránh out-of-memory / quá tải khi chạy Demucs trên máy khách.
@@ -3640,6 +4141,34 @@ class HonggouWidget(QWidget):
         try: os.startfile(folder)
         except Exception as e: QMessageBox.warning(self, "Lỗi", f"Không mở được thư mục: {e}")
 
+    def _detect_image_ext(self, content_type, content):
+        """Xác định đúng đuôi file ảnh dựa vào Content-Type thật + magic bytes,
+        KHÔNG đoán mò theo URL (URL có thể không có đuôi rõ ràng hoặc sai)."""
+        ct = (content_type or '').lower()
+        if 'png' in ct: return '.png'
+        if 'webp' in ct: return '.webp'
+        if 'gif' in ct: return '.gif'
+        if 'jpeg' in ct or 'jpg' in ct: return '.jpg'
+        if content[:8] == b'\x89PNG\r\n\x1a\n': return '.png'
+        if content[:4] == b'RIFF' and content[8:12] == b'WEBP': return '.webp'
+        if content[:6] in (b'GIF87a', b'GIF89a'): return '.gif'
+        if content[:3] == b'\xff\xd8\xff': return '.jpg'
+        return '.jpg'  # fallback cuối cùng
+
+    def _looks_like_video(self, content_type, content):
+        """Một số web phim (VD hongguoduanju) dùng 'bìa động' dạng video ngắn
+        thay vì ảnh tĩnh cho series_cover. Phát hiện qua Content-Type thật
+        hoặc magic bytes container video (mp4/mov/webm), không tin đuôi URL."""
+        ct = (content_type or '').lower()
+        if ct.startswith('video/'):
+            return True
+        if len(content) > 12:
+            if content[4:8] == b'ftyp':            # MP4 / MOV container
+                return True
+            if content[:4] == b'\x1a\x45\xdf\xa3':   # WebM / Matroska
+                return True
+        return False
+
     def _save_cover_image(self, silent=False):
         cover_url = (getattr(self, 'current_cover_url', '') or '').strip()
         if not cover_url:
@@ -3655,19 +4184,52 @@ class HonggouWidget(QWidget):
         os.makedirs(folder, exist_ok=True)
 
         safe_title = re.sub(r'[\\/:*?"<>|]', '_', getattr(self, 'current_title', '') or 'poster').strip() or 'poster'
-        ext = os.path.splitext(cover_url.split('?')[0])[1]
-        if not ext or len(ext) > 5:
-            ext = '.jpg'
-        dest_path = os.path.join(folder, f"{safe_title}{ext}")
 
-        if silent and os.path.exists(dest_path):
-            return  # Đã có sẵn, khỏi tải lại
+        # KHÔNG đoán đuôi file từ chuỗi URL (dễ sai nếu URL không có đuôi rõ
+        # ràng hoặc dùng link ký số phức tạp) - tải về trước, rồi xác định
+        # đúng định dạng THẬT dựa vào Content-Type / magic bytes của dữ liệu
+        # tải được, tránh lưu nhầm .jpg cho ảnh WEBP/PNG/... hoặc video khác.
+        if silent:
+            for _ext_check in ('.jpg', '.jpeg', '.png', '.webp', '.gif'):
+                if os.path.exists(os.path.join(folder, f"{safe_title}{_ext_check}")):
+                    return  # Đã có sẵn, khỏi tải lại
 
         try:
             resp = requests.get(cover_url, timeout=15)
             resp.raise_for_status()
-            with open(dest_path, 'wb') as f:
-                f.write(resp.content)
+            content = resp.content
+            content_type = resp.headers.get('Content-Type', '')
+
+            if self._looks_like_video(content_type, content):
+                # "Bìa động" dạng video (VD MP4 ngắn) chứ không phải ảnh tĩnh
+                # - trích 1 khung hình bằng ffmpeg làm ảnh bìa TĨNH thật, đúng
+                # ý người dùng ("tải ảnh bìa" chứ không phải tải video).
+                import tempfile as _tempfile, subprocess as _subprocess
+                tmp_video = os.path.join(_tempfile.gettempdir(), f"_cover_tmp_{int(time.time())}.mp4")
+                with open(tmp_video, 'wb') as f:
+                    f.write(content)
+
+                dest_path = os.path.join(folder, f"{safe_title}.jpg")
+                ffmpeg = get_ffmpeg_path()
+                si = None
+                if sys.platform == "win32":
+                    si = _subprocess.STARTUPINFO()
+                    si.dwFlags |= _subprocess.STARTF_USESHOWWINDOW
+                _subprocess.run(
+                    [ffmpeg, "-y", "-i", tmp_video, "-vframes", "1", "-q:v", "2", dest_path],
+                    startupinfo=si, stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL
+                )
+                try: os.remove(tmp_video)
+                except Exception: pass
+
+                if not os.path.exists(dest_path):
+                    raise RuntimeError("Không trích được khung hình từ bìa động (video).")
+            else:
+                ext = self._detect_image_ext(content_type, content)
+                dest_path = os.path.join(folder, f"{safe_title}{ext}")
+                with open(dest_path, 'wb') as f:
+                    f.write(content)
+
             if not silent:
                 QMessageBox.information(self, "Đã lưu ảnh bìa",
                     f"Đã lưu ảnh bìa vào:\n{dest_path}")
@@ -3705,9 +4267,36 @@ class HonggouWidget(QWidget):
                 "Thanh Niên Tự Tin [BV075_streaming]",
             ]
         self.cmb_dub_voice.addItems(voices)
+        # Thêm giọng Edge TTS (online, miễn phí) - đánh dấu 🌐 để phân biệt
+        # với giọng CapCut phía trên. voice_type lấy trong [] vẫn là
+        # "vi-VN-NamMinhNeural"/"vi-VN-HoaiMyNeural" -> DubThread tự nhận ra
+        # có chữ "Neural" và route sang gọi edge_tts.Communicate.
+        edge_items = [f"🌐 {label} [{vid}]" for label, (vid, _pitch, _rate) in EDGE_TTS_VOICES.items()]
+        self.cmb_dub_voice.addItems(edge_items)
         for i in range(self.cmb_dub_voice.count()):
             if "BV074_streaming]" in self.cmb_dub_voice.itemText(i):
                 self.cmb_dub_voice.setCurrentIndex(i); break
+
+    def _on_dub_voice_changed(self, sel_text):
+        """Ô 'Luồng' áp dụng cho CẢ Edge TTS lẫn CapCut - trước đây CapCut bị
+        khóa cứng 4 luồng, nhưng đã bỏ khóa vì thực tế chạy nhiều luồng hơn
+        vẫn ổn (dựa trên tool CapCut TTS/STT gốc). Chỉ đổi tooltip gợi ý mức
+        an toàn khác nhau tùy loại giọng, không còn khóa/làm mờ ô nữa."""
+        if not hasattr(self, 'spn_tts_workers'):
+            return
+        is_edge = sel_text.startswith("🌐 ")
+        self.spn_tts_workers.setEnabled(True)
+        if is_edge:
+            self.spn_tts_workers.setToolTip(
+                "Số luồng Edge TTS chạy song song (miễn phí, có thể để cao 20-50)."
+            )
+        else:
+            self.spn_tts_workers.setToolTip(
+                "Số luồng CapCut chạy song song (API riêng, có giới hạn theo\n"
+                "tài khoản/thiết bị). Nếu thấy CHẬM HƠN khi tăng luồng, thử\n"
+                "giảm về 1-2 - một số tài khoản CapCut bị nghẽn phía server\n"
+                "khi gửi nhiều request đồng thời, chạy tuần tự lại nhanh hơn."
+            )
 
     def _refresh_balance(self):
         if hasattr(self, 'refresh_stats_signal'): 
@@ -3784,6 +4373,39 @@ class HonggouWidget(QWidget):
 
         self._merge_mode_after = mode
 
+        # Nếu tick "Tách nhạc nền" -> xử lý theo 2 trường hợp:
+        # 1) CÓ tick "Lồng tiếng": tách NGẦM ngay, lưu cache, DubThread dùng
+        #    lại sau (tiết kiệm thời gian chờ Demucs lúc lồng tiếng thật).
+        # 2) KHÔNG tick "Lồng tiếng": không có DubThread nào chạy để dùng
+        #    cache -> tự XUẤT LUÔN video riêng chỉ có giọng gốc, không nhạc
+        #    nền (giống hệt nút "🎵 Tách nhạc nền ngay" thủ công, nhưng chạy
+        #    tự động, và chạy song song nhiều video theo ô "Tách song song").
+        if hasattr(self, 'chk_remove_bgm') and self.chk_remove_bgm.isChecked() and files_to_merge:
+            use_gpu_pre = self.chk_use_gpu.isChecked() if hasattr(self, 'chk_use_gpu') else False
+            will_dub = hasattr(self, 'chk_auto_dub') and self.chk_auto_dub.isChecked()
+
+            if will_dub:
+                self._bgm_precompute_thread = BgmPrecomputeThread(list(files_to_merge), use_gpu=use_gpu_pre)
+                if hasattr(self, 'txt_stt_log'):
+                    self._bgm_precompute_thread.progress_signal.connect(
+                        lambda m: self.txt_stt_log.append(m.strip())
+                    )
+                self._keep_thread_alive(self._bgm_precompute_thread)
+                self._bgm_precompute_thread.start()
+            else:
+                del_orig_bgm = self.chk_bgm_del_original.isChecked() if hasattr(self, 'chk_bgm_del_original') else False
+                self._bgm_standalone_thread = BgmStandaloneThread(
+                    list(files_to_merge), use_gpu=use_gpu_pre, del_original=del_orig_bgm
+                )
+                if hasattr(self, 'txt_stt_log'):
+                    self.txt_stt_log.show()
+                    self.txt_stt_log.append(f"🎵 Không lồng tiếng -> tự xuất {len(files_to_merge)} video không nhạc nền...")
+                    self._bgm_standalone_thread.progress_signal.connect(
+                        lambda m: self.txt_stt_log.append(m.strip())
+                    )
+                self._keep_thread_alive(self._bgm_standalone_thread)
+                self._bgm_standalone_thread.start()
+
         if auto_stt and files_to_merge:
             self.btn_download.setEnabled(True)
             self.btn_download.setText("📥 Tải đã chọn")
@@ -3840,6 +4462,12 @@ class HonggouWidget(QWidget):
         movie_folder = os.path.join(self.save_folder, folder_name)
 
         self._merge_srt_files(merge_tasks, movie_folder, after_dub=after_dub)
+
+        # Lưu lại để dọn dẹp SAU KHI ghép xong thành công (xem _on_merge_finished).
+        # Không dọn ở đây vì lúc này file .mp4 gộp CHƯA tồn tại - dọn sớm sẽ mất
+        # dữ liệu nguồn nếu HonggouMergeThread lỡ lỗi giữa chừng.
+        self._last_merge_tasks = merge_tasks
+        self._last_merge_folder = movie_folder
 
         self.btn_download.setText("⚙️ Đang gộp file...")
 
@@ -3966,10 +4594,58 @@ class HonggouWidget(QWidget):
     def _on_merge_finished(self):
         self.btn_download.setEnabled(True)
         self.btn_download.setText("📥 Tải đã chọn")
+
+        n_cleaned = self._cleanup_after_merge()
+
         self.lbl_status.setText("🎉 Hoàn tất! Đã lồng tiếng và ghép file xong.")
         if hasattr(self, 'lbl_downloaded_badge'): self.lbl_downloaded_badge.show()
         if hasattr(self, 'txt_stt_log'):
             self.txt_stt_log.append("🎉 XONG TOÀN BỘ: tách sub → dịch → lồng tiếng → ghép file!")
+            if n_cleaned:
+                self.txt_stt_log.append(f"🗑 Đã dọn {n_cleaned} file rác, chỉ giữ lại .srt + .mp4 hoàn chỉnh.")
+
+    def _cleanup_after_merge(self):
+        """Dọn sạch mọi file lẻ từng tập (video gốc, *_dubbed.mp4, .srt, _vi.srt,
+        .txt) SAU KHI đã ghép thành công thành 1 file trọn bộ - chỉ chạy nếu
+        checkbox 'Xóa file gốc' đang bật. Chỉ xóa nguồn của những task mà file
+        gộp đầu ra THẬT SỰ đã được tạo ra (an toàn, không mất dữ liệu nếu 1 task
+        trong nhiều task bị lỗi giữa chừng)."""
+        if not (hasattr(self, 'chk_del_original') and self.chk_del_original.isChecked()):
+            return 0
+        tasks = getattr(self, '_last_merge_tasks', None)
+        folder = getattr(self, '_last_merge_folder', None)
+        if not tasks or not folder:
+            return 0
+
+        removed = 0
+        for task in tasks:
+            out_path = os.path.join(folder, task["output_name"])
+            if not os.path.exists(out_path):
+                # File gộp đầu ra chưa có -> task này lỗi/chưa xong, KHÔNG đụng
+                # tới file nguồn của nó để tránh mất dữ liệu.
+                continue
+            for vf in task["files"]:
+                base = os.path.splitext(vf)[0]
+                # Nếu là file *_dubbed.mp4 (trường hợp ghép sau khi lồng tiếng),
+                # bỏ hậu tố "_dubbed" để tìm đúng *_vi.srt / video gốc đi kèm
+                # (đặt tên theo video GỐC, không theo tên file _dubbed).
+                if base.endswith("_dubbed"):
+                    base = base[:-len("_dubbed")]
+                # Xóa đủ mọi file liên quan tới tập này: video gốc, *_dubbed.mp4
+                # (nếu vf khác base+.mp4), sub gốc, sub dịch, .txt - dọn dẹp độc
+                # lập, không phụ thuộc bước xóa trước đó (nếu có) đã chạy hay chưa.
+                targets = {vf, base + ".mp4", base + ".srt", base + "_vi.srt", base + ".txt"}
+                for f in targets:
+                    try:
+                        if os.path.exists(f):
+                            os.remove(f)
+                            removed += 1
+                    except Exception:
+                        pass
+
+        self._last_merge_tasks = None
+        self._last_merge_folder = None
+        return removed
 
     # ─────────────────────────────────────────────────────────────────
     #  STT / TÁCH SUB
@@ -4002,6 +4678,16 @@ class HonggouWidget(QWidget):
             voice_type = sel[sel.rfind("[")+1:-1]
         rate = f"{self.spn_dub_rate.value():.1f}" if hasattr(self, 'spn_dub_rate') else "1.0"
 
+        # Nếu là giọng Edge TTS (có prefix 🌐) -> tra ra pitch riêng của giọng
+        # đó trong EDGE_TTS_VOICES để giọng nghe khác biệt nhau thật sự
+        # (không phải chỉ đổi tên mà âm sắc giống hệt do thiếu pitch).
+        pitch = "+0Hz"
+        if sel.startswith("🌐 "):
+            label = sel[2:sel.rfind("[")].strip()
+            preset = EDGE_TTS_VOICES.get(label)
+            if preset:
+                pitch = preset[1]
+
         self.txt_stt_log.show()
         self.txt_stt_log.append(f"\n🎙 Bắt đầu lồng tiếng {len(tasks)} file | giọng: {voice_type} | rate: {rate}x")
         self.btn_dub_now.setEnabled(False); self.btn_dub_now.setText("⏳ Đang lồng tiếng...")
@@ -4012,7 +4698,8 @@ class HonggouWidget(QWidget):
         remove_bgm = self.chk_remove_bgm.isChecked() if hasattr(self, 'chk_remove_bgm') else False
         use_gpu = self.chk_use_gpu.isChecked() if hasattr(self, 'chk_use_gpu') else False
 
-        self._dub_thread = DubThread(tasks, voice_type=voice_type, rate=rate, mute_original=mute_orig, orig_volume=orig_vol, remove_bgm=remove_bgm, use_gpu=use_gpu)
+        tts_workers = self.spn_tts_workers.value() if hasattr(self, 'spn_tts_workers') else 4
+        self._dub_thread = DubThread(tasks, voice_type=voice_type, rate=rate, pitch=pitch, mute_original=mute_orig, orig_volume=orig_vol, remove_bgm=remove_bgm, use_gpu=use_gpu, tts_workers=tts_workers)
         self._dub_thread.progress_signal.connect(self._on_stt_progress)   
         self._dub_thread.finished_signal.connect(self._on_dub_finished)
         self._keep_thread_alive(self._dub_thread)
@@ -4192,18 +4879,26 @@ class HonggouWidget(QWidget):
             QTimer.singleShot(100, self._pump_dub_queue)
             return
         self._dub_running = True
-        voice_type = self.cmb_dub_voice.currentText()
-        voice_type = voice_type[voice_type.rfind("[")+1:-1] if "[" in voice_type else "BV074_streaming"
+        voice_type_sel = self.cmb_dub_voice.currentText()
+        voice_type = voice_type_sel[voice_type_sel.rfind("[")+1:-1] if "[" in voice_type_sel else "BV074_streaming"
         rate = str(self.spn_dub_rate.value()) if hasattr(self, 'spn_dub_rate') else "1.0"
+        # Tra pitch riêng nếu là giọng Edge TTS - đồng bộ với logic ở _run_dub_on_downloaded
+        pitch = "+0Hz"
+        if voice_type_sel.startswith("🌐 "):
+            _label = voice_type_sel[2:voice_type_sel.rfind("[")].strip()
+            _preset = EDGE_TTS_VOICES.get(_label)
+            if _preset:
+                pitch = _preset[1]
         mute_orig = self.chk_mute_original.isChecked() if hasattr(self, 'chk_mute_original') else True
         orig_vol = self.spn_orig_volume.value() if hasattr(self, 'spn_orig_volume') else 15
         remove_bgm = self.chk_remove_bgm.isChecked() if hasattr(self, 'chk_remove_bgm') else False
         use_gpu = self.chk_use_gpu.isChecked() if hasattr(self, 'chk_use_gpu') else False
+        tts_workers = self.spn_tts_workers.value() if hasattr(self, 'spn_tts_workers') else 4
         self.txt_stt_log.append(f"🎙 Lồng tiếng: {os.path.basename(video_path)}...")
 
         self._roll_dub_thread = DubThread([{"video": video_path, "srt": vi_srt}],
-                                          voice_type=voice_type, rate=rate, mute_original=mute_orig,
-                                          orig_volume=orig_vol, remove_bgm=remove_bgm, use_gpu=use_gpu)
+                                          voice_type=voice_type, rate=rate, pitch=pitch, mute_original=mute_orig,
+                                          orig_volume=orig_vol, remove_bgm=remove_bgm, use_gpu=use_gpu, tts_workers=tts_workers)
         self._roll_dub_thread.progress_signal.connect(lambda m: self.txt_stt_log.append(m.strip()))
         def _one_done(ok, failed):
             self._dub_running = False
@@ -4256,14 +4951,14 @@ class HonggouWidget(QWidget):
 
             # Setup môi trường xử lý
             import os, subprocess, sys, tempfile, shutil
-            env = os.environ.copy()
-            
+            _demucs_py_env = _resolve_demucs_python()  # xác định trước để build env đúng, tránh xung đột DLL
+            env = _clean_subprocess_env(_demucs_py_env)
+
             if use_gpu:
                 env.pop("CUDA_VISIBLE_DEVICES", None) # Mở khóa GPU cho subprocess
                 device = "cuda"
                 gpu_label = "GPU"
             else:
-                env = os.environ.copy()
                 env["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # Chống xung đột thư viện CPU
                 _n_threads = str(max(1, int(os.cpu_count() * 0.3)))
                 env["OMP_NUM_THREADS"] = _n_threads # Ép chạy 30% luồng cho an toàn
@@ -4296,7 +4991,7 @@ class HonggouWidget(QWidget):
                     demucs_out = os.path.join(tmp, "out")
                     
                     # Gọi Demucs bằng subprocess. KHÔNG import trực tiếp trong app
-                    _demucs_py = _resolve_demucs_python()
+                    _demucs_py = _demucs_py_env
                     cmd_demucs = [
                         _demucs_py, "-m", "demucs.separate",
                         "-n", model_name,
