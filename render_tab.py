@@ -272,15 +272,22 @@ class SingleRenderThread(QThread):
             if "amf" in codec.lower() or "nvenc" in codec.lower() or "qsv" in codec.lower(): 
                 cmd.extend(["-c:v", codec])
                 if audio_map: cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+                
                 if use_crf:
                     if "nvenc" in codec.lower():
-                        cmd.extend(["-rc", "constqp", "-qp", str(crf_val), "-preset", preset_hw])
+                        # Dịch preset riêng cho NVIDIA để không báo lỗi
+                        nv_preset = "hq" if preset_hw == "quality" else "fast"
+                        cmd.extend(["-rc", "constqp", "-qp", str(crf_val), "-preset", nv_preset])
                     elif "amf" in codec.lower():
                         cmd.extend(["-rc", "cqp", "-qp_i", str(crf_val), "-qp_p", str(crf_val), "-quality", preset_hw])
                     elif "qsv" in codec.lower():
                         cmd.extend(["-global_quality", str(crf_val), "-preset", preset_hw])
                 else:
-                    cmd.extend(["-b:v", "1000k", "-preset", preset_hw])
+                    if "nvenc" in codec.lower():
+                        nv_preset = "hq" if preset_hw == "quality" else "fast"
+                        cmd.extend(["-b:v", "1000k", "-preset", nv_preset])
+                    else:
+                        cmd.extend(["-b:v", "1000k", "-preset", preset_hw])
                 cmd.extend(["-movflags", "+faststart", self.op])
             else: 
                 cmd.extend(["-c:v", codec])
