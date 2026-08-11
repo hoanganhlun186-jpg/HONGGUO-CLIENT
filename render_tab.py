@@ -873,7 +873,6 @@ class MergeRenderedThread(QThread):
             except Exception as e:
                 self.log.emit(f"⚠️ Lỗi đọc phân giải video đầu ({e}), dùng mặc định {w}x{h}\n")
                 
-            import tempfile, time, subprocess, os
             intro_vid = os.path.join(tempfile.gettempdir(), f"intro_2s_{int(time.time())}.mp4")
             cmd_intro = [
                 ffmpeg, "-y",
@@ -895,7 +894,6 @@ class MergeRenderedThread(QThread):
             else:
                 self.log.emit(f"❌ Lỗi tạo Intro:\n{proc_intro.stderr[-500:]}\n")
 
-        import tempfile, time
         list_txt = os.path.join(tempfile.gettempdir(), f"concat_list_{int(time.time())}.txt")
         try:
             with open(list_txt, "w", encoding="utf-8") as f:
@@ -1711,10 +1709,19 @@ class RenderWidget(QWidget):
         self.btn_full_pipeline.clicked.connect(self._run_full_pipeline_external)
         bot_lay.addWidget(self.btn_full_pipeline)
 
+        run_merge_lay = QHBoxLayout()
+        
         self.btn_run = QPushButton("🔥 RENDER TẤT CẢ (0)")
-        self.btn_run.setStyleSheet("QPushButton { background:#F37021; color:white; padding:12px; font-size:14px; border-radius:8px; border:none; } QPushButton:hover { background:#e05f10; }")
+        self.btn_run.setStyleSheet("QPushButton { background:#F37021; color:white; padding:12px; font-size:14px; border-radius:8px; border:none; font-weight:bold; } QPushButton:hover { background:#e05f10; }")
         self.btn_run.clicked.connect(self._start_render_all)
-        bot_lay.addWidget(self.btn_run)
+        run_merge_lay.addWidget(self.btn_run)
+        
+        self.btn_merge_now = QPushButton("🔗 GỘP NGAY (0)")
+        self.btn_merge_now.setStyleSheet("QPushButton { background:#10B981; color:white; padding:12px; font-size:14px; border-radius:8px; border:none; font-weight:bold; } QPushButton:hover { background:#059669; }")
+        self.btn_merge_now.clicked.connect(self._start_merge_now)
+        run_merge_lay.addWidget(self.btn_merge_now)
+        
+        bot_lay.addLayout(run_merge_lay)
 
         self.btn_stop = QPushButton("⛔ DỪNG RENDER")
         self.btn_stop.setStyleSheet("QPushButton { background:#7F1D1D; color:white; padding:10px; font-size:13px; border-radius:8px; border:none; } QPushButton:hover { background:#991B1B; } QPushButton:disabled { background:#3B2020; color:#8A8D98; }")
@@ -1723,7 +1730,9 @@ class RenderWidget(QWidget):
         bot_lay.addWidget(self.btn_stop)
         
         rl.addLayout(bot_lay)
-        main.addWidget(right)    # ============ THUMBNAIL AI ============
+        main.addWidget(right)    
+
+    # ============ THUMBNAIL AI ============
     def _build_thumbnail_ui(self, parent_widget):
         v = QVBoxLayout(parent_widget)
         v.setContentsMargins(5, 5, 5, 5)
@@ -2031,6 +2040,8 @@ class RenderWidget(QWidget):
 
     def _update_run_label(self):
         self.btn_run.setText(f"🔥 RENDER TẤT CẢ ({len(self.cards)})")
+        if hasattr(self, 'btn_merge_now'):
+            self.btn_merge_now.setText(f"🔗 GỘP NGAY ({len(self.cards)})")
 
     # ============ PREVIEW ============
     def _load_preview(self, video_path):
@@ -2444,9 +2455,42 @@ class RenderWidget(QWidget):
         self._stopping = False
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        if hasattr(self, 'btn_merge_now'):
+            self.btn_merge_now.setEnabled(False)
         self.chk_merge_all.setEnabled(False)
         self._log(f"🚀 Bắt đầu render {len(self._render_queue)} tập...")
         self._render_next()
+
+    def _start_merge_now(self):
+        if self._render_running or (hasattr(self, 'merge_thread') and self.merge_thread.isRunning()):
+            QMessageBox.information(self, "Đang bận", "Hệ thống đang xử lý, vui lòng đợi xong.")
+            return
+        
+        if not self.cards:
+            QMessageBox.information(self, "Chưa có video", "Hãy thêm video vào hàng đợi trước.")
+            return
+
+        files_to_merge = []
+        for c in self.cards:
+            vp = getattr(c, "video_path", None)
+            if vp and os.path.exists(vp) and vp not in files_to_merge:
+                files_to_merge.append(vp)
+                
+        if len(files_to_merge) < 2:
+            QMessageBox.information(self, "Chưa đủ file", "Cần ít nhất 2 file video để gộp.")
+            return
+
+        # Sắp xếp đúng theo thứ tự tự nhiên (Tập 1, 2, ... 10)
+        files_to_merge.sort(key=lambda x: _natural_key(os.path.basename(x)))
+
+        reply = QMessageBox.question(
+            self, "Xác nhận Gộp", 
+            f"Bạn có chắc muốn gộp nhanh {len(files_to_merge)} video này thành 1 file không?\n\n"
+            "(Lưu ý: Quá trình sẽ bỏ qua render ghép sub/màu. Thứ tự đã được tự động sắp xếp từ 1 đến hết)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._start_merge(files_to_merge)
 
     def _stop_render(self):
         if not self._render_running:
@@ -2467,6 +2511,8 @@ class RenderWidget(QWidget):
             
             self.btn_run.setEnabled(True)
             self.btn_stop.setEnabled(False)
+            if hasattr(self, 'btn_merge_now'):
+                self.btn_merge_now.setEnabled(True)
             self.chk_merge_all.setEnabled(True)
             
             if stopped:
@@ -2514,7 +2560,9 @@ class RenderWidget(QWidget):
         self._log(f"🔗 Đang chuẩn bị gộp {len(file_list)} file thành 1...")
         self.btn_run.setEnabled(False)
         self.btn_run.setText("⏳ ĐANG GỘP FILE...")
-        
+        if hasattr(self, 'btn_merge_now'):
+            self.btn_merge_now.setEnabled(False)
+            
         first_file = file_list[0]
         out_dir = os.path.dirname(first_file)
         dir_name = os.path.basename(out_dir)
@@ -2539,7 +2587,10 @@ class RenderWidget(QWidget):
 
     def _on_merge_done(self, ok, final_path):
         self.btn_run.setEnabled(True)
+        if hasattr(self, 'btn_merge_now'):
+            self.btn_merge_now.setEnabled(True)
         self._update_run_label()
+        
         if ok:
             self.step_render.set_status("success", 100)
             self._log(f"🎉 Đã hoàn tất gộp trọn bộ: {os.path.basename(final_path)}")
