@@ -303,7 +303,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.45"
+APP_VERSION = "1.0.46"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -1908,26 +1908,20 @@ class DubThread(QThread):
 
                 if self._stop:
                     return None
+                # Mix theo ĐÚNG mốc thời gian phụ đề: overlay từng câu vào
+                # position=start_ms trên nền im lặng dài bằng cả video. Cách này
+                # giữ tiếng khớp sub tuyệt đối, kể cả khi 1 câu đọc dài tràn qua
+                # khung của nó (câu sau vẫn vào đúng mốc của nó, không bị đẩy).
+                #
+                # KHÔNG dùng cách nối tiếp (combined += seg) vì khi 1 câu tiếng
+                # dài hơn khung sub, current_pos bị đẩy vượt mốc câu kế -> không
+                # chèn khoảng lặng -> toàn bộ phần sau chạy sớm dần: "tiếng đi
+                # trước, chữ đi sau", lệch tích lũy càng về cuối càng nặng.
+                combined = AudioSegment.silent(duration=total_ms)
                 segments_to_mix.sort(key=lambda x: x[0])
                 for start_ms, seg in segments_to_mix:
                     if self._stop: break
                     combined = combined.overlay(seg, position=start_ms)
- 
-                # Bắt đầu mix siêu tốc
-                segments_to_mix.sort(key=lambda x: x[0])
-                combined = AudioSegment.silent(duration=0)
-                current_pos = 0
-                
-                for start_ms, seg in segments_to_mix:
-                    if start_ms > current_pos:
-                        # Bơm khoảng lặng vào giữa các câu thoại
-                        combined += AudioSegment.silent(duration=(start_ms - current_pos))
-                    combined += seg
-                    current_pos = start_ms + len(seg)
-                
-                # Bơm nốt khoảng lặng cho đủ độ dài video
-                if current_pos < total_ms:
-                    combined += AudioSegment.silent(duration=(total_ms - current_pos))
 
                 if self._stop:
                     return None
@@ -4356,7 +4350,11 @@ class HonggouWidget(QWidget):
             reply = QMessageBox.question(self, "Cảnh báo tải trùng", "Bộ phim này bạn ĐÃ TẢI VỀ máy trước đó rồi!\nBạn có chắc chắn muốn TẢI LẠI và BỊ TRỪ 1 LƯỢT không?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.No: return
 
-        self.quota_used_signal.emit()
+        # KHÔNG trừ lượt ở đây nữa. Trước kia trừ ngay lúc bấm nút -> nếu server
+        # trả "Lỗi API"/lỗi lấy link thì khách MẤT LƯỢT mà không nhận được link nào.
+        # Giờ chỉ đánh dấu "phiên này chưa trừ", và chỉ trừ đúng 1 lần khi có ÍT
+        # NHẤT 1 tập trả về link thật (xem _on_stream_link_ready).
+        self._quota_charged_this_session = False
 
         # KHÓA bảng của bộ ĐANG TẢI: từ đây mọi cập nhật trạng thái tải ghi vào
         # đúng bảng này (self._active_dl_table), KHÔNG theo tab đang xem. Nhờ vậy
@@ -4436,6 +4434,13 @@ class HonggouWidget(QWidget):
         url = data.get("url")
         
         if ep_num and url:
+            # Chỉ trừ lượt khi THỰC SỰ có link tải về (tập đầu tiên hợp lệ). Trừ
+            # đúng 1 lần cho cả phiên tải, dù bộ có nhiều tập. Nếu server lỗi và
+            # không tập nào ra link, cờ này vẫn False -> khách không bị trừ oan.
+            if not getattr(self, '_quota_charged_this_session', False):
+                self._quota_charged_this_session = True
+                self.quota_used_signal.emit()
+
             ep_item_data = {
                 "episode_number": ep_num,
                 "file_name": f"Tap_{int(ep_num):02d}.mp4",
@@ -4911,62 +4916,123 @@ class HonggouWidget(QWidget):
             return blocks
 
         def _get_video_duration_ms(video_path):
+            import subprocess as _sp
             ffmpeg = get_ffmpeg_path()
-            if not ffmpeg:
-                return None
-            ffprobe = os.path.join(os.path.dirname(ffmpeg), 'ffprobe.exe')
-            if not os.path.exists(ffprobe):
-                ffprobe = os.path.join(os.path.dirname(ffmpeg), 'ffprobe')
-            if not os.path.exists(ffprobe):
-                ffprobe = ffmpeg  
-            try:
-                import subprocess as _sp
-                si = None
-                if os.name == 'nt':
-                    si = _sp.STARTUPINFO()
-                    si.dwFlags |= _sp.STARTF_USESHOWWINDOW
-                r = _sp.run(
-                    [ffprobe, '-v', 'error', '-show_entries', 'format=duration',
-                     '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
-                    stdout=_sp.PIPE, stderr=_sp.PIPE, startupinfo=si)
-                dur = float(r.stdout.decode().strip())
-                return int(dur * 1000)
-            except Exception:
-                return None
+            si = None
+            if os.name == 'nt':
+                si = _sp.STARTUPINFO()
+                si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+
+            # Ứng viên ffprobe: cạnh ffmpeg (.exe / không đuôi), rồi trên PATH.
+            probes = []
+            if ffmpeg:
+                d = os.path.dirname(ffmpeg)
+                probes += [os.path.join(d, 'ffprobe.exe'), os.path.join(d, 'ffprobe')]
+            probes += ['ffprobe.exe', 'ffprobe']  # dựa vào PATH
+
+            for ffprobe in probes:
+                # Bỏ qua path tuyệt đối không tồn tại (nhưng vẫn thử tên trần
+                # vì nó có thể nằm trên PATH).
+                if os.path.isabs(ffprobe) and not os.path.exists(ffprobe):
+                    continue
+                try:
+                    # Đọc ĐỘ DÀI LUỒNG VIDEO (stream=duration của v:0), KHÔNG
+                    # phải format=duration của container. Khi ghép concat, mỗi
+                    # tập chiếm đúng độ dài video stream; format=duration hay dài
+                    # hơn (audio priming/audio dài hơn video) -> canh sub theo nó
+                    # sẽ dồn lệch, sub tới muộn dần về cuối.
+                    r = _sp.run(
+                        [ffprobe, '-v', 'error', '-select_streams', 'v:0',
+                         '-show_entries', 'stream=duration',
+                         '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
+                        stdout=_sp.PIPE, stderr=_sp.PIPE, startupinfo=si)
+                    txt = r.stdout.decode(errors='ignore').strip()
+                    if txt and txt.upper() != 'N/A':
+                        return int(round(float(txt) * 1000))
+                    # Một số container không ghi stream duration -> quay lại
+                    # format=duration cho tập này (hiếm; chấp nhận sai số nhỏ).
+                    r2 = _sp.run(
+                        [ffprobe, '-v', 'error', '-show_entries', 'format=duration',
+                         '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
+                        stdout=_sp.PIPE, stderr=_sp.PIPE, startupinfo=si)
+                    txt2 = r2.stdout.decode(errors='ignore').strip()
+                    if txt2 and txt2.upper() != 'N/A':
+                        return int(round(float(txt2) * 1000))
+                except Exception:
+                    continue
+
+            # Fallback cuối: đọc duration từ chính ffmpeg (không cần ffprobe).
+            if ffmpeg:
+                try:
+                    r = _sp.run([ffmpeg, '-i', video_path],
+                                stdout=_sp.PIPE, stderr=_sp.PIPE, startupinfo=si)
+                    err = r.stderr.decode(errors='ignore')
+                    m = _re.search(r'Duration:\s*(\d+):(\d+):(\d+)\.(\d+)', err)
+                    if m:
+                        h, mn, s, cs = m.groups()
+                        return ((int(h)*3600 + int(mn)*60 + int(s)) * 1000
+                                + int(cs.ljust(3, '0')[:3]))
+                except Exception:
+                    pass
+            return None
 
         for task in merge_tasks:
             video_files = task["files"]
             out_name_noext = os.path.splitext(task["output_name"])[0]
 
             for suffix, srt_suffix in [("_vi.srt", "_vi.srt"), (".srt", ".srt")]:
-                srt_files_found = []
+                # QUAN TRỌNG: phải đi theo ĐÚNG thứ tự video_files (chính là thứ
+                # tự concat của ffmpeg). Với mỗi tập, đo duration THẬT của video
+                # rồi cộng offset = tổng duration các tập TRƯỚC nó. Không dùng
+                # end-time của câu sub cuối để suy offset (bỏ mất khoảng lặng
+                # cuối tập -> lệch dồn càng về sau càng nặng).
+                per_ep = []  # (offset_ms_của_tập_này, srt_path)
+                offset_ms = 0
+                any_srt = False
+                missing_dur = False
                 for vf in video_files:
                     base = os.path.splitext(vf)[0]
                     # Khi ghép SAU LỒNG TIẾNG, video là *_dubbed.mp4 nhưng file
                     # sub đặt theo tên GỐC (Tap_01_vi.srt, không phải
-                    # Tap_01_dubbed_vi.srt). Bỏ hậu tố _dubbed để tìm đúng sub,
-                    # nếu không srt_files_found sẽ rỗng -> KHÔNG tạo được sub
-                    # trọn bộ.
-                    if base.endswith("_dubbed"):
-                        base = base[:-len("_dubbed")]
-                    srt_path = base + suffix
-                    if os.path.exists(srt_path):
-                        srt_files_found.append((vf, srt_path))
+                    # Tap_01_dubbed_vi.srt). Bỏ hậu tố _dubbed để tìm đúng sub.
+                    sub_base = base[:-len("_dubbed")] if base.endswith("_dubbed") else base
+                    srt_path = sub_base + suffix
 
-                if not srt_files_found:
-                    continue  
-
-                combined_blocks = []
-                offset_ms = 0
-                for vf, sp in srt_files_found:
-                    blocks = _parse_srt_blocks(sp)
-                    for (s, e, t) in blocks:
-                        combined_blocks.append((s + offset_ms, e + offset_ms, t))
+                    # Offset của tập = tổng ĐỘ DÀI VIDEO STREAM các tập trước.
+                    # PHẢI dùng độ dài video stream, KHÔNG dùng format=duration
+                    # của container: khi concat, mỗi tập chiếm đúng độ dài luồng
+                    # video, trong khi format=duration hay dài hơn (audio priming
+                    # / audio dài hơn video) -> nếu cộng theo container, offset dư
+                    # ra mỗi tập, dồn qua trăm tập thành sub tới muộn dần.
                     dur = _get_video_duration_ms(vf)
+
+                    per_ep.append((offset_ms, srt_path if os.path.exists(srt_path) else None))
+                    if os.path.exists(srt_path):
+                        any_srt = True
+
                     if dur:
                         offset_ms += dur
-                    elif blocks:
-                        offset_ms = combined_blocks[-1][1] + 500  
+                    else:
+                        missing_dur = True
+                        blocks_tmp = _parse_srt_blocks(srt_path) if os.path.exists(srt_path) else []
+                        if blocks_tmp:
+                            offset_ms += blocks_tmp[-1][1] + 1000
+
+                if not any_srt:
+                    continue
+
+                if missing_dur and hasattr(self, 'txt_stt_log'):
+                    self.txt_stt_log.append(
+                        "⚠️ Có tập không đọc được thời lượng video (ffprobe lỗi) — "
+                        "time sub trọn bộ có thể lệch. Kiểm tra ffprobe.exe cạnh ffmpeg."
+                    )
+
+                combined_blocks = []
+                for ep_offset, sp in per_ep:
+                    if not sp:
+                        continue
+                    for (s, e, t) in _parse_srt_blocks(sp):
+                        combined_blocks.append((s + ep_offset, e + ep_offset, t))
 
                 if not combined_blocks:
                     continue

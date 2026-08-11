@@ -9,18 +9,21 @@
       logo kênh, bộ lọc Bypass FX
     • Preview canvas (kéo thả chữ/logo, xem video)
     • Render hàng loạt bằng ffmpeg (GPU nếu có)
+    • [MỚI] Tự động gộp trọn bộ video sau khi render xong
 ═══════════════════════════════════════════════════════════
 """
-import os, sys, subprocess, re, shutil, time
+import os, sys, subprocess, re, shutil, time, tempfile, base64, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QFileDialog, QTextEdit, QProgressBar,
     QComboBox, QLineEdit, QSpinBox, QMessageBox, QCheckBox, QSlider,
-    QTabWidget, QDoubleSpinBox, QGridLayout,
+    QTabWidget, QDoubleSpinBox, QGridLayout, QPlainTextEdit,
     QGraphicsScene, QGraphicsView, QGraphicsTextItem, QGraphicsRectItem,
     QGraphicsPixmapItem, QGraphicsItem, QStyle, QApplication
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QUrl, QPointF, QRectF, QTimer
+from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QUrl, QPointF, QRectF, QTimer, QSize
 from PyQt6.QtGui import QCursor, QTextCursor, QFont, QPixmap, QPen, QBrush, QColor, QPainter
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -34,6 +37,19 @@ except Exception:
     CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
     def get_ffmpeg_path(): return shutil.which("ffmpeg") or "ffmpeg"
     def get_optimal_ffmpeg_codec(): return "libx264"
+
+# Mượn hằng số đăng nhập Gemini từ tab dịch (CHỈ mượn hằng số + auth file,
+# KHÔNG import/đụng luồng dịch GeminiTranslateThread). Luồng tạo thumbnail
+# bên dưới dùng Chrome ẩn ĐỘC LẬP bằng storage_state nên chạy song song
+# luồng dịch mà không giành profile.
+try:
+    from translate_tab import AUTH_FILE, UA, BROWSER_ARGS
+except Exception:
+    AUTH_FILE = "gemini_auth.json"
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+    BROWSER_ARGS = ["--disable-blink-features=AutomationControlled", "--disable-gpu",
+                    "--no-sandbox", "--disable-dev-shm-usage", "--disable-software-rasterizer"]
 
 
 FONTS_LIST = ["Arial", "Tahoma", "Verdana", "Times New Roman", "Segoe UI", "Impact", "Consolas", "Courier New"]
@@ -49,6 +65,13 @@ COLOR_PRESETS = {
     "Đen (Black)":      {"ass": "&H00000000", "qt": "#000000"},
 }
 
+
+def _natural_key(s):
+    """Khóa sắp xếp tự nhiên: tách chữ và số để '16' đứng trước '160',
+    và 'Tap_2' đứng trước 'Tap_10'. Nhờ vậy gộp trọn bộ đúng thứ tự tập."""
+    s = str(s)
+    return [int(t) if t.isdigit() else t.lower()
+            for t in re.split(r'(\d+)', s)]
 
 def format_time(seconds):
     seconds = int(seconds)
@@ -92,6 +115,816 @@ def _merge_srt_intervals(srt_path, gap=0.3, expand=0.5, max_intervals=150):
 # ============================================================
 # CÁC LUỒNG XỬ LÝ
 # ============================================================
+
+# ============================================================
+# LUỒNG TẠO THUMBNAIL BẰNG AI (Gemini web, độc lập luồng dịch)
+# ============================================================
+# Selector RIÊNG cho luồng ảnh (tách hẳn khỏi luồng dịch).
+_THUMB_INPUT_SELS = [
+    "rich-textarea div.ql-editor[contenteditable='true']",
+    "div[contenteditable='true'][role='textbox']",
+]
+_THUMB_SEND_SELS = [
+    "button[aria-label='Send message']",
+    "button[aria-label='Gửi']",
+    "button.send-button",
+]
+_THUMB_UPLOAD_TRIGGER_SELS = [
+    # Gemini UI tiếng Việt (từ log thực tế)
+    "button[aria-label='Nội dung tải lên và công cụ']",
+    "button[aria-label='Mở trình đơn tải tệp lên']",
+    "button[aria-label='Thêm tệp']",
+    # Gemini UI tiếng Anh
+    "button[aria-label='Open upload file menu']",
+    "button[aria-label='Add files']",
+    "button[aria-label='Upload files and tools']",
+    # Fallback fuzzy match
+    "button[aria-label*='upload' i]",
+    "button[aria-label*='tải lên' i]",
+    "button[aria-label*='tệp' i]",
+    "button[aria-label*='công cụ' i]",
+]
+_THUMB_FILE_INPUT_SEL = "input[type='file']"
+_THUMB_RESULT_IMG_SELS = [
+    "message-content img",
+    ".model-response-text img",
+    "[data-message-author-role='model'] img",
+    "generated-image img",
+    "img[src^='https://']",
+    "img[src^='blob:']",
+    "img[src^='data:image']",
+]
+
+
+def _thumb_find_el(page, sels, timeout=6000, cancel_check=None):
+    step = 500
+    for s in sels:
+        try:
+            for _ in range(max(1, timeout // step)):
+                if cancel_check and cancel_check():
+                    return None
+                el = page.query_selector(s)
+                if el and el.is_visible():
+                    return el
+                page.wait_for_timeout(step)
+        except Exception:
+            continue
+    return None
+
+
+class GeminiThumbnailThread(QThread):
+    """Tạo N thumbnail từ 1 ảnh gốc bằng Gemini web. Gửi từng lượt riêng
+    (mỗi lượt 1 biến thể góc nhìn) -> thu 1 ảnh/lượt. Chrome ẩn độc lập
+    (storage_state) nên không đụng luồng dịch."""
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+    one_done = pyqtSignal(str)
+    all_done = pyqtSignal(list)
+
+    def __init__(self, src_image, base_prompt, out_dir, n_variants=4,
+                 variant_hints=None, model_key="Auto (Mặc định)", show_browser=False):
+        super().__init__()
+        self.src_image = src_image
+        self.base_prompt = base_prompt.strip()
+        self.out_dir = out_dir
+        self.n_variants = max(1, min(8, int(n_variants)))
+        self.variant_hints = variant_hints or [
+            "Phong cách RỒNG LỬA: rồng vàng-đỏ khổng lồ bằng lửa cuộn quanh phía sau, biển lửa dung nham, tàn lửa bay, khí thế bá vương ngút trời.",
+            "Phong cách SẤM SÉT VẠN QUÂN: tia sét xanh-tím xé trời, luồng năng lượng điện bùng nổ, mây bão vần vũ, hào quang chớp giật hùng vĩ.",
+            "Phong cách BĂNG PHONG THẦN GIỚI: phượng hoàng băng, bão tuyết, ánh sáng vàng kim thần thánh, cung điện trên mây, huyền ảo choáng ngợp.",
+            "Phong cách HOÀNG KIM SỬ THI: hào quang vàng rực chói lòa, linh thú vàng cuộn quanh, tia sáng thần thánh tỏa, bụi vàng bay, khí thế đế vương.",
+        ]
+        self.model_key = model_key
+        self.show_browser = bool(show_browser)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def _type_and_send(self, page, prompt_text):
+        inp = _thumb_find_el(page, _THUMB_INPUT_SELS, timeout=8000,
+                             cancel_check=lambda: self._cancel)
+        if not inp:
+            return False, "Không thấy ô nhập (có thể dính CAPTCHA)."
+        inp.click()
+        page.evaluate('''(text) => {
+            const el = document.activeElement?.contentEditable === "true"
+                ? document.activeElement
+                : document.querySelector("[contenteditable='true']");
+            if (el) { el.focus(); el.innerText = text;
+                      el.dispatchEvent(new Event('input', {bubbles: true})); }
+        }''', prompt_text)
+        page.wait_for_timeout(400)
+        page.keyboard.press("End")
+
+        def _input_text():
+            try:
+                return page.evaluate('''() => {
+                    const el = document.querySelector("[contenteditable='true']");
+                    return el ? (el.innerText || "").trim() : null;
+                }''')
+            except Exception:
+                return None
+
+        for attempt in range(4):
+            if self._cancel:
+                return False, "Đã hủy."
+            btn = _thumb_find_el(page, _THUMB_SEND_SELS, timeout=2000,
+                                 cancel_check=lambda: self._cancel)
+            sent = False
+            if btn:
+                try:
+                    if not btn.is_disabled() and btn.get_attribute("aria-disabled") != "true":
+                        btn.click(); sent = True
+                except Exception:
+                    pass
+            if not sent:
+                try:
+                    inp.click(); page.keyboard.press("Enter")
+                except Exception:
+                    pass
+                page.wait_for_timeout(400)
+                if _input_text():
+                    try: page.keyboard.press("Control+Enter")
+                    except Exception: pass
+            page.wait_for_timeout(800)
+            txt = _input_text()
+            if txt is None or txt == "":
+                return True, ""
+            if attempt < 3:
+                self.log.emit(f"↩️ Chưa gửi được, thử lại ({attempt+2}/4)...\n")
+        return False, "Gemini không nhận prompt sau 4 lần."
+
+    def _dump_buttons(self, page):
+        """In ra mọi nút/aria-label để bắt đúng selector khi dò thất bại."""
+        try:
+            labels = page.evaluate('''() => {
+                const out = [];
+                const push = (root) => {
+                    root.querySelectorAll('button, [role=button], input').forEach(el => {
+                        const a = el.getAttribute('aria-label') || '';
+                        const t = (el.tagName || '').toLowerCase();
+                        const ty = el.getAttribute('type') || '';
+                        if (a || t === 'input') out.push(`${t}${ty?('['+ty+']'):''} :: ${a}`);
+                    });
+                    root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) push(el.shadowRoot); });
+                };
+                push(document);
+                return [...new Set(out)];
+            }''')
+            self.log.emit("🔎 Các nút/input tìm thấy trên trang:\n")
+            for l in labels[:40]:
+                self.log.emit(f"    • {l}\n")
+        except Exception as e:
+            self.log.emit(f"⚠️ Không dò được nút: {e}\n")
+
+    def _find_file_input_deep(self, page):
+        """Tìm input[type=file] khắp trang KỂ CẢ trong shadow DOM.
+        Trả về ElementHandle hoặc None."""
+        try:
+            handle = page.evaluate_handle('''() => {
+                const find = (root) => {
+                    let el = root.querySelector("input[type='file']");
+                    if (el) return el;
+                    const hosts = root.querySelectorAll('*');
+                    for (const h of hosts) {
+                        if (h.shadowRoot) {
+                            const found = find(h.shadowRoot);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                };
+                return find(document);
+            }''')
+            el = handle.as_element()
+            return el
+        except Exception:
+            return None
+
+    def _copy_image_to_clipboard(self, img_path):
+        """Đưa ảnh vào clipboard hệ thống để dán bằng Ctrl+V.
+        Windows: dùng PowerShell (không cần cài thêm gì).
+        macOS/Linux: thử qua thư viện nếu có."""
+        try:
+            if os.name == "nt":
+                ps = (
+                    "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
+                    f"$img=[System.Drawing.Image]::FromFile('{img_path}');"
+                    "[System.Windows.Forms.Clipboard]::SetImage($img);"
+                )
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
+                                   startupinfo=si, capture_output=True, text=True, timeout=20)
+                return r.returncode == 0
+            else:
+                # macOS: osascript; Linux: xclip (nếu có)
+                if sys.platform == "darwin":
+                    scpt = (f'set the clipboard to (read (POSIX file "{img_path}") as JPEG picture)')
+                    r = subprocess.run(["osascript", "-e", scpt], capture_output=True, timeout=20)
+                    return r.returncode == 0
+                else:
+                    mime = "image/png" if img_path.lower().endswith(".png") else "image/jpeg"
+                    r = subprocess.run(["xclip", "-selection", "clipboard", "-t", mime, "-i", img_path],
+                                       capture_output=True, timeout=20)
+                    return r.returncode == 0
+        except Exception as e:
+            self.log.emit(f"⚠️ Không copy được ảnh vào clipboard: {e}\n")
+            return False
+
+    def _paste_image(self, page):
+        """Dán ảnh từ clipboard vào ô nhập bằng Ctrl+V (né được input ẩn)."""
+        if not self._copy_image_to_clipboard(self.src_image):
+            return False
+        inp = _thumb_find_el(page, _THUMB_INPUT_SELS, timeout=6000,
+                             cancel_check=lambda: self._cancel)
+        if not inp:
+            return False
+        try:
+            inp.click()
+            page.wait_for_timeout(400)
+            page.keyboard.press("Control+V")
+            # chờ ảnh preview đính kèm hiện ra (chip/thumbnail trong ô soạn)
+            for _ in range(20):  # ~10s
+                if self._cancel:
+                    return False
+                page.wait_for_timeout(500)
+                has_att = page.evaluate('''() => {
+                    // có thẻ img preview hoặc vùng đính kèm xuất hiện gần ô nhập
+                    const imgs = document.querySelectorAll("img");
+                    for (const im of imgs) {
+                        const s = im.src || "";
+                        if (s.startsWith("blob:") || s.startsWith("data:image")) return true;
+                    }
+                    return !!document.querySelector("[class*='attachment'], [class*='file-preview'], [data-test-id*='file']");
+                }''')
+                if has_att:
+                    return True
+            return False
+        except Exception as e:
+            self.log.emit(f"⚠️ Lỗi dán ảnh: {e}\n")
+            return False
+
+    # Selector các mục trong submenu sau khi bấm nút "Nội dung tải lên và công cụ"
+    _SUBMENU_FILE_SELS = [
+        # Mục "Tải tệp lên" / "Upload file" trong submenu Gemini
+        "li[aria-label*='tệp' i]",
+        "li[aria-label*='file' i]",
+        "li[data-value*='file' i]",
+        "[role='menuitem'][aria-label*='tệp' i]",
+        "[role='menuitem'][aria-label*='file' i]",
+        "[role='menuitem'][aria-label*='upload' i]",
+        "[role='menuitem'][aria-label*='tải lên' i]",
+        # Gemini hay dùng mat-menu-item hoặc div dạng này
+        "button[aria-label*='Tải tệp lên' i]",
+        "button[aria-label*='Upload file' i]",
+        "span[aria-label*='Tải tệp lên' i]",
+    ]
+
+    def _attach_image(self, page):
+        # CÁCH 0 (ưu tiên): set_input_files thẳng vào input[type=file] ẩn
+        # (an toàn nhất, không phụ thuộc UI, không cần clipboard).
+        fi = page.query_selector(_THUMB_FILE_INPUT_SEL) or self._find_file_input_deep(page)
+        if fi:
+            try:
+                fi.set_input_files(self.src_image)
+                page.wait_for_timeout(2500)
+                # Kiểm tra có preview ảnh xuất hiện không
+                has_att = page.evaluate('''() => {
+                    const imgs = document.querySelectorAll("img");
+                    for (const im of imgs) {
+                        const s = im.src || "";
+                        if (s.startsWith("blob:") || s.startsWith("data:image")) return true;
+                    }
+                    return !!document.querySelector("[class*='attachment'], [class*='file-preview'], [data-test-id*='file']");
+                }''')
+                if has_att:
+                    self.log.emit("   📎 Đã đính kèm ảnh qua input[type=file] ẩn.\n")
+                    return True, ""
+            except Exception as e:
+                self.log.emit(f"   ↪️ input ẩn lỗi ({e}), thử cách khác...\n")
+
+        # CÁCH 1: DÁN ảnh bằng Ctrl+V
+        try:
+            if self._paste_image(page):
+                self.log.emit("   📋 Đã dán ảnh bằng Ctrl+V.\n")
+                return True, ""
+        except Exception:
+            pass
+        self.log.emit("   ↪️ Ctrl+V chưa ăn, thử nút đính kèm...\n")
+
+        # CÁCH 2: bấm nút trigger, bắt file chooser (1 cấp)
+        trig = _thumb_find_el(page, _THUMB_UPLOAD_TRIGGER_SELS, timeout=3000,
+                              cancel_check=lambda: self._cancel)
+        if trig:
+            # 2a: bắt file chooser trực tiếp (nút mở thẳng dialog)
+            try:
+                with page.expect_file_chooser(timeout=5000) as fc_info:
+                    trig.click()
+                fc = fc_info.value
+                fc.set_files(self.src_image)
+                page.wait_for_timeout(2500)
+                return True, ""
+            except Exception:
+                page.wait_for_timeout(500)
+
+            # 2b: nút mở SUBMENU (2 cấp) — bấm trig rồi bấm mục con trong submenu
+            try:
+                trig.click()
+                page.wait_for_timeout(800)
+                # Tìm mục "Tải tệp lên" / "Upload file" trong submenu vừa mở
+                sub_item = _thumb_find_el(page, self._SUBMENU_FILE_SELS, timeout=3000,
+                                         cancel_check=lambda: self._cancel)
+                if sub_item:
+                    try:
+                        with page.expect_file_chooser(timeout=5000) as fc_info:
+                            sub_item.click()
+                        fc = fc_info.value
+                        fc.set_files(self.src_image)
+                        page.wait_for_timeout(2500)
+                        return True, ""
+                    except Exception:
+                        pass
+                    # Nếu vẫn chưa được: thử set_input_files lần nữa sau khi submenu mở
+                    fi2 = page.query_selector(_THUMB_FILE_INPUT_SEL) or self._find_file_input_deep(page)
+                    if fi2:
+                        try:
+                            fi2.set_input_files(self.src_image)
+                            page.wait_for_timeout(2500)
+                            return True, ""
+                        except Exception as e:
+                            self.log.emit(f"⚠️ set_input_files sau submenu lỗi: {e}\n")
+            except Exception as e:
+                self.log.emit(f"⚠️ Thử submenu lỗi: {e}\n")
+
+        self._dump_buttons(page)
+        return False, ("Không tìm thấy chỗ tải ảnh lên. Xem danh sách nút ở trên, "
+                       "gửi lại cho người phát triển để chỉnh selector.")
+
+    def _grab_new_image(self, page, known_srcs, save_path):
+        """Chờ ảnh Gemini VẼ XONG rồi tải. Lọc chặt để không vớ nhầm
+        avatar/icon/ảnh gốc: chỉ lấy ảnh TO, nằm trong khối trả lời model,
+        và phải ỔN ĐỊNH (không đổi qua vài nhịp = đã vẽ xong)."""
+        stable_src, stable_count = None, 0
+        for _ in range(480):  # ~240s, ảnh có thể vẽ lâu
+            if self._cancel:
+                return None
+            page.wait_for_timeout(500)
+
+            # Quét TOÀN TRANG (kể cả shadow DOM), lấy ảnh TO NHẤT mới xuất hiện
+            # mà không nằm trong 'known' (ảnh gốc + ảnh cũ). Ảnh Gemini vẽ luôn
+            # là ảnh lớn nhất trên trang -> không cần giới hạn trong scope model.
+            cand = page.evaluate('''(args) => {
+                const known = args.known, srcRatio = args.srcRatio;
+                const knownSet = new Set(known);
+                let best = null, bestArea = 0;
+                const consider = (im) => {
+                    const s = im.src || im.currentSrc || "";
+                    if (!s) return;
+                    if (knownSet.has(s)) return;
+                    if (!im.complete) return;
+                    const w = im.naturalWidth || 0;
+                    const h = im.naturalHeight || 0;
+                    if (w < 256 || h < 256) return;        // bỏ avatar/icon/placeholder nhỏ
+                    if (h >= w) return;                    // thumbnail là NGANG -> bỏ ảnh vuông/dọc
+                    const ratio = w / h;
+                    if (ratio < 1.2) return;               // chưa đủ ngang
+                    // Loại ảnh TRÙNG TỈ LỆ ảnh gốc (chính là ảnh gốc, dù src đã đổi).
+                    if (srcRatio && Math.abs(ratio - srcRatio) < 0.03) return;
+                    const area = w * h;
+                    if (area > bestArea) { bestArea = area; best = {src: s, w, h}; }
+                };
+                const walk = (root) => {
+                    root.querySelectorAll("img").forEach(consider);
+                    root.querySelectorAll("*").forEach(el => {
+                        if (el.shadowRoot) walk(el.shadowRoot);
+                    });
+                };
+                walk(document);
+                return best;
+            }''', {"known": list(known_srcs), "srcRatio": self._src_ratio})
+
+            if not cand:
+                stable_src, stable_count = None, 0
+                continue
+
+            src = cand["src"]
+            if stable_count == 0 or src != stable_src:
+                self.log.emit(f"   👁️ Thấy ảnh ứng viên {cand['w']}x{cand['h']}, đang chờ vẽ xong...\n")
+            # Chờ ỔN ĐỊNH: cùng 1 src xuất hiện liên tục >= 4 nhịp (~2s)
+            # -> coi như Gemini đã vẽ xong, không còn đổi ảnh.
+            if src == stable_src:
+                stable_count += 1
+            else:
+                stable_src, stable_count = src, 1
+
+            if stable_count >= 4:
+                page.wait_for_timeout(800)
+                got = self._capture_img_element(page, src, save_path)
+                if got:
+                    try:
+                        if os.path.getsize(got) > 15000:  # >15KB
+                            return got
+                    except Exception:
+                        return got
+                # chụp hỏng -> thử fetch (dự phòng), rồi coi src là đã biết
+                got = self._download_src(page, src, save_path)
+                if got:
+                    try:
+                        if os.path.getsize(got) > 15000:
+                            return got
+                    except Exception:
+                        return got
+                known_srcs.add(src)
+                stable_src, stable_count = None, 0
+        # Hết giờ mà không có ảnh: đọc text Gemini trả về để chẩn đoán
+        # (nếu Gemini từ chối / không hỗ trợ tạo ảnh thì báo cho người dùng).
+        try:
+            reply = page.evaluate('''() => {
+                const el = document.querySelector(
+                    ".model-response-text .markdown, message-content .markdown, [data-message-author-role='model']");
+                return el ? (el.innerText || "").trim().slice(0, 400) : "";
+            }''')
+            if reply:
+                self.log.emit(f"   💬 Gemini trả lời (chữ): {reply}\n")
+                low = reply.lower()
+                if any(k in low for k in ["can't create", "cannot create", "unable to",
+                                          "không thể tạo", "không hỗ trợ", "i can't generate",
+                                          "i'm not able"]):
+                    self.log.emit("   ⛔ Có vẻ tài khoản/model này KHÔNG tạo được ảnh. "
+                                  "Thử đổi sang model có tạo ảnh, hoặc tài khoản khác.\n")
+        except Exception:
+            pass
+        return None
+
+    def _capture_img_element(self, page, src, save_path):
+        """Chụp THẲNG phần tử <img> đang hiển thị thành PNG (không fetch mạng,
+        né được CORS/cookie mà Gemini chặn). Ảnh gì hiện trên màn thì lấy y hệt."""
+        try:
+            # Đánh dấu đúng img có src này để Playwright chụp được (kể cả shadow DOM
+            # thì vẫn cuộn tới + chụp qua bounding box).
+            handle = page.evaluate_handle('''(target) => {
+                const findImg = (root) => {
+                    for (const im of root.querySelectorAll("img")) {
+                        if ((im.src || im.currentSrc || "") === target) return im;
+                    }
+                    for (const el of root.querySelectorAll("*")) {
+                        if (el.shadowRoot) {
+                            const f = findImg(el.shadowRoot);
+                            if (f) return f;
+                        }
+                    }
+                    return null;
+                };
+                const im = findImg(document);
+                if (im) im.scrollIntoView({block: "center"});
+                return im;
+            }''', src)
+            el = handle.as_element()
+            if not el:
+                return None
+            page.wait_for_timeout(500)
+            save_path = os.path.splitext(save_path)[0] + ".png"
+            el.screenshot(path=save_path)
+            # Bỏ góc bo tròn / viền đen do Gemini bọc ảnh trong khung border-radius.
+            self._trim_rounded_corners(save_path)
+            return save_path
+        except Exception as e:
+            self.log.emit(f"   ⚠️ Chụp phần tử ảnh lỗi: {e}\n")
+            return None
+
+    def _trim_rounded_corners(self, img_path):
+        """Cắt ảnh Gemini trả về thành hình chữ nhật ĐẶC, không còn 4 góc bo
+        tròn. Cách: dò bounding box vùng ảnh thật, rồi dò độ sâu góc bo và
+        crop vào đủ để 4 góc đều kín (không còn pixel nền lọt ở góc)."""
+        try:
+            from PIL import Image, ImageChops
+            im = Image.open(img_path).convert("RGB")
+            bg = Image.new("RGB", im.size, (0, 0, 0))
+            diff = ImageChops.difference(im, bg)
+            bbox = diff.getbbox()
+            if not bbox:
+                return
+            l, t, r, b = bbox
+            im2 = im.crop((l, t, r, b))
+            w, h = im2.size
+            px = im2.load()
+
+            def _is_bg(x, y):
+                # Pixel gần đen coi như nền (góc bo để lộ nền tối)
+                pr, pg, pb = px[x, y]
+                return pr < 12 and pg < 12 and pb < 12
+
+            # Dò độ sâu góc bo: quét đường chéo từ 4 góc vào tâm, tìm điểm
+            # đầu tiên KHÔNG còn là nền -> đó là bán kính bo lớn nhất.
+            max_scan = min(w, h) // 4      # không quét quá 1/4 cạnh
+            corner_depth = 0
+            corners = [(0, 0, 1, 1), (w - 1, 0, -1, 1),
+                       (0, h - 1, 1, -1), (w - 1, h - 1, -1, -1)]
+            for cx, cy, dx, dy in corners:
+                d = 0
+                while d < max_scan:
+                    x = cx + dx * d
+                    y = cy + dy * d
+                    if not (0 <= x < w and 0 <= y < h):
+                        break
+                    if not _is_bg(x, y):
+                        break
+                    d += 1
+                corner_depth = max(corner_depth, d)
+
+            # Crop vào bằng độ sâu góc bo (thêm 1px cho chắc), giữ tối đa 92%
+            # kích thước để không lẹm quá nhiều nếu dò sai.
+            cut = min(corner_depth + 1, int(min(w, h) * 0.08))
+            if cut > 0 and (w - 2 * cut) > 8 and (h - 2 * cut) > 8:
+                im2 = im2.crop((cut, cut, w - cut, h - cut))
+            im2.save(img_path)
+            return
+        except Exception:
+            pass
+        # Fallback không có Pillow: cắt cứng ~3% mỗi mép bằng Qt.
+        try:
+            pm = QPixmap(img_path)
+            if pm.isNull():
+                return
+            w, h = pm.width(), pm.height()
+            mx, my = max(3, int(w * 0.03)), max(3, int(h * 0.03))
+            pm.copy(mx, my, w - 2 * mx, h - 2 * my).save(img_path, "PNG")
+        except Exception:
+            pass
+
+        try:
+            if src.startswith("data:image"):
+                header, b64 = src.split(",", 1)
+                ext = ".png"
+                if "jpeg" in header or "jpg" in header: ext = ".jpg"
+                if "webp" in header: ext = ".webp"
+                save_path = os.path.splitext(save_path)[0] + ext
+                with open(save_path, "wb") as f:
+                    f.write(base64.b64decode(b64))
+                return save_path
+            data_url = page.evaluate('''async (url) => {
+                try {
+                    const r = await fetch(url);
+                    const b = await r.blob();
+                    if (!b || !b.type || !b.type.startsWith("image/")) {
+                        // một số URL trả redirect/html -> thử vẫn đọc nếu blob có kích thước
+                        if (!b || b.size < 5000) return null;
+                    }
+                    return await new Promise((res) => {
+                        const fr = new FileReader();
+                        fr.onload = () => res(fr.result);
+                        fr.onerror = () => res(null);
+                        fr.readAsDataURL(b);
+                    });
+                } catch (e) { return null; }
+            }''', src)
+            if not data_url or "," not in data_url:
+                self.log.emit("   ⚠️ Fetch ảnh không trả về dữ liệu ảnh hợp lệ.\n")
+                return None
+            header, b64 = data_url.split(",", 1)
+            ext = ".png"
+            if "jpeg" in header or "jpg" in header: ext = ".jpg"
+            if "webp" in header: ext = ".webp"
+            save_path = os.path.splitext(save_path)[0] + ext
+            with open(save_path, "wb") as f:
+                f.write(base64.b64decode(b64))
+            return save_path
+        except Exception as e:
+            self.log.emit(f"⚠️ Lỗi tải ảnh: {e}\n")
+            return None
+
+    def _make_one_variant(self, i, stem):
+        """Tạo 1 biến thể thumbnail. Tự mở Chrome (playwright) RIÊNG cho
+        biến thể này để có thể chạy song song với các biến thể khác."""
+        if self._cancel:
+            return None
+        hint = self.variant_hints[i % len(self.variant_hints)]
+        prompt = (
+            f"{self.base_prompt}\n\n"
+            f"PHONG CÁCH RIÊNG CHO ẢNH NÀY (biến thể {i+1}/{self.n_variants}): {hint}\n"
+            f"Giữ nguyên nhân vật/nét đặc trưng của ảnh gốc, chỉ đổi hậu cảnh & hiệu ứng "
+            f"theo phong cách trên. Vẫn có đầy đủ chữ tiêu đề tiếng Việt và badge. "
+            f"Chỉ tạo 1 ảnh, tỉ lệ 16:9 ngang."
+        )
+        self.log.emit(f"\n🖼️ [{i+1}/{self.n_variants}] Đang tạo thumbnail... ({hint})\n")
+
+        pw = browser = None
+        try:
+            from playwright.sync_api import sync_playwright
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(headless=not self.show_browser,
+                                         channel="chrome", args=BROWSER_ARGS)
+            ctx = browser.new_context(storage_state=AUTH_FILE, user_agent=UA,
+                                      viewport={"width": 1280, "height": 900})
+            ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+            page = ctx.new_page()
+
+            if self._cancel:
+                return None
+
+            page.goto("https://gemini.google.com/app",
+                      wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1500)
+
+            try:
+                known = set(page.eval_on_selector_all(
+                    "img", "els => els.map(e => e.src || '')"))
+            except Exception:
+                known = set()
+
+            ok, err = self._attach_image(page)
+            if not ok:
+                self.log.emit(f"⚠️ {err} -> bỏ qua biến thể {i+1}.\n")
+                return None
+
+            # Chụp lại danh sách ảnh SAU KHI đính kèm (gồm cả ảnh gốc vừa
+            # dán/upload) -> để _grab_new_image loại đúng ảnh gốc, chỉ lấy
+            # ảnh Gemini vẽ ra.
+            try:
+                known = set(page.eval_on_selector_all(
+                    "img", "els => els.map(e => e.src || '')"))
+            except Exception:
+                pass
+
+            ok, err = self._type_and_send(page, prompt)
+            if not ok:
+                self.log.emit(f"⚠️ {err} -> bỏ qua biến thể {i+1}.\n")
+                return None
+
+            out_path = os.path.join(self.out_dir, f"{stem}_thumb{i+1}.png")
+            got = self._grab_new_image(page, known, out_path)
+            if got:
+                self.log.emit(f"✅ Đã lưu: {os.path.basename(got)}\n")
+                self.one_done.emit(got)
+            else:
+                self.log.emit(f"❌ Không lấy được ảnh cho biến thể {i+1} "
+                              f"(có thể Gemini không trả ảnh / đổi giao diện).\n")
+            return got
+        except Exception as e:
+            self.log.emit(f"⚠️ Lỗi biến thể {i+1}: {e}\n")
+            return None
+        finally:
+            try: ctx.close()
+            except Exception: pass
+            try:
+                if browser: browser.close()
+                if pw: pw.stop()
+            except Exception:
+                pass
+
+    def run(self):
+        if not os.path.exists(AUTH_FILE):
+            self.log.emit("❌ Chưa đăng nhập Gemini. Hãy bấm 'Đồng bộ Gemini' ở tab dịch trước.\n")
+            self.all_done.emit([]); return
+        if not self.src_image or not os.path.exists(self.src_image):
+            self.log.emit("❌ Không tìm thấy ảnh gốc.\n")
+            self.all_done.emit([]); return
+
+        os.makedirs(self.out_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(self.src_image))[0]
+        # Đọc tỉ lệ ảnh gốc để KHÔNG chụp nhầm nó (dù src đổi sau khi Gemini vẽ).
+        self._src_ratio = None
+        try:
+            pm = QPixmap(self.src_image)
+            if not pm.isNull() and pm.height() > 0:
+                self._src_ratio = pm.width() / pm.height()
+        except Exception:
+            pass
+
+        saved = []
+        saved_lock = threading.Lock()
+        done_count = [0]
+        n_workers = 1
+        self.log.emit(f"🌐 Mở {n_workers} Chrome ẩn (tuần tự) để tạo thumbnail.\n")
+
+        def _worker(i):
+            got = self._make_one_variant(i, stem)
+            with saved_lock:
+                if got:
+                    saved.append(got)
+                done_count[0] += 1
+                self.progress.emit(done_count[0], self.n_variants)
+            return got
+
+        try:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = [pool.submit(_worker, i) for i in range(self.n_variants)]
+                for f in as_completed(futures):
+                    if self._cancel:
+                        break
+        except Exception as e:
+            self.log.emit(f"❌ Lỗi luồng tạo thumbnail: {e}\n")
+
+        self.log.emit(f"\n🏁 Xong. Tạo được {len(saved)}/{self.n_variants} thumbnail.\n")
+        self.all_done.emit(saved)
+
+
+_DEFAULT_THUMB_PROMPT = (
+    "Tạo ảnh thumbnail YouTube 16:9 HOÀN CHỈNH cho video review phim/drama Trung Quốc, "
+    "phong cách poster điện ảnh BOM TẤN, cực kỳ hoành tráng, dữ dội và có hồn. Giữ ĐÚNG "
+    "nhân vật chính và thần thái trong ảnh gốc (gương mặt sắc nét, biểu cảm mãnh liệt, "
+    "ánh mắt có thần).\n\n"
+    "HẬU CẢNH PHẢI EPIC & CÓ HỒN: dựng bối cảnh sử thi choáng ngợp — linh thú khổng lồ "
+    "bằng năng lượng (rồng vàng, phượng hoàng lửa) cuộn quanh phía sau, luồng năng lượng "
+    "bùng nổ, tia sáng tỏa mạnh, tàn lửa/tia điện bay, cung điện cổ mờ ảo phía xa, khói "
+    "sương huyền ảo. Ánh sáng điện ảnh tương phản cao, chiều sâu lớn, chi tiết dày đặc, "
+    "màu sắc rực rỡ bốc lửa. Nhân vật nổi bật giữa khung cảnh khí thế ngút trời, toát ra "
+    "sức mạnh và cảm xúc mạnh. Bố cục đặt nhân vật lệch xuống dưới hoặc sang bên, chừa "
+    "vùng trời/nền thoáng ở phía trên để đặt chữ mà không đè lên mặt.\n\n"
+    "CHỮ TIÊU ĐỀ: Đọc tên phim (chữ Trung) trong ảnh gốc, dịch sang TIẾNG VIỆT rồi RÚT "
+    "GỌN thành tiêu đề GIẬT TÍT thật ngắn — TỐI ĐA 2 DÒNG, mỗi dòng vài từ đắt giá, đúng "
+    "tinh thần phim (kiểu 'ĐỊNH MỆNH KHÓA CHẶT', 'NGHỊCH THIÊN CẢI MỆNH'). Ghi chữ IN HOA "
+    "to đậm, kiểu thư pháp/điện ảnh, gradient vàng-cam-đỏ phát sáng, viền đen dày đổ bóng.\n\n"
+    "VỊ TRÍ CHỮ CỰC KỲ QUAN TRỌNG: đặt chữ Ở PHÍA TRÊN hoặc vùng trống của ảnh, TUYỆT ĐỐI "
+    "KHÔNG che mặt, đầu hay thân nhân vật. Gương mặt nhân vật phải luôn rõ ràng, không bị "
+    "chữ đè lên. Nếu cần, thu nhỏ chữ để chừa mặt nhân vật.\n\n"
+    "BADGE: biểu tượng LOA đỏ + chữ 'Trọn Bộ' góc dưới trái, RUY BĂNG đỏ 'NEW' góc trên phải. "
+    "Bố cục chuyên nghiệp, hút mắt, đúng chuẩn thumbnail review phim triệu view."
+)
+
+
+class MergeRenderedThread(QThread):
+    log = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, file_list, out_file, intro_image=None):
+        super().__init__()
+        self.file_list = file_list
+        self.out_file = out_file
+        self.intro_image = intro_image
+
+    def run(self):
+        self.log.emit(f"🔗 Bắt đầu gộp {len(self.file_list)} file nhanh (stream copy)...\n")
+        ffmpeg = get_ffmpeg_path()
+        final_file_list = list(self.file_list)
+        intro_vid = None
+        
+        if self.intro_image and os.path.exists(self.intro_image):
+            self.log.emit("🖼️ Đang tạo video Intro 2s từ Thumbnail...\n")
+            first_vid = self.file_list[0]
+            w, h = 1920, 1080
+            try:
+                probe = subprocess.run([ffmpeg, "-i", first_vid], stderr=subprocess.PIPE, text=True, errors="ignore", creationflags=CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                m = re.search(r"Video:.*?,.*? (\d+)x(\d+)", probe.stderr)
+                if m:
+                    w, h = int(m.group(1)), int(m.group(2))
+            except Exception as e:
+                self.log.emit(f"⚠️ Lỗi đọc phân giải video đầu ({e}), dùng mặc định {w}x{h}\n")
+                
+            import tempfile, time, subprocess, os
+            intro_vid = os.path.join(tempfile.gettempdir(), f"intro_2s_{int(time.time())}.mp4")
+            cmd_intro = [
+                ffmpeg, "-y",
+                "-loop", "1", "-framerate", "30", "-t", "2", "-i", self.intro_image,
+                "-f", "lavfi", "-t", "2", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1",
+                "-c:v", get_optimal_ffmpeg_codec(),
+                "-c:a", "aac", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                intro_vid
+            ]
+            si = subprocess.STARTUPINFO() if os.name == "nt" else None
+            if si: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                
+            proc_intro = subprocess.run(cmd_intro, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=si, text=True, errors="replace")
+            if proc_intro.returncode == 0 and os.path.exists(intro_vid):
+                final_file_list.insert(0, intro_vid)
+                self.log.emit("✅ Đã tạo xong video Intro 2s.\n")
+            else:
+                self.log.emit(f"❌ Lỗi tạo Intro:\n{proc_intro.stderr[-500:]}\n")
+
+        import tempfile, time
+        list_txt = os.path.join(tempfile.gettempdir(), f"concat_list_{int(time.time())}.txt")
+        try:
+            with open(list_txt, "w", encoding="utf-8") as f:
+                for fp in final_file_list:
+                    safe_path = fp.replace('\\', '/').replace("'", r"\'")
+                    f.write(f"file '{safe_path}'\n")
+
+            cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_txt, "-c", "copy", "-movflags", "+faststart", self.out_file]
+            si = subprocess.STARTUPINFO() if os.name == "nt" else None
+            if si: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=si, text=True, encoding="utf-8", errors="replace")
+            if proc.returncode == 0 and os.path.exists(self.out_file):
+                self.log.emit(f"✅ Gộp trọn bộ thành công: {os.path.basename(self.out_file)}\n")
+                self.done.emit(True, self.out_file)
+            else:
+                err = proc.stderr[-500:] if proc.stderr else "Lỗi không xác định"
+                self.log.emit(f"❌ Lỗi gộp file FFmpeg:\n{err}\n")
+                self.done.emit(False, "")
+        except Exception as e:
+            self.log.emit(f"❌ Exception khi gộp: {e}\n")
+            self.done.emit(False, "")
+        finally:
+            if os.path.exists(list_txt):
+                try: os.remove(list_txt)
+                except: pass
+            if intro_vid and os.path.exists(intro_vid):
+                try: os.remove(intro_vid)
+                except: pass
 
 class SingleRenderThread(QThread):
     log = pyqtSignal(str); done = pyqtSignal(bool)
@@ -189,10 +1022,17 @@ class SingleRenderThread(QThread):
             filter_chains.append(f"{last_vid_out}[frame_s] overlay=0:0:shortest=1 [v_framed]")
             last_vid_out = "[v_framed]"
 
-        if self.cfg.get("logo_en") and self.cfg.get("logo_path") and os.path.exists(self.cfg.get("logo_path")):
+        logo_en = self.cfg.get("logo_en")
+        logo_path = self.cfg.get("logo_path")
+        if logo_en and not logo_path:
+            self.log.emit("⚠️ Logo đang BẬT nhưng chưa chọn file ảnh -> bỏ qua logo.\n")
+        elif logo_en and logo_path and not os.path.exists(logo_path):
+            self.log.emit(f"⚠️ Logo đang BẬT nhưng KHÔNG TÌM THẤY file tại đường dẫn:\n    {logo_path}\n"
+                           f"    (File có thể đã bị xoá/di chuyển sau khi chọn) -> bỏ qua logo.\n")
+        elif logo_en and logo_path and os.path.exists(logo_path):
             try:
                 logo_idx = inputs.count("-i")
-                inputs.extend(["-loop", "1", "-i", self.cfg["logo_path"]])
+                inputs.extend(["-loop", "1", "-i", logo_path])
                 lx, ly = int(self.cfg["logo_x"]), int(self.cfg["logo_y"]); logo_scale = self.cfg.get("logo_scale", 1.0)
                 if abs(logo_scale - 1.0) > 0.01: 
                     filter_chains.append(f"[{logo_idx}:v] format=yuva420p,scale=iw*{logo_scale:.3f}:ih*{logo_scale:.3f} [logo_s]")
@@ -200,6 +1040,7 @@ class SingleRenderThread(QThread):
                     filter_chains.append(f"[{logo_idx}:v] format=yuva420p [logo_s]")
                 filter_chains.append(f"{last_vid_out}[logo_s] overlay=x={lx}:y={ly}:shortest=1 [v_logo]")
                 last_vid_out = "[v_logo]"
+                self.log.emit(f"   🖼️ Đã chèn logo tại x={lx}, y={ly}, scale={logo_scale:.3f}\n")
             except Exception as e:
                 self.log.emit(f"⚠️ Lỗi chèn logo vào filter chain, bỏ qua logo: {e}\n")
 
@@ -504,6 +1345,49 @@ class EpisodeCard(QFrame):
     def set_selected(self, val):
         self.selected = val; self._apply_style()
 
+    def refresh_srt_from_disk(self):
+        """Tự dò lại sub + video đã lồng tiếng cạnh video trên đĩa và cập
+        nhật nhãn. Ưu tiên bản tiếng Việt (*_vi.srt), không có thì lấy .srt
+        gốc (vừa tách xong). Nếu tìm thấy *_dubbed.mp4 cạnh video gốc thì
+        chuyển video_path sang bản đã lồng để RENDER DÙNG ĐÚNG TIẾNG ĐÃ LỒNG
+        (trước đây render vẫn lấy video gốc vì không ai cập nhật video_path).
+        Trả về True nếu vừa tìm thấy sub mới hoặc video mới."""
+        # Xác định stem gốc (bỏ hậu tố _dubbed nếu video_path đang trỏ
+        # tới bản gốc chưa lồng)
+        stem, ext = os.path.splitext(self.video_path)
+        if stem.endswith("_dubbed"):
+            orig_stem = stem[:-len("_dubbed")]
+        else:
+            orig_stem = stem
+        dubbed_video = orig_stem + "_dubbed" + ext
+        video_changed = False
+        if os.path.exists(dubbed_video) and self.video_path != dubbed_video:
+            self.video_path = dubbed_video
+            video_changed = True
+            if hasattr(self, "lbl_name"):
+                self.lbl_name.setText(os.path.basename(self.video_path))
+
+        base = orig_stem
+        vi = base + "_vi.srt"
+        raw = base + ".srt"
+        found = None
+        if os.path.exists(vi):
+            found = vi
+        elif os.path.exists(raw):
+            found = raw
+        if not found:
+            return video_changed
+        changed = (self.srt_path != found) or video_changed
+        self.srt_path = found
+        # Nhãn: bản Việt -> xanh, sub gốc (chưa dịch) -> vàng nhắc nhở
+        if found.endswith("_vi.srt"):
+            self.lbl_srt.setText("📄 " + os.path.basename(found))
+            self.lbl_srt.setStyleSheet("color:#10B981; font-size:10px; border:none;")
+        else:
+            self.lbl_srt.setText("📄 " + os.path.basename(found) + " (sub gốc)")
+            self.lbl_srt.setStyleSheet("color:#FBBF24; font-size:10px; border:none;")
+        return changed
+
     def set_status(self, status):
         colors = {
             "chờ": ("#2D303D", "#8A8D98"),
@@ -551,6 +1435,8 @@ class RenderWidget(QWidget):
         self.settings = QSettings("HongguoDownloader", "RenderTab")
         self.cards = []                 # danh sách EpisodeCard trong grid
         self.selected_card = None
+        self._thumb_src_path = None     # ảnh gốc cho thumbnail AI
+        self._thumb_thread = None
         self.blur_boxes = []
         self.sample_sub = None
         self.logo_item = None
@@ -583,7 +1469,7 @@ class RenderWidget(QWidget):
         head_q = QHBoxLayout()
         head_q.addWidget(QLabel("🎞️ Hàng đợi Render", styleSheet="font-size:14px; font-weight:bold; color:#F37021; border:none;"))
         head_q.addStretch()
-        self.btn_open_folder = QPushButton("📂 Mở thư mục đang render")
+        self.btn_open_folder = QPushButton("📂 Mở thư mục")
         self.btn_open_folder.setStyleSheet("QPushButton { background:#2D303D; color:#E5E6E8; padding:6px 10px; font-size:11px; border-radius:6px; border:1px solid #3B3E4D; } QPushButton:hover { background:#3B3E4D; border:1px solid #7452FF; color:white; }")
         self.btn_open_folder.clicked.connect(self._open_render_folder)
         head_q.addWidget(self.btn_open_folder)
@@ -596,6 +1482,13 @@ class RenderWidget(QWidget):
         b_clear.setStyleSheet("background:#2D303D; color:#F87171; border:1px dashed #EF4444;")
         btnrow.addWidget(b_folder); btnrow.addWidget(b_files); btnrow.addWidget(b_clear)
         ll.addLayout(btnrow)
+
+        # Nút dọn file rác: sau khi render xong, xóa hết file trung gian, chỉ
+        # giữ lại bản render cuối (*_final.mp4) và bản gộp trọn bộ.
+        self.btn_clean_junk = QPushButton("🧹 Dọn file rác (chỉ giữ bản render)")
+        self.btn_clean_junk.setStyleSheet("QPushButton { background:#3B2A12; color:#FBBF24; border:1px solid #92610a; border-radius:6px; padding:6px; font-size:11px; font-weight:bold; } QPushButton:hover { background:#4a350f; }")
+        self.btn_clean_junk.clicked.connect(self._clean_junk_files)
+        ll.addWidget(self.btn_clean_junk)
 
         self.scroll_grid = QScrollArea(); self.scroll_grid.setWidgetResizable(True)
         self.grid_host = QWidget(); self.grid_lay = QGridLayout(self.grid_host)
@@ -652,15 +1545,55 @@ class RenderWidget(QWidget):
         main.addWidget(center, stretch=6)
 
         # ---------- CỘT PHẢI: DESIGN ----------
-        right = QFrame(); right.setMinimumWidth(300); right.setMaximumWidth(350)
+        right = QFrame(); right.setMinimumWidth(320); right.setMaximumWidth(380)
         right.setStyleSheet("background:#151821; border-radius:8px; border:1px solid #1F222D;")
-        rl = QVBoxLayout(right); rl.setContentsMargins(10, 10, 10, 10)
-        rl.addWidget(QLabel("🎨 Thiết kế & Render", styleSheet="font-size:14px; font-weight:bold; color:#10B981; border:none;"))
+        rl = QVBoxLayout(right); rl.setContentsMargins(5, 5, 5, 5)
+
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(
+            "QTabWidget::pane { border: 1px solid #2D303D; border-radius: 4px; background: #151821; }"
+            "QTabBar::tab { background: #1C1D27; color: #8A8D98; padding: 7px 4px; border: 1px solid #2D303D; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; font-weight: bold; font-size: 10px; }"
+            "QTabBar::tab:selected { background: #2D303D; color: #10B981; }"
+            "QTabBar::tab:hover:!selected { background: #232533; }"
+        )
+        # Cho 3 tab chia đều bề ngang, không dùng nút cuộn ‹ › gây phải bấm qua lại
+        self.tabs.tabBar().setExpanding(True)
+        self.tabs.setUsesScrollButtons(False)
+        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
+        self.tab_design = QWidget()
+        self.tab_thumb = QWidget()
+        self.tabs.addTab(self.tab_design, "🎨 Thiết kế")
+        self.tabs.addTab(self.tab_thumb, "🖼️ Thumbnail")
+        # Tab con: Tách sub → Dịch → Lồng tiếng (tái dùng thread từ honggou_tab).
+        # Import an toàn: thiếu module thì bỏ qua, không làm hỏng tab Render.
+        try:
+            from render_dub_feature import attach_dub_tab
+            attach_dub_tab(self)
+        except Exception as _dub_err:
+            print(f"[WARN] Không nạp được tab Sub→Dịch→Lồng: {_dub_err}")
+        rl.addWidget(self.tabs)
+
+        design_lay = QVBoxLayout(self.tab_design); design_lay.setContentsMargins(5, 10, 5, 5)
 
         self.chk_hardsub = QCheckBox("Khắc Sub vào Video")
         self.chk_hardsub.setChecked(self.settings.value("hardsub_en", True, type=bool))
         self.chk_hardsub.setStyleSheet("color:#FBBF24; font-weight:bold;")
-        rl.addWidget(self.chk_hardsub)
+        design_lay.addWidget(self.chk_hardsub)
+
+        # ── Chèn Intro (đưa lên đầu tab thiết kế cho dễ thao tác) ──
+        intro_row = QHBoxLayout()
+        self.chk_intro = QCheckBox("Chèn Intro (2s)")
+        self.chk_intro.setChecked(self.settings.value("intro_en", False, type=bool))
+        self.chk_intro.setStyleSheet("color:#F37021; font-weight:bold; font-size:11px;")
+        self.intro_input = QLineEdit(self.settings.value("intro_path", ""))
+        self.intro_input.setPlaceholderText("Ảnh Intro...")
+        btn_intro_pick = QPushButton("Chọn")
+        btn_intro_pick.setFixedWidth(50)
+        btn_intro_pick.clicked.connect(self._select_intro)
+        intro_row.addWidget(self.chk_intro); intro_row.addWidget(self.intro_input); intro_row.addWidget(btn_intro_pick)
+        design_lay.addLayout(intro_row)
+        self.chk_intro.stateChanged.connect(lambda: self.settings.setValue("intro_en", self.chk_intro.isChecked()))
+        self.intro_input.textChanged.connect(lambda: self.settings.setValue("intro_path", self.intro_input.text().strip()))
 
         ql = QHBoxLayout(); ql.addWidget(QLabel("Chất lượng:"))
         self.cb_quality = QComboBox()
@@ -671,21 +1604,20 @@ class RenderWidget(QWidget):
             "⚡ Nhanh (1 Mbps - File nhỏ)",
         ])
         self.cb_quality.setCurrentText(self.settings.value("render_quality", "⭐ Tốt (CRF 20 - Đề xuất)"))
-        ql.addWidget(self.cb_quality); rl.addLayout(ql)
+        ql.addWidget(self.cb_quality); design_lay.addLayout(ql)
 
         fb = QHBoxLayout(); fb.addWidget(QLabel("Font:"))
         self.cb_font = QComboBox(); self.cb_font.addItems(FONTS_LIST)
         self.cb_font.setCurrentText(self.settings.value("font_name", "Arial"))
         fb.addWidget(QLabel("Cỡ:")); self.spin_size = QSpinBox(); self.spin_size.setRange(10, 150)
         self.spin_size.setValue(int(self.settings.value("font_size", 24)))
-        fb.addWidget(self.cb_font); fb.addWidget(self.spin_size); rl.addLayout(fb)
+        fb.addWidget(self.cb_font); fb.addWidget(self.spin_size); design_lay.addLayout(fb)
 
         cb = QHBoxLayout(); cb.addWidget(QLabel("Màu Sub:"))
         self.cb_color = QComboBox(); self.cb_color.addItems(list(COLOR_PRESETS.keys()))
         self.cb_color.setCurrentText(self.settings.value("font_color_name", "Trắng (White)"))
-        cb.addWidget(self.cb_color); rl.addLayout(cb)
+        cb.addWidget(self.cb_color); design_lay.addLayout(cb)
 
-        # ── Nền ô chữ (dạng hộp màu sau chữ) ──
         box_row = QHBoxLayout()
         self.chk_subbox = QCheckBox("Nền ô chữ")
         self.chk_subbox.setChecked(self.settings.value("subbox_en", False, type=bool))
@@ -696,7 +1628,7 @@ class RenderWidget(QWidget):
         self.cb_subbox_color.addItems(["Đen", "Xám đậm", "Xanh đen", "Trắng"])
         self.cb_subbox_color.setCurrentText(self.settings.value("subbox_color_name", "Đen"))
         box_row.addWidget(self.cb_subbox_color)
-        rl.addLayout(box_row)
+        design_lay.addLayout(box_row)
 
         op_row = QHBoxLayout()
         op_row.addWidget(QLabel("Độ mờ nền:"))
@@ -704,10 +1636,9 @@ class RenderWidget(QWidget):
         self.spn_subbox_opacity.setRange(0, 100)
         self.spn_subbox_opacity.setValue(int(self.settings.value("subbox_opacity", 60)))
         self.spn_subbox_opacity.setSuffix(" %")
-        self.spn_subbox_opacity.setToolTip("0% = trong suốt (không thấy nền), 100% = nền đặc kín.")
         op_row.addWidget(self.spn_subbox_opacity); op_row.addStretch()
-        rl.addLayout(op_row)
-        # đổi font/cỡ/màu -> cập nhật ngay ô chữ mẫu trên preview
+        design_lay.addLayout(op_row)
+
         self.cb_font.currentTextChanged.connect(lambda *_: self._restyle_sample_sub())
         self.spin_size.valueChanged.connect(lambda *_: self._restyle_sample_sub())
         self.cb_color.currentTextChanged.connect(lambda *_: self._restyle_sample_sub())
@@ -719,26 +1650,27 @@ class RenderWidget(QWidget):
         b_add.clicked.connect(lambda: self._add_blur_box())
         b_clr = QPushButton("[-] Xóa"); b_clr.setStyleSheet("background:#2D303D; color:#EF4444; padding:4px; font-size:10px;")
         b_clr.clicked.connect(self._clear_blur_boxes)
-        bl.addWidget(self.chk_blur); bl.addWidget(b_add); bl.addWidget(b_clr); rl.addLayout(bl)
+        bl.addWidget(self.chk_blur); bl.addWidget(b_add); bl.addWidget(b_clr); design_lay.addLayout(bl)
 
         frl = QHBoxLayout()
         self.chk_frame = QCheckBox("Overlay PNG"); self.chk_frame.setChecked(self.settings.value("bp_frame_en", False, type=bool))
         self.chk_frame.setStyleSheet("color:#7452FF; font-weight:bold;")
         self.frame_input = QLineEdit(self.settings.value("frame_path", "")); self.frame_input.setPlaceholderText("Ảnh PNG...")
         bf = QPushButton("Chọn"); bf.setFixedWidth(55); bf.clicked.connect(self._select_frame)
-        frl.addWidget(self.chk_frame); frl.addWidget(self.frame_input); frl.addWidget(bf); rl.addLayout(frl)
+        frl.addWidget(self.chk_frame); frl.addWidget(self.frame_input); frl.addWidget(bf); design_lay.addLayout(frl)
 
         lgl = QHBoxLayout()
         self.chk_logo = QCheckBox("Logo"); self.chk_logo.setChecked(self.settings.value("bp_logo_en", False, type=bool))
         self.logo_input = QLineEdit(self.settings.value("logo_path", ""))
         bg2 = QPushButton("Chọn"); bg2.setFixedWidth(55); bg2.clicked.connect(self._select_logo)
-        lgl.addWidget(self.chk_logo); lgl.addWidget(self.logo_input); lgl.addWidget(bg2); rl.addLayout(lgl)
+        lgl.addWidget(self.chk_logo); lgl.addWidget(self.logo_input); lgl.addWidget(bg2); design_lay.addLayout(lgl)
 
-        # Hook hiển thị ảnh logo
         self.chk_logo.stateChanged.connect(lambda: self._update_logo_preview())
         self.logo_input.textChanged.connect(lambda: self._update_logo_preview())
+        self.chk_logo.stateChanged.connect(lambda: setattr(self, "_design_locked", None))
+        self.logo_input.textChanged.connect(lambda: setattr(self, "_design_locked", None))
 
-        rl.addWidget(QLabel("🎛️ Bộ lọc Bypass FX:", styleSheet="font-weight:bold; margin-top:10px; color:#8A8D98;"))
+        design_lay.addWidget(QLabel("🎛️ Bộ lọc Bypass FX:", styleSheet="font-weight:bold; margin-top:5px; color:#8A8D98;"))
         self.chk_flip = QCheckBox("Lật ngang"); self.chk_zoom = QCheckBox("Phóng to 4%")
         self.chk_color = QCheckBox("Kích màu sáng"); self.chk_noise = QCheckBox("Nhiễu hạt")
         self.chk_speed = QCheckBox("Tốc độ 1.05x"); self.chk_pitch = QCheckBox("Đổi Tone")
@@ -752,29 +1684,203 @@ class RenderWidget(QWidget):
         gb.addWidget(self.chk_color, 1, 0); gb.addWidget(self.chk_noise, 1, 1)
         gb.addWidget(self.chk_speed, 2, 0); gb.addWidget(self.chk_pitch, 2, 1)
         gb.addWidget(self.chk_rotate, 3, 0)
-        rl.addLayout(gb)
-        rl.addStretch()
+        design_lay.addLayout(gb)
+        design_lay.addStretch()
 
-        # Nút Đồng bộ: chốt cấu hình canh chỉnh hiện tại (vị trí sub + ô che +
-        # font/màu) làm chuẩn áp cho TẤT CẢ các tập khi render.
+        # ── Khu Thumbnail AI (Gemini) ──
+        self._build_thumbnail_ui(self.tab_thumb)
+
+        bot_lay = QVBoxLayout(); bot_lay.setContentsMargins(5, 5, 5, 5)
         self.btn_sync_design = QPushButton("🔄 Đồng bộ canh chỉnh cho tất cả file")
-        self.btn_sync_design.setStyleSheet("QPushButton { background:#0891b2; color:white; padding:9px; font-size:12px; border-radius:8px; border:none; } QPushButton:hover { background:#0e7490; }")
+        self.btn_sync_design.setStyleSheet("QPushButton { background:#0891b2; color:white; padding:8px; font-size:12px; border-radius:8px; border:none; } QPushButton:hover { background:#0e7490; }")
         self.btn_sync_design.clicked.connect(self._sync_design_all)
-        rl.addWidget(self.btn_sync_design)
+        bot_lay.addWidget(self.btn_sync_design)
+
+        merge_row = QHBoxLayout()
+        self.chk_merge_all = QCheckBox("🔗 Gộp trọn bộ sau Render")
+        self.chk_merge_all.setChecked(self.settings.value("merge_after_render", False, type=bool))
+        self.chk_merge_all.setStyleSheet("color:#10B981; font-weight:bold; font-size:12px;")
+        self.chk_merge_all.stateChanged.connect(lambda: self.settings.setValue("merge_after_render", self.chk_merge_all.isChecked()))
+        merge_row.addWidget(self.chk_merge_all)
+        bot_lay.addLayout(merge_row)
+
+        # Nút chạy trọn quy trình: tách → dịch → lồng → render. Dùng đúng cấu
+        # hình đã set trong tab con "Sub → Dịch → Lồng".
+        self.btn_full_pipeline = QPushButton("🚀 LÀM TẤT CẢ: Tách → Dịch → Lồng → Render")
+        self.btn_full_pipeline.setStyleSheet("QPushButton { background:#7452FF; color:white; padding:11px; font-size:12px; font-weight:bold; border-radius:8px; border:none; } QPushButton:hover { background:#5b3fd6; } QPushButton:disabled { background:#3B3E4D; color:#8A8D98; }")
+        self.btn_full_pipeline.clicked.connect(self._run_full_pipeline_external)
+        bot_lay.addWidget(self.btn_full_pipeline)
 
         self.btn_run = QPushButton("🔥 RENDER TẤT CẢ (0)")
         self.btn_run.setStyleSheet("QPushButton { background:#F37021; color:white; padding:12px; font-size:14px; border-radius:8px; border:none; } QPushButton:hover { background:#e05f10; }")
         self.btn_run.clicked.connect(self._start_render_all)
-        rl.addWidget(self.btn_run)
+        bot_lay.addWidget(self.btn_run)
 
         self.btn_stop = QPushButton("⛔ DỪNG RENDER")
         self.btn_stop.setStyleSheet("QPushButton { background:#7F1D1D; color:white; padding:10px; font-size:13px; border-radius:8px; border:none; } QPushButton:hover { background:#991B1B; } QPushButton:disabled { background:#3B2020; color:#8A8D98; }")
         self.btn_stop.clicked.connect(self._stop_render)
         self.btn_stop.setEnabled(False)
-        rl.addWidget(self.btn_stop)
-        main.addWidget(right)
+        bot_lay.addWidget(self.btn_stop)
+        
+        rl.addLayout(bot_lay)
+        main.addWidget(right)    # ============ THUMBNAIL AI ============
+    def _build_thumbnail_ui(self, parent_widget):
+        v = QVBoxLayout(parent_widget)
+        v.setContentsMargins(5, 5, 5, 5)
+        v.addWidget(QLabel("Tùy chỉnh Prompt & Ảnh gốc", styleSheet="font-size:12px; font-weight:bold; color:#F59E0B; border:none; margin-bottom:5px;"))
 
-    # ============ LOG ============
+        r1 = QHBoxLayout()
+        self.lbl_thumb_src = QLabel("Chưa chọn ảnh gốc")
+        self.lbl_thumb_src.setStyleSheet("color:#8A8D98; font-size:10px; border:none;")
+        btn_pick = QPushButton("Chọn ảnh gốc"); btn_pick.setFixedWidth(90)
+        btn_pick.clicked.connect(self._pick_thumb_source)
+        r1.addWidget(self.lbl_thumb_src, stretch=1); r1.addWidget(btn_pick)
+        v.addLayout(r1)
+
+        v.addWidget(QLabel("Prompt (sửa nếu thích):", styleSheet="color:#8A8D98; font-size:10px; border:none;"))
+        self.txt_thumb_prompt = QPlainTextEdit()
+        self.txt_thumb_prompt.setPlainText(_DEFAULT_THUMB_PROMPT)
+        self.txt_thumb_prompt.setFixedHeight(120)
+        self.txt_thumb_prompt.setStyleSheet(
+            "QPlainTextEdit { background:#1B1D25; color:#E5E6E8; border:1px solid #3B3E4D; "
+            "border-radius:6px; font-size:11px; padding:4px; }")
+        v.addWidget(self.txt_thumb_prompt)
+
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel("Số ảnh:", styleSheet="color:#8A8D98; border:none; font-size:11px;"))
+        self.spin_thumb_n = QSpinBox(); self.spin_thumb_n.setRange(1, 8)
+        self.spin_thumb_n.setValue(4); self.spin_thumb_n.setFixedWidth(50)
+        r2.addWidget(self.spin_thumb_n); r2.addStretch()
+        self.btn_thumb_run = QPushButton("✨ Tạo Thumbnail")
+        self.btn_thumb_run.setStyleSheet(
+            "QPushButton { background:#7452FF; color:white; border-radius:6px; padding:7px 14px; font-weight:bold; border:none; }"
+            "QPushButton:hover { background:#6035E0; }")
+        self.btn_thumb_run.clicked.connect(self._start_thumbnail)
+        r2.addWidget(self.btn_thumb_run)
+        v.addLayout(r2)
+
+        self.thumb_result_row = QHBoxLayout()
+        self.thumb_result_row.addStretch()
+        
+        scroll_res = QScrollArea()
+        scroll_res.setFixedHeight(120)
+        scroll_res.setWidgetResizable(True)
+        scroll_res.setStyleSheet("border:none; background:transparent;")
+        res_container = QWidget()
+        res_container.setLayout(self.thumb_result_row)
+        scroll_res.setWidget(res_container)
+        
+        v.addWidget(QLabel("Kết quả (bấm xem hoặc Set Intro):", styleSheet="color:#8A8D98; font-size:10px; border:none; margin-top:5px;"))
+        v.addWidget(scroll_res)
+        v.addStretch()
+
+    def _pick_thumb_source(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Chọn ảnh gốc làm mẫu", "",
+            "Ảnh (*.png *.jpg *.jpeg *.webp *.bmp);;Tất cả (*)")
+        if f:
+            self._thumb_src_path = f
+            self.lbl_thumb_src.setText(os.path.basename(f))
+            self.lbl_thumb_src.setStyleSheet("color:#10B981; font-size:10px; border:none;")
+
+    def _start_thumbnail(self):
+        src = getattr(self, "_thumb_src_path", None)
+        if not src or not os.path.exists(src):
+            QMessageBox.information(self, "Chưa chọn ảnh", "Hãy chọn 1 ảnh gốc làm mẫu trước.")
+            return
+        if getattr(self, "_thumb_thread", None) and self._thumb_thread.isRunning():
+            QMessageBox.information(self, "Đang chạy", "Đang tạo thumbnail, vui lòng đợi.")
+            return
+        if not os.path.exists(AUTH_FILE):
+            QMessageBox.warning(self, "Chưa đăng nhập Gemini",
+                                "Hãy bấm 'Đồng bộ Gemini' (ở tab dịch) để đăng nhập 1 lần trước.")
+            return
+
+        prompt = self.txt_thumb_prompt.toPlainText().strip() or _DEFAULT_THUMB_PROMPT
+        n = self.spin_thumb_n.value()
+        out_dir = os.path.join(os.path.dirname(src), "AI_Thumbnails")
+
+        self._clear_thumb_results()
+        self.btn_thumb_run.setEnabled(False)
+        self.btn_thumb_run.setText("⏳ Đang tạo...")
+        self._log(f"✨ Bắt đầu tạo {n} thumbnail từ: {os.path.basename(src)}\n")
+
+        self._thumb_thread = GeminiThumbnailThread(
+            src_image=src, base_prompt=prompt, out_dir=out_dir, n_variants=n,
+            show_browser=True)
+        self._thumb_thread.log.connect(self._log)
+        self._thumb_thread.one_done.connect(self._add_thumb_result)
+        self._thumb_thread.all_done.connect(self._on_thumb_all_done)
+        self._thumb_thread.start()
+
+    def _clear_thumb_results(self):
+        while self.thumb_result_row.count():
+            it = self.thumb_result_row.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+        self.thumb_result_row.addStretch()
+
+    def _add_thumb_result(self, path):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        
+        btn = QPushButton()
+        pix = QPixmap(path)
+        if not pix.isNull():
+            btn.setIcon(QIcon(pix)); btn.setIconSize(QSize(96, 54))
+        btn.setFixedSize(104, 62); btn.setToolTip(path)
+        btn.setStyleSheet("QPushButton { border:1px solid #3B3E4D; border-radius:6px; background:#1B1D25; }"
+                          "QPushButton:hover { border:1px solid #7452FF; }")
+        btn.clicked.connect(lambda _=False, p=path: self._open_thumb_path(p))
+        
+        btn_intro = QPushButton("⭐ Làm Intro")
+        btn_intro.setStyleSheet("QPushButton { background:#31265C; color:#A78BFA; font-size:10px; font-weight:bold; padding:4px; border-radius:4px; border:none; } QPushButton:hover { background:#7452FF; color:white; }")
+        btn_intro.clicked.connect(lambda _=False, p=path: self._set_intro(p))
+        
+        lay.addWidget(btn)
+        lay.addWidget(btn_intro)
+        
+        self.thumb_result_row.insertWidget(self.thumb_result_row.count() - 1, w)
+
+    def _open_thumb_path(self, path):
+        try:
+            if os.name == "nt":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            self._log(f"⚠️ Không mở được ảnh: {e}\n")
+
+    def _on_thumb_all_done(self, saved):
+        self.btn_thumb_run.setEnabled(True)
+        self.btn_thumb_run.setText("✨ Tạo Thumbnail")
+        if saved:
+            folder = os.path.dirname(saved[0])
+            QMessageBox.information(self, "Xong",
+                f"Đã tạo {len(saved)} thumbnail.\nLưu tại:\n{folder}")
+        else:
+            QMessageBox.warning(self, "Không có ảnh",
+                "Không tạo được thumbnail nào. Kiểm tra log — có thể Gemini không trả ảnh, "
+                "chưa đăng nhập, hoặc giao diện Gemini đã đổi (cần chỉnh selector).")
+
+    def _select_intro(self):
+        fp, _ = QFileDialog.getOpenFileName(self, "Chọn ảnh Intro", "", "Ảnh (*.png *.jpg *.jpeg *.webp)")
+        if fp:
+            self.intro_input.setText(fp)
+            self.chk_intro.setChecked(True)
+
+    def _set_intro(self, path):
+        self.intro_input.setText(path)
+        self.chk_intro.setChecked(True)
+        self._log(f"📌 Đã đặt ảnh này làm Intro 2s cho Video trọn bộ.\n")
+        QMessageBox.information(self, "Thành công", "Đã chọn ảnh này làm Intro 2 giây khi gộp trọn bộ!")
+
+        # ============ LOG ============
     def _log(self, msg):
         self.txt_log.append(str(msg).strip())
 
@@ -843,7 +1949,7 @@ class RenderWidget(QWidget):
                 groups.setdefault(stem, {})["plain"] = v
 
         pairs = []
-        for base in sorted(groups.keys()):
+        for base in sorted(groups.keys(), key=_natural_key):
             g = groups[base]
             video = g.get("dubbed") or g.get("plain")
             if not video:
@@ -994,7 +2100,7 @@ class RenderWidget(QWidget):
         rect = self.scene.sceneRect()
         W = rect.width() or 1080; H = rect.height() or 1920
         if getattr(self, 'sample_sub', None) is None:
-            self.sample_sub = ScalableTextItem("Chữ Dịch Tiếng Việt (kéo tôi đi đâu cũng được!)")
+            self.sample_sub = ScalableTextItem("Chữ mẫu — kéo để đặt chữ")
             self.sample_sub.setZValue(5)
             self.scene.addItem(self.sample_sub)
             self.sample_sub.setPos(W * 0.08, H * 0.80)
@@ -1106,6 +2212,18 @@ class RenderWidget(QWidget):
         self.settings.setValue("subbox_en", subbox_en)
         self.settings.setValue("subbox_color_name", self.cb_subbox_color.currentText())
         self.settings.setValue("subbox_opacity", opac)
+        # Lưu thêm các thiết lập Logo/Khung mờ/Overlay/Bypass FX -> trước đây
+        # các giá trị này chỉ được ĐỌC lúc khởi động chứ chưa từng được GHI,
+        # nên có thể bị "quên" nếu app khởi động lại giữa chừng.
+        self.settings.setValue("bp_logo_en", self.chk_logo.isChecked())
+        self.settings.setValue("logo_path", self.logo_input.text().strip())
+        self.settings.setValue("bp_frame_en", self.chk_frame.isChecked())
+        self.settings.setValue("frame_path", self.frame_input.text().strip())
+        self.settings.setValue("bp_blur_en", self.chk_blur.isChecked())
+        for k, chk in (("bp_flip", self.chk_flip), ("bp_zoom", self.chk_zoom), ("bp_color", self.chk_color),
+                       ("bp_noise", self.chk_noise), ("bp_speed", self.chk_speed), ("bp_pitch", self.chk_pitch),
+                       ("bp_rotate", self.chk_rotate)):
+            self.settings.setValue(k, chk.isChecked())
         return {
             "hardsub_en": self.chk_hardsub.isChecked(),
             "render_quality": self.cb_quality.currentText(),
@@ -1169,6 +2287,17 @@ class RenderWidget(QWidget):
             lx = int(max(0, lp["x"] * sx))
             ly = int(max(0, lp["y"] * sy))
             lscale = lp["scale"] * sx
+            if lscale <= 0.01:
+                # An toàn: nếu vì lý do gì đó (scene chưa kịp load kích thước
+                # khi tick Logo, v.v.) hệ số scale tính ra ~0, logo sẽ bị co
+                # về kích thước gần như vô hình dù overlay vẫn "chạy thành
+                # công" không báo lỗi gì. Ép về 1.0 để logo luôn thấy được.
+                self._log(f"   ⚠️ [logo] scale tính ra bất thường ({lscale:.4f}) -> dùng scale=1.0 để logo không bị vô hình.\n")
+                lscale = 1.0
+            # Đảm bảo logo không bị đẩy hẳn ra ngoài khung hình do toạ độ
+            # scene không khớp với kích thước video thật.
+            lx = min(lx, max(0, W - 10))
+            ly = min(ly, max(0, H - 10))
 
         return {
             "scene_w": int(W), "scene_h": int(H),
@@ -1203,6 +2332,98 @@ class RenderWidget(QWidget):
             f"Đã lưu canh chỉnh hiện tại làm chuẩn cho tất cả {len(self.cards)} tập.\n"
             f"Bấm 'RENDER TẤT CẢ' để render đồng loạt theo canh chỉnh này.")
 
+    def _clean_junk_files(self):
+        """Dọn sạch file trung gian sau khi render, CHỈ GIỮ bản render cuối
+        (*_final.mp4) và bản gộp trọn bộ (*_TronBo_Rendered.mp4).
+        Xóa: video gốc, *_dubbed.mp4, .srt, _vi.srt, .txt, .vocals_cache.wav.
+        Xóa luôn, không hỏi (theo yêu cầu)."""
+        if self._render_running:
+            QMessageBox.information(self, "Đang render", "Đang render, dọn rác sau khi xong.")
+            return
+
+        # Gom các thư mục chứa video trong hàng đợi (kể cả khi card đã bị xóa,
+        # dùng thư mục render gần nhất).
+        dirs = set()
+        for c in getattr(self, "cards", []) or []:
+            vp = getattr(c, "video_path", None)
+            if vp:
+                dirs.add(os.path.dirname(vp))
+        last = getattr(self, "_last_render_dir", None)
+        if last:
+            dirs.add(last)
+
+        if not dirs:
+            QMessageBox.information(self, "Chưa có gì để dọn",
+                                    "Chưa có thư mục nào (thêm video hoặc render trước đã).")
+            return
+
+        KEEP_SUFFIX = ("_final.mp4", "_tronbo_rendered.mp4")
+        # Đuôi/hậu tố được coi là rác
+        JUNK_EXT = (".srt", ".txt", ".vocals_cache.wav", ".ass")
+        VIDEO_EXT = (".mp4", ".mkv", ".mov", ".avi", ".ts", ".webm")
+
+        removed = 0
+        errors = 0
+        for d in dirs:
+            if not os.path.isdir(d):
+                continue
+            for name in os.listdir(d):
+                low = name.lower()
+                # Giữ lại bản render cuối và bản gộp trọn bộ
+                if low.endswith(KEEP_SUFFIX):
+                    continue
+                path = os.path.join(d, name)
+                if not os.path.isfile(path):
+                    continue
+
+                is_junk = False
+                if low.endswith(JUNK_EXT):
+                    is_junk = True
+                elif low.endswith(".vocals_cache.wav"):
+                    is_junk = True
+                elif low.endswith(VIDEO_EXT):
+                    # Video: xóa video gốc và *_dubbed.mp4 (không phải _final)
+                    is_junk = True
+                # (các đuôi khác như ảnh thumbnail, png overlay... KHÔNG đụng tới)
+
+                if is_junk:
+                    try:
+                        os.remove(path)
+                        removed += 1
+                    except Exception:
+                        errors += 1
+
+        self._log(f"🧹 Đã dọn {removed} file rác (giữ *_final.mp4 & bản gộp).")
+        if errors:
+            self._log(f"⚠️ {errors} file không xóa được (đang mở?).")
+        # Xóa các card khỏi hàng đợi vì video gốc đã bị xóa
+        try:
+            self._clear_all()
+        except Exception:
+            pass
+        QMessageBox.information(self, "Dọn rác xong",
+                                f"Đã xóa {removed} file rác.\nChỉ còn lại bản render cuối (*_final.mp4)"
+                                + (" và bản gộp trọn bộ." if True else "."))
+
+    def _run_full_pipeline_external(self):
+        """Nút 'LÀM TẤT CẢ' ngoài: chuyển việc cho tab con Sub→Dịch→Lồng chạy
+        trọn quy trình (dùng cấu hình đã set trong tab đó)."""
+        tab = getattr(self, "dub_feature_tab", None)
+        if tab is None or not hasattr(tab, "_run_full_pipeline"):
+            QMessageBox.warning(self, "Thiếu tính năng",
+                                "Không tìm thấy tab 'Sub → Dịch → Lồng'.\n"
+                                "Hãy đảm bảo render_dub_feature.py và honggou_tab.py nằm cạnh app.")
+            return
+        if not self.cards:
+            QMessageBox.information(self, "Chưa có video", "Hãy thêm video vào hàng đợi trước.")
+            return
+        # Chuyển sang tab con để người dùng thấy log chạy
+        try:
+            self.tabs.setCurrentWidget(tab)
+        except Exception:
+            pass
+        tab._run_full_pipeline()
+
     def _start_render_all(self):
         if self._render_running:
             QMessageBox.information(self, "Đang render", "Đang render, vui lòng đợi xong.")
@@ -1213,11 +2434,17 @@ class RenderWidget(QWidget):
         # Ưu tiên cấu hình ĐÃ ĐỒNG BỘ (nếu bấm nút Đồng bộ trước đó); nếu chưa
         # đồng bộ thì lấy canh chỉnh hiện tại. Dù cách nào cũng áp CHUNG cho mọi tập.
         self._design = getattr(self, '_design_locked', None) or self._collect_design()
+        # Sắp lại theo SỐ tập để gộp trọn bộ đúng thứ tự 1 -> cuối
+        # (phòng khi thêm file thủ công bằng '+ File' không theo thứ tự).
+        self.cards.sort(key=lambda c: _natural_key(os.path.basename(c.video_path)))
+        self._relayout_grid()
         self._render_queue = list(self.cards)
+        self._rendered_files = [] # Lưu danh sách file xuất ra để gộp
         self._render_running = True
         self._stopping = False
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self.chk_merge_all.setEnabled(False)
         self._log(f"🚀 Bắt đầu render {len(self._render_queue)} tập...")
         self._render_next()
 
@@ -1237,17 +2464,24 @@ class RenderWidget(QWidget):
             self._render_running = False
             self._stopping = False
             self._render_queue = []
+            
             self.btn_run.setEnabled(True)
             self.btn_stop.setEnabled(False)
+            self.chk_merge_all.setEnabled(True)
+            
             if stopped:
                 self.step_render.set_status("error", 0)
                 self._log("⛔ Đã dừng render.")
                 QMessageBox.information(self, "Đã dừng", "Đã dừng render theo yêu cầu.")
             else:
-                self.step_render.set_status("success", 100)
-                self._log("🎉 Đã render xong tất cả!")
-                QMessageBox.information(self, "Xong", "Đã render xong tất cả các tập!")
+                if self.chk_merge_all.isChecked() and len(self._rendered_files) > 1:
+                    self._start_merge(self._rendered_files)
+                else:
+                    self.step_render.set_status("success", 100)
+                    self._log("🎉 Đã render xong tất cả!")
+                    QMessageBox.information(self, "Xong", "Đã render xong tất cả các tập!")
             return
+            
         card = self._render_queue.pop(0)
         card.set_status("đang render")
         self.step_render.set_status("processing", 30)
@@ -1261,14 +2495,55 @@ class RenderWidget(QWidget):
         out_path = os.path.join(out_dir, f"{stem}_final.mp4")
         cfg = self._build_cfg(vp, self._design)
         self._log(f"🎬 Render: {os.path.basename(vp)}...")
+        
         self.render_thread = SingleRenderThread(vp, sp, None, out_path, cfg)
         self.render_thread.log.connect(self._log)
-        self.render_thread.done.connect(lambda ok, c=card: self._on_one_done(ok, c))
+        self.render_thread.done.connect(lambda ok, c=card, op=out_path: self._on_one_done(ok, c, op))
         self.render_thread.start()
 
-    def _on_one_done(self, ok, card):
+    def _on_one_done(self, ok, card, out_path):
         if self._stopping and not ok:
             card.set_status("đã dừng")
         else:
             card.set_status("xong" if ok else "lỗi")
+            if ok:
+                self._rendered_files.append(out_path)
         self._render_next()
+        
+    def _start_merge(self, file_list):
+        self._log(f"🔗 Đang chuẩn bị gộp {len(file_list)} file thành 1...")
+        self.btn_run.setEnabled(False)
+        self.btn_run.setText("⏳ ĐANG GỘP FILE...")
+        
+        first_file = file_list[0]
+        out_dir = os.path.dirname(first_file)
+        dir_name = os.path.basename(out_dir)
+        if not dir_name: dir_name = "TronBo"
+        out_path = os.path.join(out_dir, f"{dir_name}_TronBo_Rendered.mp4")
+        
+        if os.path.exists(out_path):
+            try: os.remove(out_path)
+            except: pass
+            
+        intro_img = None
+        if self.chk_intro.isChecked() and self.intro_input.text().strip():
+            if os.path.exists(self.intro_input.text().strip()):
+                intro_img = self.intro_input.text().strip()
+            else:
+                self._log("⚠️ Không tìm thấy ảnh Intro, bỏ qua chèn Intro.\n")
+                
+        self.merge_thread = MergeRenderedThread(file_list, out_path, intro_img)
+        self.merge_thread.log.connect(self._log)
+        self.merge_thread.done.connect(self._on_merge_done)
+        self.merge_thread.start()
+
+    def _on_merge_done(self, ok, final_path):
+        self.btn_run.setEnabled(True)
+        self._update_run_label()
+        if ok:
+            self.step_render.set_status("success", 100)
+            self._log(f"🎉 Đã hoàn tất gộp trọn bộ: {os.path.basename(final_path)}")
+            QMessageBox.information(self, "Hoàn tất Trọn bộ", f"Đã render và gộp thành công!\\nFile được lưu tại:\\n{final_path}")
+        else:
+            self.step_render.set_status("error", 100)
+            QMessageBox.warning(self, "Lỗi gộp file", "Quá trình gộp file gặp sự cố. Bạn có thể kiểm tra log hoặc gộp thủ công.")

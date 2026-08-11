@@ -358,20 +358,54 @@ class GeminiTranslateThread(QThread):
                 base = os.path.basename(srt_path)
                 self.log.emit(f"\n{'='*50}\n📄 [{idx+1}/{total}] Đang xử lý (song song): {base}\n")
 
-                pw_w = sync_playwright().start()
-                browser_w = None
-                try:
-                    browser_w, ctx_w = self._launch_authenticated_context(pw_w)
-                    page_w = ctx_w.new_page()
-                    self._translate_smart(clean_ctx, page_w, idx, video_path, srt_path)
-                except Exception as e:
-                    self.item_failed.emit(idx, str(e))
-                finally:
+                # KHỞI ĐỘNG LẠI CHROME NGẦM KHI ĐƠ: mỗi tập được thử tối đa
+                # MAX_BROWSER_RESTART lần. Mỗi lần thất bại (Gemini đơ / Chrome
+                # treo / mất kết nối) sẽ ĐÓNG SẠCH browser cũ rồi MỞ browser MỚI
+                # hoàn toàn để dịch lại tập đó — không tái dùng phiên Chrome đã
+                # hỏng. Nếu vẫn thất bại sau các lần thử, đánh dấu tập lỗi và
+                # ĐI TIẾP (không để 1 tập treo làm đứng cả hàng đợi).
+                MAX_BROWSER_RESTART = 3
+                ok_this = False
+                last_err = ""
+                for attempt in range(1, MAX_BROWSER_RESTART + 1):
+                    if self._cancel: return
+                    if attempt > 1:
+                        self.log.emit(
+                            f"🔁 [{idx+1}/{total}] Gemini đơ — khởi động lại Chrome ngầm "
+                            f"(lần {attempt}/{MAX_BROWSER_RESTART})...\n")
+                    pw_w = None
+                    browser_w = None
                     try:
-                        if browser_w: browser_w.close()
-                    except Exception: pass
-                    try: pw_w.stop()
-                    except Exception: pass
+                        pw_w = sync_playwright().start()
+                        browser_w, ctx_w = self._launch_authenticated_context(pw_w)
+                        page_w = ctx_w.new_page()
+                        # _translate_smart tự phát tín hiệu item_done/item_failed.
+                        # Nếu Gemini đơ, nó sẽ ném lỗi (hoặc trả kết quả lỗi) ->
+                        # nhảy xuống except/vòng lặp để restart browser.
+                        self._translate_smart(clean_ctx, page_w, idx, video_path, srt_path)
+                        ok_this = True
+                        break
+                    except Exception as e:
+                        last_err = str(e)
+                        self.log.emit(f"⚠️ [{idx+1}/{total}] Lỗi khi dịch: {last_err[:120]}\n")
+                    finally:
+                        # Đóng SẠCH browser + playwright của lần thử này, kể cả
+                        # khi đang treo, để lần sau mở phiên hoàn toàn mới.
+                        try:
+                            if browser_w: browser_w.close()
+                        except Exception: pass
+                        try:
+                            if pw_w: pw_w.stop()
+                        except Exception: pass
+                    if not self._cancel and attempt < MAX_BROWSER_RESTART:
+                        time.sleep(3)
+
+                if not ok_this and not self._cancel:
+                    self.item_failed.emit(idx, f"Gemini đơ sau {MAX_BROWSER_RESTART} lần khởi động lại. {last_err[:120]}")
+                    self.log.emit(
+                        f"❌ [{idx+1}/{total}] Bỏ qua tập này sau {MAX_BROWSER_RESTART} lần thử. "
+                        f"Các tập khác vẫn chạy tiếp.\n")
+
                 with done_lock:
                     done += 1
                     self.progress.emit(done)
@@ -549,9 +583,10 @@ class GeminiTranslateThread(QThread):
                 if c_res.startswith("ERROR"): 
                     self.log.emit(f"⚠️ Lỗi mạng/gửi: {c_res}\n")
                     self.log.emit(f"⚙️ Đang Thoát vào lại (Mở trang mới) để reset AI...\n")
-                    try: page.close()
-                    except Exception: pass
-                    try: page = page.context.new_page(); page.goto("about:blank")
+                    # KHÔNG mở tab mới (tránh tab dồn đầy Chrome gây chậm/treo).
+                    # Tái dùng CHÍNH tab hiện tại: chỉ điều hướng về trang trắng
+                    # để reset ngữ cảnh AI. Luôn chỉ 1 tab/luồng.
+                    try: page.goto("about:blank"); page.wait_for_timeout(200)
                     except Exception: pass
                     retry_count += 1
                     time.sleep(2)
@@ -620,9 +655,10 @@ class GeminiTranslateThread(QThread):
                 
                 if len(temp_lines) == 0:
                     self.log.emit(f"⚠️ AI không trả về dòng nào hợp lệ. Thoát vào lại và thử lại...\n")
-                    try: page.close()
-                    except Exception: pass
-                    try: page = page.context.new_page(); page.goto("about:blank")
+                    # KHÔNG mở tab mới (tránh tab dồn đầy Chrome gây chậm/treo).
+                    # Tái dùng CHÍNH tab hiện tại: chỉ điều hướng về trang trắng
+                    # để reset ngữ cảnh AI. Luôn chỉ 1 tab/luồng.
+                    try: page.goto("about:blank"); page.wait_for_timeout(200)
                     except Exception: pass
                     retry_count += 1
                     time.sleep(2)
@@ -642,9 +678,10 @@ class GeminiTranslateThread(QThread):
                         self.log.emit(f"✂️ Tự động chia nhỏ: {batch_size} câu → {half} câu để AI bớt lười...\n")
                         batch_size = half
 
-                    try: page.close()
-                    except Exception: pass
-                    try: page = page.context.new_page(); page.goto("about:blank")
+                    # KHÔNG mở tab mới (tránh tab dồn đầy Chrome gây chậm/treo).
+                    # Tái dùng CHÍNH tab hiện tại: chỉ điều hướng về trang trắng
+                    # để reset ngữ cảnh AI. Luôn chỉ 1 tab/luồng.
+                    try: page.goto("about:blank"); page.wait_for_timeout(200)
                     except Exception: pass
                     retry_count += 1
                     time.sleep(2)
@@ -659,9 +696,10 @@ class GeminiTranslateThread(QThread):
                         batch_size = max(1, batch_size // 2)
                     
                     retry_count += 1
-                    try: page.close()
-                    except Exception: pass
-                    try: page = page.context.new_page(); page.goto("about:blank")
+                    # KHÔNG mở tab mới (tránh tab dồn đầy Chrome gây chậm/treo).
+                    # Tái dùng CHÍNH tab hiện tại: chỉ điều hướng về trang trắng
+                    # để reset ngữ cảnh AI. Luôn chỉ 1 tab/luồng.
+                    try: page.goto("about:blank"); page.wait_for_timeout(200)
                     except Exception: pass
                     time.sleep(2)
                     continue
@@ -680,9 +718,10 @@ class GeminiTranslateThread(QThread):
                 
                 # Sang trang mới để reset bộ nhớ đệm AI
                 if len(chunk_to_translate) > 0:
-                    try: page.close()
-                    except Exception: pass
-                    try: page = page.context.new_page(); page.goto("about:blank")
+                    # KHÔNG mở tab mới (tránh tab dồn đầy Chrome gây chậm/treo).
+                    # Tái dùng CHÍNH tab hiện tại: chỉ điều hướng về trang trắng
+                    # để reset ngữ cảnh AI. Luôn chỉ 1 tab/luồng.
+                    try: page.goto("about:blank"); page.wait_for_timeout(200)
                     except Exception: pass
 
             # Nếu nỗ lực thử lại đều thất bại, giữ nguyên gốc
@@ -736,16 +775,75 @@ class GeminiTranslateThread(QThread):
             }''', prompt_message)
             page.wait_for_timeout(300)
             page.keyboard.press("End"); page.keyboard.press("Space"); page.wait_for_timeout(300)
-            
-            btn = _find_el(page, _SEND_SELS, timeout=2000, cancel_check=lambda: self._cancel)
-            if btn:
-                try: 
-                    btn.click()
-                except Exception: 
-                    page.keyboard.press("Control+Enter")
-            else: 
-                page.keyboard.press("Control+Enter")
-            
+
+            # ── GỬI CHẮC CHẮN: dán xong Gemini THƯỜNG KHÔNG tự gửi. Nút gửi có
+            # thể còn disabled (Gemini chưa nhận ra ô nhập có chữ), hoặc Enter
+            # lần đầu không ăn. Phải THỬ NHIỀU CÁCH và XÁC NHẬN đã gửi thật —
+            # cách xác nhận đáng tin nhất: ô nhập đã TRỐNG sau khi gửi.
+            def _input_text():
+                # Đọc nội dung ô nhập hiện tại (để biết đã gửi đi chưa).
+                try:
+                    return page.evaluate('''() => {
+                        const el = document.querySelector("[contenteditable='true']");
+                        return el ? (el.innerText || "").trim() : null;
+                    }''')
+                except Exception:
+                    return None
+
+            def _try_send_once():
+                # Ưu tiên bấm nút gửi nếu nó ĐANG BẬT (không disabled);
+                # nếu không có/bị khóa thì dùng Enter rồi Ctrl+Enter.
+                sent = False
+                btn = _find_el(page, _SEND_SELS, timeout=2000, cancel_check=lambda: self._cancel)
+                if btn:
+                    try:
+                        _disabled = btn.get_attribute("aria-disabled")
+                        _disabled2 = btn.is_disabled()
+                        if not _disabled2 and _disabled != "true":
+                            btn.click()
+                            sent = True
+                    except Exception:
+                        pass
+                if not sent:
+                    try:
+                        inp.click()
+                        page.keyboard.press("Enter")
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(400)
+                    if _input_text():  # vẫn còn chữ -> Enter chưa ăn, thử Ctrl+Enter
+                        try:
+                            page.keyboard.press("Control+Enter")
+                        except Exception:
+                            pass
+
+            _sent_ok = False
+            for _attempt in range(4):  # thử tối đa 4 lần gửi
+                if self._cancel: return "ERROR: Cancelled"
+                _try_send_once()
+                page.wait_for_timeout(700)
+                _txt = _input_text()
+                # Ô nhập trống (hoặc không đọc được nữa vì đã submit) = đã gửi.
+                if _txt is None or _txt == "":
+                    _sent_ok = True
+                    break
+                # Chưa gửi được: dán lại (phòng khi nội dung bị mất) rồi thử tiếp.
+                if _attempt < 3:
+                    self.log.emit(f"↩️ [{bot_name}] Chưa gửi được, thử Enter lại (lần {_attempt+2}/4)...\n")
+                    try:
+                        inp.click()
+                        page.evaluate('''(text) => {
+                            const el = document.querySelector("[contenteditable='true']");
+                            if (el) { el.focus(); el.innerText = text; el.dispatchEvent(new Event('input', {bubbles: true})); }
+                        }''', prompt_message)
+                        page.wait_for_timeout(300)
+                        page.keyboard.press("End")
+                    except Exception:
+                        pass
+
+            if not _sent_ok:
+                return f"ERROR [{bot_name}]: Gửi prompt thất bại (Gemini không nhận Enter sau 4 lần)."
+
             prev, stable = "", 0
             for _ in range(720): 
                 if self._cancel: return "ERROR: Cancelled"
