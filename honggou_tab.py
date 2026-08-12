@@ -89,7 +89,7 @@ def _setup_ffmpeg_pydub():
 FFMPEG_PATH = _setup_ffmpeg_pydub()
 
 def _get_capcut_device():
-    s = QSettings("HongguoDownloader", "ClientApp")
+    s = QSettings("BoomStudio", "ClientApp")
     did = s.value("capcut_device_id", "")
     if not did:
         did = "".join(str(uuid.uuid4().int)[:20])
@@ -238,7 +238,7 @@ def _resolve_demucs_python():
     # demucs_manager không import được nhưng python_portable vẫn có sẵn.
     appdata = os.getenv('APPDATA', '')
     if appdata:
-        candidates.append(os.path.join(appdata, 'AnhStudio', 'python_portable', 'python.exe'))
+        candidates.append(os.path.join(appdata, 'BoomStudio', 'python_portable', 'python.exe'))
     for c in candidates:
         if c and os.path.isfile(c):
             return c
@@ -303,7 +303,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.47"
+APP_VERSION = "1.0.48"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -2038,7 +2038,7 @@ class DubThread(QThread):
                             try:
                                 log_path = os.path.join(
                                     os.environ.get("APPDATA", os.path.expanduser("~")),
-                                    "AnhStudio", "demucs_error.log"
+                                    "BoomStudio", "demucs_error.log"
                                 )
                                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                                 with open(log_path, "w", encoding="utf-8") as _lf:
@@ -2048,7 +2048,7 @@ class DubThread(QThread):
                             short = str(bgm_e)[:200]
                             self.progress_signal.emit(
                                 f"[{idx+1}] ⚠️ Lỗi Demucs: {short}\n"
-                                r"  Chi tiết lỗi đã lưu tại: AppData\Roaming\AnhStudio\demucs_error.log"
+                                r"  Chi tiết lỗi đã lưu tại: AppData\Roaming\BoomStudio\demucs_error.log"
                             )
 
                 # ── MIX & GHÉP VÀO VIDEO ──────────────────────────────────────
@@ -2178,7 +2178,7 @@ class HonggouWidget(QWidget):
         self.username = username
         self.expiry = expiry
         self.vip_unlocked = bool(vip_unlocked)
-        self.settings = QSettings("HongguoDownloader", "ClientApp")
+        self.settings = QSettings("BoomStudio", "ClientApp")
         self.auth_token = self.settings.value("auth_token", "")
         
         self.current_series_id = ""
@@ -2998,7 +2998,7 @@ class HonggouWidget(QWidget):
         self.cb_translate_engine.addItems(["🌐 Gemini", "🚀 DeepSeek V4 Pro"])
         self.cb_translate_engine.setToolTip("Chọn công cụ dịch: Gemini (miễn phí, qua trình duyệt) hoặc DeepSeek (API key riêng, nhanh & rẻ)")
         self.cb_translate_engine.setStyleSheet("QComboBox { background:#1f2937; color:#f8fafc; border:1px solid #374151; border-radius:6px; padding:4px 8px; } QComboBox QAbstractItemView { background:#1e293b; color:#f8fafc; }")
-        _saved_engine = QSettings("HongguoDownloader", "ClientApp").value("trans_engine_main", "🌐 Gemini")
+        _saved_engine = QSettings("BoomStudio", "ClientApp").value("trans_engine_main", "🌐 Gemini")
         self.cb_translate_engine.setCurrentText(_saved_engine)
         self.cb_translate_engine.currentTextChanged.connect(self._on_translate_engine_changed)
         stt_ctrl.addWidget(self.cb_translate_engine)
@@ -3017,11 +3017,11 @@ class HonggouWidget(QWidget):
         """)
         try:
             self.chk_show_browser.setChecked(
-                QSettings("HongguoDownloader", "ClientApp").value("show_browser_translate", "false") == "true")
+                QSettings("BoomStudio", "ClientApp").value("show_browser_translate", "false") == "true")
         except Exception:
             pass
         self.chk_show_browser.stateChanged.connect(
-            lambda v: QSettings("HongguoDownloader", "ClientApp").setValue(
+            lambda v: QSettings("BoomStudio", "ClientApp").setValue(
                 "show_browser_translate", "true" if v else "false"))
         stt_ctrl.addWidget(self.chk_show_browser)
 
@@ -3040,11 +3040,11 @@ class HonggouWidget(QWidget):
         )
         self.spn_trans_workers.setStyleSheet("QSpinBox { background:#1f2937; color:#fde68a; border:1px solid #f59e0b; border-radius:6px; padding:3px; }")
         try:
-            self.spn_trans_workers.setValue(int(QSettings("HongguoDownloader", "ClientApp").value("trans_workers", 2)))
+            self.spn_trans_workers.setValue(int(QSettings("BoomStudio", "ClientApp").value("trans_workers", 2)))
         except Exception:
             pass
         self.spn_trans_workers.valueChanged.connect(
-            lambda v: QSettings("HongguoDownloader", "ClientApp").setValue("trans_workers", int(v)))
+            lambda v: QSettings("BoomStudio", "ClientApp").setValue("trans_workers", int(v)))
         stt_ctrl.addWidget(self.spn_trans_workers)
 
         self.txt_ds_key_main = QLineEdit()
@@ -3052,9 +3052,9 @@ class HonggouWidget(QWidget):
         self.txt_ds_key_main.setEchoMode(QLineEdit.EchoMode.Password)
         self.txt_ds_key_main.setFixedWidth(160)
         self.txt_ds_key_main.setStyleSheet("QLineEdit { background:#1f2937; color:#f8fafc; border:1px solid #374151; border-radius:6px; padding:4px 8px; }")
-        self.txt_ds_key_main.setText(QSettings("HongguoDownloader", "ClientApp").value("deepseek_api_key", ""))
+        self.txt_ds_key_main.setText(QSettings("BoomStudio", "ClientApp").value("deepseek_api_key", ""))
         self.txt_ds_key_main.textChanged.connect(
-            lambda t: QSettings("HongguoDownloader", "ClientApp").setValue("deepseek_api_key", t)
+            lambda t: QSettings("BoomStudio", "ClientApp").setValue("deepseek_api_key", t)
         )
         stt_ctrl.addWidget(self.txt_ds_key_main)
         self._on_translate_engine_changed(self.cb_translate_engine.currentText())  # set ẩn/hiện ban đầu
@@ -3252,7 +3252,7 @@ class HonggouWidget(QWidget):
 
         self.chk_use_gpu = QCheckBox("🚀 Tách bằng Card Đồ Họa (GPU)")
         self.chk_use_gpu.setEnabled(False)
-        self.chk_use_gpu.setToolTip("⏳ Đang kiểm tra GPU... Nếu máy không có Card NVIDIA (CUDA) thì ô này sẽ bị xám và không dùng được. Máy sẽ tự dùng CPU thay thế.")
+        self.chk_use_gpu.setToolTip("Bật 'Tách nhạc nền' để tự kiểm tra GPU. Máy không có GPU NVIDIA sẽ dùng CPU (chậm hơn nhưng vẫn chạy).")
         self.chk_use_gpu.setStyleSheet("""
             QCheckBox { color: #38bdf8; font-weight: bold; font-size: 12px; padding: 2px; }
             QCheckBox::indicator { width: 16px; height: 16px; border: 2px solid #0284c7; border-radius: 4px; background: #1f2937; }
@@ -3265,7 +3265,8 @@ class HonggouWidget(QWidget):
         detail_layout.addLayout(bgm_ctrl)
         
         # Tự động detect GPU khi khởi động
-        QTimer.singleShot(1000, self._detect_bgm_device)
+        # (Đã bỏ dò GPU lúc mở app — 'import torch' rất nặng làm lag cả máy.
+        #  Giờ chỉ dò khi khách bật 'Tách nhạc nền', và dò nhẹ bằng nvidia-smi.)
 
         self.txt_stt_log = QTextEdit()
         self.txt_stt_log.setReadOnly(True); self.txt_stt_log.setFixedHeight(110)
@@ -3347,6 +3348,12 @@ class HonggouWidget(QWidget):
     def _on_chk_remove_bgm_changed(self, state):
         """Khi tick vào ô Tách nhạc nền: check demucs, hỏi cài nếu chưa có."""
         if state == 2:  # Checked
+            # Dò GPU LƯỜI: chỉ dò lần đầu khi khách thật sự bật tách nhạc nền,
+            # thay vì dò lúc mở app (import torch rất nặng, làm lag cả máy).
+            if not getattr(self, "_gpu_detected_once", False):
+                self._gpu_detected_once = True
+                self._detect_bgm_device()
+
             if not _DEMUCS_MANAGER_OK:
                 # demucs_manager không load được → cho tick bình thường
                 return
@@ -3460,52 +3467,82 @@ class HonggouWidget(QWidget):
             self._gpu_name = ""
             self._gpu_vram_gb = 0.0
             _debug_info = ""
+
+            si = None
+            if sys.platform == "win32":
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            # BƯỚC 1 (nhẹ): nvidia-smi — chạy tích tắc, không nạp torch.
+            # Không có NVIDIA thì DỪNG luôn, khỏi đụng 'import torch' (rất nặng).
             try:
-                probe = (
-                    "import torch\n"
-                    "if torch.cuda.is_available():\n"
-                    "    p = torch.cuda.get_device_properties(0)\n"
-                    "    print('1|%s|%.2f' % (p.name, p.total_memory / (1024**3)))\n"
-                    "else:\n"
-                    "    print('0||0')\n"
-                )
-                _probe_py = _resolve_demucs_python()
-                env = _clean_subprocess_env(_probe_py)
-                cmd = [_probe_py, "-c", probe]
-                si = None
-                if sys.platform == "win32":
-                    si = subprocess.STARTUPINFO()
-                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                res = subprocess.run(cmd, env=env, capture_output=True, text=True, startupinfo=si, timeout=30)
-                parts = res.stdout.strip().split('|')
-                if len(parts) == 3 and parts[0] == '1':
+                smi = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=name,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, startupinfo=si, timeout=8)
+                if smi.returncode == 0 and smi.stdout.strip():
+                    line = smi.stdout.strip().splitlines()[0]
+                    name, mem = [x.strip() for x in line.split(",")[:2]]
                     self._has_real_gpu = True
-                    self._gpu_name = parts[1]
-                    self._gpu_vram_gb = float(parts[2])
-                else:
-                    _debug_info = (
-                        f"probe_py: {_probe_py}\n"
-                        f"returncode: {res.returncode}\n"
-                        f"stdout: {res.stdout!r}\n"
-                        f"stderr: {res.stderr[-2000:]!r}\n"
-                    )
-            except Exception as e:
-                _debug_info = f"Exception khi detect GPU: {e}\n"
-            finally:
-                if _debug_info:
+                    self._gpu_name = name
                     try:
-                        appdata = os.getenv('APPDATA', '')
-                        if appdata:
-                            log_path = os.path.join(appdata, 'AnhStudio', 'gpu_detect_debug.log')
-                            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-                            with open(log_path, 'w', encoding='utf-8') as f:
-                                f.write(_debug_info)
+                        self._gpu_vram_gb = float(mem) / 1024.0  # MiB -> GiB
                     except Exception:
-                        pass
-                self._gpu_is_good = self._has_real_gpu and self._gpu_vram_gb >= self.MIN_GPU_VRAM_GB_FOR_AUTO
-                # Gọi slot trên main thread qua invokeMethod - KHÔNG dùng QTimer từ thread phụ
-                QMetaObject.invokeMethod(self, "_apply_gpu_detect_result",
-                                         Qt.ConnectionType.QueuedConnection)
+                        self._gpu_vram_gb = 0.0
+                else:
+                    # nvidia-smi có nhưng không GPU NVIDIA -> chắc chắn không có
+                    self._has_real_gpu = False
+            except FileNotFoundError:
+                # Không có nvidia-smi = gần như chắc chắn không phải máy NVIDIA.
+                # Vẫn thử torch 1 lần phòng driver lạ, nhưng đa số sẽ ra 'không GPU'.
+                self._has_real_gpu = False
+            except Exception as e:
+                _debug_info += f"nvidia-smi lỗi: {e}\n"
+
+            # BƯỚC 2 (nặng, chỉ khi cần): chỉ đụng torch khi nvidia-smi báo CÓ
+            # GPU nhưng chưa lấy được dung lượng VRAM (hiếm). Không có NVIDIA thì
+            # KHÔNG bao giờ nạp torch -> mở app không còn lag.
+            need_torch = self._has_real_gpu and self._gpu_vram_gb <= 0.0
+            if need_torch:
+                try:
+                    probe = (
+                        "import torch\n"
+                        "if torch.cuda.is_available():\n"
+                        "    p = torch.cuda.get_device_properties(0)\n"
+                        "    print('1|%s|%.2f' % (p.name, p.total_memory / (1024**3)))\n"
+                        "else:\n"
+                        "    print('0||0')\n"
+                    )
+                    _probe_py = _resolve_demucs_python()
+                    env = _clean_subprocess_env(_probe_py)
+                    cmd = [_probe_py, "-c", probe]
+                    res = subprocess.run(cmd, env=env, capture_output=True, text=True, startupinfo=si, timeout=30)
+                    parts = res.stdout.strip().split('|')
+                    if len(parts) == 3 and parts[0] == '1':
+                        self._has_real_gpu = True
+                        self._gpu_name = parts[1]
+                        self._gpu_vram_gb = float(parts[2])
+                    else:
+                        _debug_info += (
+                            f"probe_py: {_probe_py}\nreturncode: {res.returncode}\n"
+                            f"stdout: {res.stdout!r}\nstderr: {res.stderr[-1500:]!r}\n"
+                        )
+                except Exception as e:
+                    _debug_info += f"Exception torch detect: {e}\n"
+
+            try:
+                if _debug_info:
+                    appdata = os.getenv('APPDATA', '')
+                    if appdata:
+                        log_path = os.path.join(appdata, 'BoomStudio', 'gpu_detect_debug.log')
+                        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                        with open(log_path, 'w', encoding='utf-8') as f:
+                            f.write(_debug_info)
+            except Exception:
+                pass
+            self._gpu_is_good = self._has_real_gpu and self._gpu_vram_gb >= self.MIN_GPU_VRAM_GB_FOR_AUTO
+            QMetaObject.invokeMethod(self, "_apply_gpu_detect_result",
+                                     Qt.ConnectionType.QueuedConnection)
 
         threading.Thread(target=_check, daemon=True).start()
 
@@ -5264,7 +5301,7 @@ class HonggouWidget(QWidget):
         self._files_for_stt = None
 
     def _on_translate_engine_changed(self, text):
-        QSettings("HongguoDownloader", "ClientApp").setValue("trans_engine_main", text)
+        QSettings("BoomStudio", "ClientApp").setValue("trans_engine_main", text)
         self.txt_ds_key_main.setVisible(text.startswith("🚀"))
 
     def _start_gemini_translate(self, srt_files):
@@ -5309,7 +5346,7 @@ class HonggouWidget(QWidget):
             self._gtrans_thread.start()
             return
 
-        settings = QSettings("HongguoDownloader", "ClientApp")
+        settings = QSettings("BoomStudio", "ClientApp")
         preset = settings.value("trans_preset", list(PROMPT_PRESETS.keys())[0] if PROMPT_PRESETS else "")
         _CUSTOM_KEY = "✏️ Tự nhập prompt"
         if preset == _CUSTOM_KEY:
@@ -5754,7 +5791,8 @@ class DownloadUpdateThread(QThread):
 
             total_size = int(resp.headers.get('content-length', 0))
             downloaded = 0
-            temp_path = os.path.join(tempfile.gettempdir(), "Hongguo_Update.exe")
+            # STANDALONE: bản cập nhật là .zip cả thư mục (không phải 1 .exe).
+            temp_path = os.path.join(tempfile.gettempdir(), "BoomStudio_Update.zip")
 
             with open(temp_path, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 1024):
@@ -5769,23 +5807,36 @@ class DownloadUpdateThread(QThread):
             self.done_signal.emit(temp_path)
         except Exception as e: self.error_signal.emit(str(e))
 
-def _apply_update_and_restart(new_exe_path: str):
+def _apply_update_and_restart(new_zip_path: str):
+    """STANDALONE: giải nén .zip cập nhật rồi thay TOÀN BỘ thư mục app.
+    Bản build .zip có 1 thư mục con 'BoomStudio' bên trong -> giải nén ra temp,
+    copy đè nội dung thư mục đó vào thư mục app đang chạy, rồi khởi động lại."""
     current_exe = _get_exe_path()
-    bat_path = os.path.join(tempfile.gettempdir(), "hongguo_update.bat")
+    app_dir = os.path.dirname(current_exe)
+    extract_dir = os.path.join(tempfile.gettempdir(), "BoomStudio_Update_extract")
+    bat_path = os.path.join(tempfile.gettempdir(), "boomstudio_update.bat")
+
+    # PowerShell giải nén; robocopy /MIR đồng bộ (thay cả thư mục, giữ file mới).
+    # Nội dung zip: <extract>\BoomStudio\*  -> nguồn copy là thư mục con đó.
     bat_content = f'''@echo off
 timeout /t 3 /nobreak >nul
+rmdir /s /q "{extract_dir}" >nul 2>&1
+powershell -NoProfile -Command "Expand-Archive -LiteralPath '{new_zip_path}' -DestinationPath '{extract_dir}' -Force"
+set SRC="{extract_dir}\\BoomStudio"
+if not exist %SRC% set SRC="{extract_dir}"
 set RETRY=0
 :COPY_LOOP
 if %RETRY% GEQ 20 goto COPY_DONE
-copy /Y "{new_exe_path}" "{current_exe}" >nul 2>&1
-if %ERRORLEVEL%==0 goto COPY_DONE
+robocopy %SRC% "{app_dir}" /E /R:2 /W:1 >nul
+if %ERRORLEVEL% LSS 8 goto COPY_DONE
 set /a RETRY+=1
 timeout /t 1 /nobreak >nul
 goto COPY_LOOP
 :COPY_DONE
 timeout /t 2 /nobreak >nul
 start "" "{current_exe}"
-del /f /q "{new_exe_path}" >nul 2>&1
+rmdir /s /q "{extract_dir}" >nul 2>&1
+del /f /q "{new_zip_path}" >nul 2>&1
 del /f /q "%~f0" >nul 2>&1
 '''
     try:
@@ -5841,7 +5892,7 @@ class AutoUpdater:
 
     def _start_download(self, force=False):
         self.progress = QProgressDialog("Đang tải phiên bản mới...", None, 0, 100, self.parent)
-        self.progress.setWindowTitle("Cập nhật Hongguo Downloader")
+        self.progress.setWindowTitle("Cập nhật BOOM STUDIO")
         self.progress.setWindowModality(Qt.WindowModality.ApplicationModal if force else Qt.WindowModality.WindowModal)
         self.progress.setCancelButton(None); self.progress.setMinimumDuration(0); self.progress.setValue(0)
         if force:
@@ -5856,10 +5907,10 @@ class AutoUpdater:
         self._dl_thread.error_signal.connect(self._on_dl_error)
         self._dl_thread.start()
 
-    def _on_dl_done(self, new_exe_path):
+    def _on_dl_done(self, new_zip_path):
         self.progress.close()
         QMessageBox.information(self.parent, "Sẵn sàng", "Tải xong bản mới!\nApp sẽ tự đóng, cập nhật, và mở lại.\nNhấn OK.")
-        _apply_update_and_restart(new_exe_path)
+        _apply_update_and_restart(new_zip_path)
 
     def _on_dl_error(self, error_msg):
         self.progress.close(); self.btn_update.setEnabled(True); self.btn_update.setText(f"🔄 Cập nhật v{self._latest_version}")
@@ -5878,7 +5929,7 @@ class LoginScreen(QWidget):
         self.setStyleSheet("background-color: #0f172a; color: white;")
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.settings = QSettings("HongguoDownloader", "ClientApp")
+        self.settings = QSettings("BoomStudio", "ClientApp")
 
         login_box = QWidget(); login_box.setFixedWidth(400)
         login_box.setStyleSheet("background-color: #1e293b; border-radius: 12px; border: 1px solid #334155;")
@@ -5941,7 +5992,16 @@ class LoginScreen(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Hongguo Downloader Pro v{APP_VERSION}")
+        self.setWindowTitle(f"BOOM STUDIO v{APP_VERSION}")
+        # Icon cửa sổ / taskbar (icon.ico đặt cạnh app; bỏ qua nếu không có)
+        try:
+            _ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+            if not os.path.exists(_ico) and getattr(sys, "frozen", False):
+                _ico = os.path.join(os.path.dirname(sys.executable), "icon.ico")
+            if os.path.exists(_ico):
+                self.setWindowIcon(QIcon(_ico))
+        except Exception:
+            pass
         self.resize(1050, 780); self.setStyleSheet("background-color: #0f172a;")
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -5957,7 +6017,7 @@ class MainWindow(QMainWindow):
         header.setStyleSheet("background-color: #1e293b; border-bottom: 1px solid #334155;")
         header_layout = QHBoxLayout(header); header_layout.setContentsMargins(25, 0, 25, 0)
 
-        lbl_logo = QLabel("👑 Hongguo Downloader Pro")
+        lbl_logo = QLabel("⚡ BOOM STUDIO")
         lbl_logo.setFont(QFont("Arial", 16, QFont.Weight.Bold)); lbl_logo.setStyleSheet("color: #38bdf8;")
         vip_tag = "🔓 Đã kích hoạt" if vip_unlocked else "🔒 Chưa kích hoạt"
         lbl_user_info = QLabel(f"👤 Khách hàng: <b>{username}</b>  |  ⏳ Hạn: {expiry}  |  {vip_tag}")
@@ -6006,14 +6066,46 @@ class MainWindow(QMainWindow):
             QTabBar::tab:selected { background: #0f172a; color: #38bdf8; }
             QTabBar::tab:hover { color: #e2e8f0; }
         """)
-        self.main_tabs.addTab(self.honggou_tab, "📥  Tải & Xử lý")
-        # Chỉ thêm tab Render nếu nạp được module (không thì bỏ qua, app vẫn chạy)
+        self.main_tabs.addTab(self.honggou_tab, "👑  Hongguo VIP")
+
+        # ── Thêm các tab nền tảng (YouTube, TikTok, Douyin, Bilibili, Facebook, X, Render, Cookie) ──
+        _platform_tabs = [
+            ("youtube_tab",  "YouTubeWidget",  "🔴  YouTube"),
+            ("tiktok_tab",   "TikTokWidget",   "🎵  TikTok"),
+            ("douyin_tab",   "DouyinWidget",   "🎶  Douyin"),
+            ("bilibili_tab", "BilibiliWidget", "📺  Bilibili"),
+            ("facebook_tab", "FacebookWidget", "🔵  Facebook"),
+            ("x_tab",        "XWidget",        "✖  X (Twitter)"),
+        ]
+        for _mod_name, _cls_name, _tab_label in _platform_tabs:
+            try:
+                import importlib
+                _mod = importlib.import_module(_mod_name)
+                _cls = getattr(_mod, _cls_name)
+                _widget = _cls()
+                self.main_tabs.addTab(_widget, _tab_label)
+                setattr(self, f"_tab_{_mod_name}", _widget)
+            except Exception as _tab_e:
+                print(f"[WARN] Không nạp được tab {_tab_label}: {_tab_e}")
+
+        # Render Video nằm sau X, trước Cookie
         if RenderWidget is not None:
             try:
                 self.render_tab = RenderWidget()
                 self.main_tabs.addTab(self.render_tab, "🎨  Render Video")
             except Exception as _rw_e:
                 print(f"[WARN] Không tạo được tab Render: {_rw_e}")
+
+        # Cookie cuối cùng
+        try:
+            import importlib
+            _mod = importlib.import_module("cookie_tab")
+            _widget = _mod.CookieWidget()
+            self.main_tabs.addTab(_widget, "🍪  Cookie")
+            self._tab_cookie_tab = _widget
+        except Exception as _tab_e:
+            print(f"[WARN] Không nạp được tab Cookie: {_tab_e}")
+
         main_layout.addWidget(self.main_tabs)
 
         self.stack.addWidget(main_widget); self.stack.setCurrentWidget(main_widget)
@@ -6024,7 +6116,7 @@ class MainWindow(QMainWindow):
     
     def _fetch_balance(self, username):
         try:
-            token = self.honggou_tab.auth_token if hasattr(self, 'honggou_tab') else QSettings("HongguoDownloader", "ClientApp").value("auth_token", "")
+            token = self.honggou_tab.auth_token if hasattr(self, 'honggou_tab') else QSettings("BoomStudio", "ClientApp").value("auth_token", "")
             res = requests.get(f"{SERVER_URL}/api/client/balance/{username}", headers={"Authorization": f"Bearer {token}"}, timeout=5)
             if res.status_code == 200:
                 balance = res.json().get("balance", 0)
@@ -6047,7 +6139,7 @@ class MainWindow(QMainWindow):
             self._refresh_quota(username)
 
         try:
-            token = QSettings("HongguoDownloader", "ClientApp").value("auth_token", "")
+            token = QSettings("BoomStudio", "ClientApp").value("auth_token", "")
             if not token: return
             payload = {"current_job_id": "", "series_id": "", "action": ""}
             if hasattr(self, 'honggou_tab'):
@@ -6090,7 +6182,7 @@ class MainWindow(QMainWindow):
         btn_login.setStyleSheet("background:#7c3aed;")
         lay.addWidget(btn_login)
 
-        _gem_settings = QSettings("HongguoDownloader", "ClientApp")
+        _gem_settings = QSettings("BoomStudio", "ClientApp")
         CUSTOM_KEY = "✏️ Tự nhập prompt"
 
         lay.addWidget(QLabel("Chọn prompt dịch:"))
@@ -6169,7 +6261,7 @@ class MainWindow(QMainWindow):
         self._refresh_gemini_btn()
 
     def _refresh_quota(self, username):
-        settings = QSettings("HongguoDownloader", "ClientApp")
+        settings = QSettings("BoomStudio", "ClientApp")
         today = datetime.now().strftime("%Y-%m-%d")
         saved_date = settings.value(f"quota_date_{username}", "")
         
@@ -6190,7 +6282,7 @@ class MainWindow(QMainWindow):
         
         self._refresh_quota(username)
         
-        settings = QSettings("HongguoDownloader", "ClientApp")
+        settings = QSettings("BoomStudio", "ClientApp")
         try: quota = int(settings.value(f"quota_left_{username}", 20))
         except: quota = 20
         
@@ -6204,7 +6296,7 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(self, "Đăng xuất", "Bạn có chắc chắn muốn đăng xuất không?\n(Sẽ xóa thông tin tài khoản đã ghi nhớ)", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             if hasattr(self, '_hb_timer'): self._hb_timer.stop()
-            settings = QSettings("HongguoDownloader", "ClientApp")
+            settings = QSettings("BoomStudio", "ClientApp")
             settings.remove("username"); settings.remove("password")
             self.login_screen.inp_user.clear(); self.login_screen.inp_pass.clear() 
             if hasattr(self, 'honggou_tab') and self.honggou_tab.monitor_thread: self.honggou_tab.monitor_thread.stop()

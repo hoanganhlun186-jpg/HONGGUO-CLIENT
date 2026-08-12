@@ -52,6 +52,47 @@ except Exception:
                     "--no-sandbox", "--disable-dev-shm-usage", "--disable-software-rasterizer"]
 
 
+def build_video_encoder_args(codec, crf_val=20, preset_hw="quality", preset_sw="medium"):
+    """Trả về list tham số encoder video ĐÚNG theo từng codec.
+
+    Cùng logic với phần render từng tập: codec phần cứng (AMF/NVENC/QSV) KHÔNG
+    dùng được '-crf' và '-preset medium' của libx264 — mỗi hãng có cờ riêng.
+    Dùng chung cho cả GỘP TRỌN BỘ để không lặp lại lỗi
+    'Unable to parse preset medium' trên h264_amf/hevc_amf.
+
+    crf_val<=0 -> chế độ bitrate ~1000k (nhanh, chất lượng thấp).
+    """
+    c = (codec or "").lower()
+    args = ["-c:v", codec]
+    use_crf = crf_val and crf_val > 0
+
+    if "nvenc" in c:
+        nv_preset = "hq" if preset_hw == "quality" else "fast"
+        if use_crf:
+            args += ["-rc", "constqp", "-qp", str(crf_val), "-preset", nv_preset]
+        else:
+            args += ["-b:v", "1000k", "-preset", nv_preset]
+    elif "amf" in c:
+        # AMD AMF: KHÔNG có -crf / -preset; dùng -rc cqp + -quality
+        if use_crf:
+            args += ["-rc", "cqp", "-qp_i", str(crf_val), "-qp_p", str(crf_val),
+                     "-qp_b", str(crf_val), "-quality", preset_hw]
+        else:
+            args += ["-b:v", "1000k", "-quality", preset_hw]
+    elif "qsv" in c:
+        if use_crf:
+            args += ["-global_quality", str(crf_val), "-preset", preset_hw]
+        else:
+            args += ["-b:v", "1000k", "-preset", preset_hw]
+    else:
+        # libx264/libx265 (CPU) — mới dùng -crf + -preset medium/slow...
+        if use_crf:
+            args += ["-crf", str(crf_val), "-preset", preset_sw]
+        else:
+            args += ["-b:v", "1000k", "-preset", preset_sw]
+    return args
+
+
 FONTS_LIST = ["Arial", "Tahoma", "Verdana", "Times New Roman", "Segoe UI", "Impact", "Consolas", "Courier New"]
 
 COLOR_PRESETS = {
@@ -85,6 +126,36 @@ def _escape_ffmpeg_path(path):
     p = path.replace('\\', '/')
     for ch in [":", "'", "[", "]", ",", ";"]: p = p.replace(ch, f"\\{ch}")
     return p
+
+def _srt_has_content(srt_path):
+    """True nếu file .srt có ÍT NHẤT 1 dòng thoại thật (có timecode + chữ).
+    Tập cảnh đánh nhau/không thoại thường cho .srt rỗng hoặc chỉ vài dòng
+    trắng — ép sub bằng file này sẽ khiến FFmpeg lỗi 'Invalid data'. Dùng để
+    bỏ qua bước ép sub cho tập không thoại (vẫn render giữ tiếng gốc)."""
+    try:
+        if not srt_path or not os.path.exists(srt_path):
+            return False
+        if os.path.getsize(srt_path) < 8:
+            return False
+        with open(srt_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        # phải có timecode
+        if not re.search(r"\d{2}:\d{2}:\d{2}[,\.]\d{3}\s*-->", text):
+            return False
+        # và phải có chữ (dòng không phải số thứ tự / không phải timecode / không trắng)
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.isdigit():
+                continue
+            if "-->" in s:
+                continue
+            return True   # có 1 dòng chữ thật
+        return False
+    except Exception:
+        return False
+
 
 def _merge_srt_intervals(srt_path, gap=0.3, expand=0.5, max_intervals=150):
     try:
@@ -855,73 +926,148 @@ class MergeRenderedThread(QThread):
         self.out_file = out_file
         self.intro_image = intro_image
 
-    def run(self):
-        self.log.emit(f"🔗 Bắt đầu gộp {len(self.file_list)} file nhanh (stream copy)...\n")
-        ffmpeg = get_ffmpeg_path()
-        final_file_list = list(self.file_list)
-        intro_vid = None
-        
-        if self.intro_image and os.path.exists(self.intro_image):
-            self.log.emit("🖼️ Đang tạo video Intro 2s từ Thumbnail...\n")
-            first_vid = self.file_list[0]
-            w, h = 1920, 1080
-            try:
-                probe = subprocess.run([ffmpeg, "-i", first_vid], stderr=subprocess.PIPE, text=True, errors="ignore", creationflags=CREATE_NO_WINDOW if os.name == 'nt' else 0)
-                m = re.search(r"Video:.*?,.*? (\d+)x(\d+)", probe.stderr)
-                if m:
-                    w, h = int(m.group(1)), int(m.group(2))
-            except Exception as e:
-                self.log.emit(f"⚠️ Lỗi đọc phân giải video đầu ({e}), dùng mặc định {w}x{h}\n")
-                
-            intro_vid = os.path.join(tempfile.gettempdir(), f"intro_2s_{int(time.time())}.mp4")
-            cmd_intro = [
-                ffmpeg, "-y",
-                "-loop", "1", "-framerate", "30", "-t", "2", "-i", self.intro_image,
-                "-f", "lavfi", "-t", "2", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1",
-                "-c:v", get_optimal_ffmpeg_codec(),
-                "-c:a", "aac", "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                intro_vid
-            ]
+    def _probe_resolution(self, ffmpeg, filepath):
+        """Trả về (width, height) của video, hoặc None nếu probe thất bại."""
+        try:
             si = subprocess.STARTUPINFO() if os.name == "nt" else None
             if si: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                
-            proc_intro = subprocess.run(cmd_intro, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=si, text=True, errors="replace")
-            if proc_intro.returncode == 0 and os.path.exists(intro_vid):
-                final_file_list.insert(0, intro_vid)
-                self.log.emit("✅ Đã tạo xong video Intro 2s.\n")
-            else:
-                self.log.emit(f"❌ Lỗi tạo Intro:\n{proc_intro.stderr[-500:]}\n")
+            r = subprocess.run(
+                [ffmpeg, "-i", filepath],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                startupinfo=si, text=True, encoding="utf-8", errors="replace"
+            )
+            m = re.search(r"Stream.*Video.*?(\d{3,5})x(\d{3,5})", r.stderr)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+        except Exception:
+            pass
+        return None
+
+    def run(self):
+        ffmpeg = get_ffmpeg_path()
+        import tempfile, time, subprocess
+
+        # ── 1. Phát hiện resolution không đồng nhất ─────────────────────────
+        resolutions = []
+        for fp in self.file_list:
+            res = self._probe_resolution(ffmpeg, fp)
+            resolutions.append(res)
+
+        unique_res = set(r for r in resolutions if r is not None)
+        mixed = len(unique_res) > 1
+
+        if mixed:
+            res_list = ", ".join(f"{w}×{h}" for w, h in resolutions if (w, h) in unique_res)
+            self.log.emit(
+                f"⚠️ Phát hiện resolution KHÔNG đồng nhất: {res_list}\n"
+                f"   → Bắt buộc re-encode để cố định kích thước và timestamp.\n"
+                f"   (Dùng -c copy sẽ gây Access Violation khi swscale gặp frame đổi kích thước)\n\n"
+            )
+            # Chọn resolution lớn nhất (theo diện tích) làm chuẩn
+            target_w, target_h = max(unique_res, key=lambda wh: wh[0] * wh[1])
+            # Đảm bảo chia hết cho 2 (yêu cầu của H.264)
+            target_w = (target_w // 2) * 2
+            target_h = (target_h // 2) * 2
+            self.log.emit(f"   🎯 Resolution đích: {target_w}×{target_h}\n\n")
+        else:
+            self.log.emit(f"🔗 Bắt đầu gộp {len(self.file_list)} file (resolution đồng nhất, không đổi âm thanh)...\n")
 
         list_txt = os.path.join(tempfile.gettempdir(), f"concat_list_{int(time.time())}.txt")
         try:
             with open(list_txt, "w", encoding="utf-8") as f:
-                for fp in final_file_list:
+                for fp in self.file_list:
                     safe_path = fp.replace('\\', '/').replace("'", r"\'")
                     f.write(f"file '{safe_path}'\n")
 
-            cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_txt, "-c", "copy", "-movflags", "+faststart", self.out_file]
             si = subprocess.STARTUPINFO() if os.name == "nt" else None
             if si: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=si, text=True, encoding="utf-8", errors="replace")
+
+            if mixed:
+                # ── Re-encode: scale mọi clip về resolution đích, reset timestamp ──
+                # scale + setsar chuẩn hóa SAR; fps=copy giữ nguyên fps gốc;
+                # aresample chuẩn hóa sample rate audio trước khi concat.
+                vf = (
+                    f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                    f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
+                    f"setsar=1,fps=fps=source_fps"
+                )
+                merge_codec = get_optimal_ffmpeg_codec()
+                enc_args = build_video_encoder_args(merge_codec, crf_val=20,
+                                                    preset_hw="quality", preset_sw="medium")
+                cmd = [
+                    ffmpeg, "-y",
+                    "-f", "concat", "-safe", "0", "-i", list_txt,
+                    # Chuẩn hóa timestamp (sửa non-monotonic DTS từ ghép đoạn)
+                    "-video_track_timescale", "90000",
+                    "-vf", vf,
+                    *enc_args,
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-af", "aresample=async=1",
+                    "-movflags", "+faststart",
+                    self.out_file
+                ]
+            else:
+                # Resolution đồng nhất → copy stream, chỉ reset timestamp
+                cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_txt]
+                if self.intro_image and os.path.exists(self.intro_image):
+                    self.log.emit("🖼️ Đang nhúng Ảnh Bìa (Cover Art) vào video...\n")
+                    cmd.extend([
+                        "-i", self.intro_image,
+                        "-map", "0:v:0", "-map", "0:a?", "-map", "1:v:0",
+                        "-c", "copy",
+                        "-disposition:v:1", "attached_pic"
+                    ])
+                else:
+                    cmd.extend(["-c", "copy"])
+                cmd.extend(["-movflags", "+faststart", self.out_file])
+
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                startupinfo=si, text=True, encoding="utf-8", errors="replace"
+            )
+
             if proc.returncode == 0 and os.path.exists(self.out_file):
-                self.log.emit(f"✅ Gộp trọn bộ thành công: {os.path.basename(self.out_file)}\n")
+                mode = "re-encode" if mixed else "copy stream"
+                self.log.emit(f"✅ Gộp trọn bộ thành công ({mode}): {os.path.basename(self.out_file)}\n")
                 self.done.emit(True, self.out_file)
             else:
-                err = proc.stderr[-500:] if proc.stderr else "Lỗi không xác định"
-                self.log.emit(f"❌ Lỗi gộp file FFmpeg:\n{err}\n")
-                self.done.emit(False, "")
+                err = proc.stderr[-800:] if proc.stderr else "Lỗi không xác định"
+                # Fallback: nếu re-encode bằng codec phần cứng lỗi -> thử lại
+                # bằng libx264 (CPU) cho chắc ăn, tránh hỏng cả bản gộp trọn bộ.
+                did_fallback = False
+                if mixed and "libx264" not in get_optimal_ffmpeg_codec().lower():
+                    self.log.emit("⚠️ Gộp bằng codec phần cứng lỗi → thử lại bằng libx264 (CPU)...\n")
+                    cmd_fb = [
+                        ffmpeg, "-y",
+                        "-f", "concat", "-safe", "0", "-i", list_txt,
+                        "-video_track_timescale", "90000",
+                        "-vf", vf,
+                        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                        "-c:a", "aac", "-b:a", "192k",
+                        "-af", "aresample=async=1",
+                        "-movflags", "+faststart",
+                        self.out_file
+                    ]
+                    proc = subprocess.run(
+                        cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        startupinfo=si, text=True, encoding="utf-8", errors="replace"
+                    )
+                    did_fallback = True
+                if did_fallback and proc.returncode == 0 and os.path.exists(self.out_file):
+                    self.log.emit(f"✅ Gộp trọn bộ thành công (re-encode libx264): {os.path.basename(self.out_file)}\n")
+                    self.done.emit(True, self.out_file)
+                else:
+                    if did_fallback and proc.stderr:
+                        err = proc.stderr[-800:]
+                    self.log.emit(f"❌ Lỗi gộp file FFmpeg:\n{err}\n")
+                    self.done.emit(False, "")
         except Exception as e:
             self.log.emit(f"❌ Exception khi gộp: {e}\n")
             self.done.emit(False, "")
         finally:
             if os.path.exists(list_txt):
                 try: os.remove(list_txt)
-                except: pass
-            if intro_vid and os.path.exists(intro_vid):
-                try: os.remove(intro_vid)
                 except: pass
 
 class SingleRenderThread(QThread):
@@ -967,9 +1113,14 @@ class SingleRenderThread(QThread):
         basename = os.path.basename(self.vp)
         temp_srt = ""; escaped_srt = ""
         if self.sp and os.path.exists(self.sp):
-            temp_srt = os.path.join(os.path.dirname(self.op), f"_temp_sub_{basename}.srt")
-            try: shutil.copy2(self.sp, temp_srt); escaped_srt = _escape_ffmpeg_path(temp_srt)
-            except Exception as e: self.log.emit(f"⚠️ Không thể copy SRT tạm: {e}\n"); escaped_srt = _escape_ffmpeg_path(self.sp)
+            if not _srt_has_content(self.sp):
+                # Tập không có thoại (sub rỗng) -> KHÔNG ép sub, render giữ
+                # tiếng gốc bình thường. Tránh FFmpeg lỗi 'Invalid data'.
+                self.log.emit("   ℹ️ Phụ đề rỗng (tập không thoại) → render không ép sub, giữ tiếng gốc.\n")
+            else:
+                temp_srt = os.path.join(os.path.dirname(self.op), f"_temp_sub_{basename}.srt")
+                try: shutil.copy2(self.sp, temp_srt); escaped_srt = _escape_ffmpeg_path(temp_srt)
+                except Exception as e: self.log.emit(f"⚠️ Không thể copy SRT tạm: {e}\n"); escaped_srt = _escape_ffmpeg_path(self.sp)
 
         inputs = ["-hwaccel", "none", "-threads", "0", "-i", self.vp]
         filter_chains = []
@@ -1578,13 +1729,13 @@ class RenderWidget(QWidget):
         self.chk_hardsub.setStyleSheet("color:#FBBF24; font-weight:bold;")
         design_lay.addWidget(self.chk_hardsub)
 
-        # ── Chèn Intro (đưa lên đầu tab thiết kế cho dễ thao tác) ──
+        # ── Nhúng Ảnh Bìa (đưa lên đầu tab thiết kế cho dễ thao tác) ──
         intro_row = QHBoxLayout()
-        self.chk_intro = QCheckBox("Chèn Intro (2s)")
+        self.chk_intro = QCheckBox("Nhúng Ảnh Bìa (Cover)")
         self.chk_intro.setChecked(self.settings.value("intro_en", False, type=bool))
         self.chk_intro.setStyleSheet("color:#F37021; font-weight:bold; font-size:11px;")
         self.intro_input = QLineEdit(self.settings.value("intro_path", ""))
-        self.intro_input.setPlaceholderText("Ảnh Intro...")
+        self.intro_input.setPlaceholderText("File Ảnh Bìa...")
         btn_intro_pick = QPushButton("Chọn")
         btn_intro_pick.setFixedWidth(50)
         btn_intro_pick.clicked.connect(self._select_intro)
@@ -1779,7 +1930,7 @@ class RenderWidget(QWidget):
         res_container.setLayout(self.thumb_result_row)
         scroll_res.setWidget(res_container)
         
-        v.addWidget(QLabel("Kết quả (bấm xem hoặc Set Intro):", styleSheet="color:#8A8D98; font-size:10px; border:none; margin-top:5px;"))
+        v.addWidget(QLabel("Kết quả (bấm xem hoặc Set Ảnh Bìa):", styleSheet="color:#8A8D98; font-size:10px; border:none; margin-top:5px;"))
         v.addWidget(scroll_res)
         v.addStretch()
 
@@ -1845,7 +1996,7 @@ class RenderWidget(QWidget):
                           "QPushButton:hover { border:1px solid #7452FF; }")
         btn.clicked.connect(lambda _=False, p=path: self._open_thumb_path(p))
         
-        btn_intro = QPushButton("⭐ Làm Intro")
+        btn_intro = QPushButton("⭐ Làm Ảnh Bìa")
         btn_intro.setStyleSheet("QPushButton { background:#31265C; color:#A78BFA; font-size:10px; font-weight:bold; padding:4px; border-radius:4px; border:none; } QPushButton:hover { background:#7452FF; color:white; }")
         btn_intro.clicked.connect(lambda _=False, p=path: self._set_intro(p))
         
@@ -1878,7 +2029,7 @@ class RenderWidget(QWidget):
                 "chưa đăng nhập, hoặc giao diện Gemini đã đổi (cần chỉnh selector).")
 
     def _select_intro(self):
-        fp, _ = QFileDialog.getOpenFileName(self, "Chọn ảnh Intro", "", "Ảnh (*.png *.jpg *.jpeg *.webp)")
+        fp, _ = QFileDialog.getOpenFileName(self, "Chọn ảnh Bìa", "", "Ảnh (*.png *.jpg *.jpeg *.webp)")
         if fp:
             self.intro_input.setText(fp)
             self.chk_intro.setChecked(True)
@@ -1886,8 +2037,8 @@ class RenderWidget(QWidget):
     def _set_intro(self, path):
         self.intro_input.setText(path)
         self.chk_intro.setChecked(True)
-        self._log(f"📌 Đã đặt ảnh này làm Intro 2s cho Video trọn bộ.\n")
-        QMessageBox.information(self, "Thành công", "Đã chọn ảnh này làm Intro 2 giây khi gộp trọn bộ!")
+        self._log(f"📌 Đã đặt ảnh này làm Ảnh Bìa cho Video trọn bộ.\n")
+        QMessageBox.information(self, "Thành công", "Đã chọn ảnh này làm Ảnh Bìa (Cover) khi gộp trọn bộ!")
 
         # ============ LOG ============
     def _log(self, msg):
@@ -2578,7 +2729,7 @@ class RenderWidget(QWidget):
             if os.path.exists(self.intro_input.text().strip()):
                 intro_img = self.intro_input.text().strip()
             else:
-                self._log("⚠️ Không tìm thấy ảnh Intro, bỏ qua chèn Intro.\n")
+                self._log("⚠️ Không tìm thấy ảnh bìa, bỏ qua nhúng.\n")
                 
         self.merge_thread = MergeRenderedThread(file_list, out_path, intro_img)
         self.merge_thread.log.connect(self._log)
@@ -2598,3 +2749,5 @@ class RenderWidget(QWidget):
         else:
             self.step_render.set_status("error", 100)
             QMessageBox.warning(self, "Lỗi gộp file", "Quá trình gộp file gặp sự cố. Bạn có thể kiểm tra log hoặc gộp thủ công.")
+
+# (MergeRenderedThread đã được định nghĩa đầy đủ ở trên, không lặp lại tại đây)

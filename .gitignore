@@ -1,0 +1,58 @@
+# ============================================================
+#  .gitignore — BOOM STUDIO
+#  Chặn các file KHÔNG được đẩy lên GitHub (publish_tool.py dùng
+#  'git add .' nên mọi thứ không nằm đây đều bị push).
+# ============================================================
+
+# --- Session / thông tin đăng nhập NHẠY CẢM (tuyệt đối không push) ---
+gemini_auth.json
+*_auth.json
+auth.json
+cookies.txt
+*.cookies
+device.json
+
+# --- Profile trình duyệt Playwright (chứa session đăng nhập) ---
+BoomStudio_ChromeData/
+*_ChromeData/
+user_data_dir/
+
+# --- Thư mục output / dữ liệu chạy (rác, không thuộc mã nguồn) ---
+output_tts/
+outputs/
+temp/
+tmp/
+*_temp_*
+*.vocals_cache.wav
+
+# --- Thư mục ID series tải về (số dài) ---
+[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*/
+
+# --- Công cụ nhị phân: COMMIT THẲNG vào repo (đóng gói kèm, không tải lúc build) ---
+# ffmpeg.exe / ffprobe.exe / ffplay.exe / yt-dlp.exe / aria2c.exe -> GIỮ trong repo.
+# Chỉ chặn file .exe do build sinh ra (không phải công cụ kèm theo):
+BoomStudio.exe
+build/**/*.exe
+
+# --- Cache Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# --- Build artifacts (Nuitka/PyInstaller) ---
+build/
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+wheels/
+*.zip
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

@@ -18,6 +18,16 @@ from PyQt6.QtGui import QTextCursor, QBrush, QColor, QFont
 
 import deepseek_translate as dst  # module dịch DeepSeek V4 Pro (giữ ngữ cảnh xuyên suốt)
 
+# Ưu tiên Chrome khách, thiếu thì tự lùi về Chromium (dùng chung toàn app)
+try:
+    from shared_utils import browser_launch_kwargs
+except Exception:
+    def browser_launch_kwargs(headless=True, args=None, **extra):
+        kw = dict(extra); kw["headless"] = headless
+        if args is not None: kw["args"] = args
+        kw["channel"] = "chrome"   # fallback: giữ hành vi cũ
+        return kw
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 AUTH_FILE = "gemini_auth.json"
 BROWSER_ARGS = ["--disable-blink-features=AutomationControlled", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage", "--disable-software-rasterizer"]
@@ -101,15 +111,16 @@ class GoogleManualLoginThread(QThread):
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
                 base_dir = os.path.dirname(os.path.abspath(__file__))
-                tool_profile_path = os.path.join(base_dir, "AnhStudio_ChromeData")
+                tool_profile_path = os.path.join(base_dir, "BoomStudio_ChromeData")
                 
                 ctx = p.chromium.launch_persistent_context(
-                    user_data_dir=tool_profile_path,
-                    channel="chrome",
-                    headless=False,
-                    user_agent=UA,
-                    viewport={"width": 1280, "height": 900},
-                    args=["--disable-blink-features=AutomationControlled"]
+                    tool_profile_path,
+                    **browser_launch_kwargs(
+                        headless=False,
+                        user_agent=UA,
+                        viewport={"width": 1280, "height": 900},
+                        args=["--disable-blink-features=AutomationControlled"]
+                    )
                 )
                 
                 ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -242,18 +253,19 @@ class GeminiTranslateThread(QThread):
             pw = sync_playwright().start()
             
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            tool_profile_path = os.path.join(base_dir, "AnhStudio_ChromeData")
+            tool_profile_path = os.path.join(base_dir, "BoomStudio_ChromeData")
             
             launch_err = None
             for attempt in range(3):
                 try:
                     ctx = pw.chromium.launch_persistent_context(
-                        user_data_dir=tool_profile_path,
-                        channel="chrome",
-                        headless=not self.show_browser,
-                        user_agent=UA,
-                        viewport={"width": 1280, "height": 900},
-                        args=BROWSER_ARGS
+                        tool_profile_path,
+                        **browser_launch_kwargs(
+                            headless=not self.show_browser,
+                            user_agent=UA,
+                            viewport={"width": 1280, "height": 900},
+                            args=BROWSER_ARGS
+                        )
                     )
                     launch_err = None
                     break
@@ -306,7 +318,7 @@ class GeminiTranslateThread(QThread):
         đụng độ luồng khác (Playwright sync API không an toàn khi dùng chung
         giữa nhiều luồng, và Chrome persistent profile không cho 2 tiến
         trình cùng mở 1 lúc)."""
-        browser = pw.chromium.launch(headless=not self.show_browser, channel="chrome", args=BROWSER_ARGS)
+        browser = pw.chromium.launch(**browser_launch_kwargs(headless=not self.show_browser, args=BROWSER_ARGS))
         ctx = browser.new_context(
             storage_state=AUTH_FILE,
             user_agent=UA,
@@ -1047,7 +1059,7 @@ class TranslateWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._queue = []
-        self.settings = QSettings("AnhStudio", "TranslateTab")
+        self.settings = QSettings("BoomStudio", "TranslateTab")
         self._translate_thread = None
         self.current_selected_item = None
         self.context_memory = {} 

@@ -55,7 +55,7 @@ def publish():
 
 # Giao diện đơn giản bằng Tkinter
 root = tk.Tk()
-root.title("Auto Publish - AnhStudio")
+root.title("Auto Publish - BoomStudio")
 root.geometry("350x150")
 root.eval('tk::PlaceWindow . center')
 

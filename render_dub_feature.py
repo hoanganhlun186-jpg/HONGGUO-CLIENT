@@ -26,6 +26,17 @@ trong tab con và app vẫn chạy bình thường (không crash).
 """
 
 import os
+import subprocess
+
+# Tiện ích ffmpeg dùng chung (để tạo _dubbed cho tập không thoại). Ưu tiên
+# shared_utils như các module khác; không có thì fallback.
+try:
+    from shared_utils import get_ffmpeg_path, CREATE_NO_WINDOW
+except Exception:
+    import shutil as _shutil
+    CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+    def get_ffmpeg_path():
+        return _shutil.which("ffmpeg") or "ffmpeg"
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
@@ -102,6 +113,12 @@ class DubFeatureWidget(QWidget):
         self._dub_queue = []
         self._dub_running = False
         self._auto_dub_on = False
+        # ── Kiểm tra + retry trước khi render ──
+        self._MAX_VERIFY_RETRY = 2        # số vòng làm lại tối đa cho tập lỗi
+        self._verify_round = 0            # đã làm lại mấy vòng
+        self._translate_failed = set()    # video_path dịch fail (để log)
+        self._skip_from_render = set()    # video_path bỏ hẳn khỏi render (fail hết retry)
+        self._bad_found = []              # kết quả nút '🔎 Tìm file lỗi' [(video, lý do)]
         self._build_ui()
 
     # ────────────────────────────────────────────────────────────────────
@@ -372,6 +389,15 @@ class DubFeatureWidget(QWidget):
         row_steps2.addWidget(self.btn_only_render)
         root.addLayout(row_steps2)
 
+        # Hàng nút tìm & fix file lỗi (chưa dịch / chưa lồng)
+        row_fix = QHBoxLayout()
+        self.btn_find_bad = _mk_btn("🔎 Tìm file lỗi", "#B45309", "#92400E", self._find_bad_files)
+        self.btn_fix_bad = _mk_btn("🔧 Fix file lỗi", "#B45309", "#92400E", self._fix_bad_files)
+        self.btn_fix_bad.setEnabled(False)   # chỉ bật sau khi đã tìm ra danh sách
+        row_fix.addWidget(self.btn_find_bad)
+        row_fix.addWidget(self.btn_fix_bad)
+        root.addLayout(row_fix)
+
         # Log
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
@@ -477,10 +503,113 @@ class DubFeatureWidget(QWidget):
             return raw, lang
         return None, None
 
+    @staticmethod
+    def _srt_is_empty(srt_path):
+        """True nếu .srt KHÔNG có dòng thoại thật (tập không thoại / cảnh đánh
+        nhau). Khi đó không cần dịch/lồng — chỉ giữ tiếng gốc."""
+        try:
+            if not srt_path or not os.path.exists(srt_path):
+                return True
+            if os.path.getsize(srt_path) < 8:
+                return True
+            import re
+            with open(srt_path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+            if not re.search(r"\d{2}:\d{2}:\d{2}[,\.]\d{3}\s*-->", text):
+                return True
+            for line in text.splitlines():
+                s = line.strip()
+                if not s or s.isdigit() or "-->" in s:
+                    continue
+                return False   # có 1 dòng chữ thật
+            return True
+        except Exception:
+            return False
+
+    def _prepare_no_dialogue(self, video_path, srt_path=None):
+        """Tập không thoại: tạo _vi.srt (rỗng hợp lệ) + _dubbed.mp4 với tiếng
+        gốc đã ĐƯA VỀ ĐÚNG mức như khi lồng tiếng (theo 'Tắt tiếng gốc' /
+        'Vol gốc'), để âm lượng ĐỒNG BỘ với các tập có lồng tiếng. Trả về True
+        nếu chuẩn bị xong."""
+        import shutil
+        vi = self._vi_srt_for(video_path)
+        # 1) _vi.srt rỗng hợp lệ (render tự bỏ ép sub khi thấy rỗng)
+        try:
+            if srt_path and os.path.exists(srt_path) and srt_path != vi:
+                shutil.copyfile(srt_path, vi)
+            elif not os.path.exists(vi):
+                with open(vi, "w", encoding="utf-8") as f:
+                    f.write("")
+        except Exception as e:
+            self._log(f"⚠️ {os.path.basename(video_path)}: không tạo được _vi.srt rỗng: {e}")
+            return False
+
+        # 2) _dubbed.mp4 với tiếng gốc theo đúng cấu hình lồng tiếng
+        if self._auto_dub_on:
+            stem = os.path.splitext(video_path)[0]
+            if stem.endswith("_dubbed"):
+                return True   # đã là bản dubbed
+            dub = self._dubbed_for(video_path)
+            if os.path.exists(dub):
+                return True
+
+            mute = self.chk_mute_original.isChecked()
+            orig_v = 0.0 if mute else (self.spn_orig_volume.value() / 100.0)
+
+            try:
+                ff = get_ffmpeg_path()
+                si = None
+                if os.name == "nt":
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+                if orig_v <= 0:
+                    # Câm tiếng gốc: giữ video, thay bằng audio im lặng cùng độ dài
+                    cmd = [ff, "-y", "-i", video_path,
+                           "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                           "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+                           "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                           "-movflags", "+faststart", dub]
+                    self._log(f"🔇 {os.path.basename(video_path)}: tập không thoại → tắt tiếng gốc cho đồng bộ.")
+                elif abs(orig_v - 1.0) < 0.001:
+                    # Giữ nguyên 100% -> copy trần cho nhanh
+                    shutil.copyfile(video_path, dub)
+                    self._log(f"🔇 {os.path.basename(video_path)}: tập không thoại → giữ tiếng gốc 100%.")
+                    return True
+                else:
+                    # Hạ tiếng gốc về đúng mức 'Vol gốc' như khi lồng tiếng
+                    cmd = [ff, "-y", "-i", video_path,
+                           "-map", "0:v:0", "-map", "0:a:0?",
+                           "-filter:a", f"volume={orig_v:.2f}",
+                           "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                           "-movflags", "+faststart", dub]
+                    self._log(f"🔇 {os.path.basename(video_path)}: tập không thoại → "
+                              f"tiếng gốc {int(orig_v*100)}% cho đồng bộ.")
+
+                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      startupinfo=si, text=True, errors="ignore")
+                if proc.returncode != 0 or not os.path.exists(dub):
+                    # Encode lỗi -> fallback copy trần để ít nhất vẫn render được
+                    self._log(f"⚠️ {os.path.basename(video_path)}: chỉnh tiếng gốc lỗi, copy trần video.")
+                    shutil.copyfile(video_path, dub)
+            except Exception as e:
+                self._log(f"⚠️ {os.path.basename(video_path)}: lỗi tạo _dubbed ({e}), copy trần.")
+                try:
+                    shutil.copyfile(video_path, dub)
+                except Exception:
+                    return False
+        else:
+            self._log(f"🔇 {os.path.basename(video_path)}: tập không thoại → giữ tiếng gốc, không lồng.")
+        return True
+
     def _set_buttons_enabled(self, on):
-        for b in ("btn_only_stt", "btn_only_trans", "btn_only_dub", "btn_only_render"):
+        for b in ("btn_only_stt", "btn_only_trans", "btn_only_dub", "btn_only_render",
+                  "btn_find_bad"):
             if hasattr(self, b):
                 getattr(self, b).setEnabled(on)
+        # Nút Fix chỉ bật khi rảnh VÀ đã có danh sách lỗi tìm được
+        if hasattr(self, "btn_fix_bad"):
+            self.btn_fix_bad.setEnabled(on and bool(self._bad_found))
         # Nút "LÀM TẤT CẢ" nằm ngoài host — bật/tắt nếu có tham chiếu
         ext = getattr(self.host, "btn_full_pipeline", None)
         if ext is not None:
@@ -536,6 +665,9 @@ class DubFeatureWidget(QWidget):
             if not srt:
                 self._log(f"⏭ Bỏ qua (chưa có srt): {os.path.basename(vp)}")
                 continue
+            if self._srt_is_empty(srt):
+                self._log(f"🔇 {os.path.basename(vp)}: tập không thoại — bỏ qua dịch.")
+                continue
             if lang == "vi":
                 # Đã là tiếng Việt -> chỉ cần bảo đảm có bản _vi.srt
                 vi = self._vi_srt_for(vp)
@@ -576,6 +708,13 @@ class DubFeatureWidget(QWidget):
 
         def _on_item_failed(idx, msg):
             self._log(f"⚠️ Dịch lỗi 1 file: {msg}")
+            try:
+                if 0 <= idx < len(queue):
+                    vp = queue[idx].get("video")
+                    if vp:
+                        self._translate_failed.add(vp)
+            except Exception:
+                pass
 
         if use_deepseek:
             key = self.txt_ds_key.text().strip()
@@ -641,7 +780,7 @@ class DubFeatureWidget(QWidget):
             self._stop_card_poll()
             self._log("✅ Lồng tiếng xong toàn bộ.")
             if getattr(self, "_render_after_dub", False):
-                self._start_render()
+                self._verify_before_render()
 
     # ════════════════════════════════════════════════════════════════════
     #  ③ NÚT: CHỈ LỒNG TIẾNG  (lấy sub Việt cạnh video)
@@ -731,7 +870,7 @@ class DubFeatureWidget(QWidget):
                     self._set_buttons_enabled(True)
                     self._stop_card_poll()
                     if getattr(self, "_render_after_dub", False):
-                        self._start_render()
+                        self._verify_before_render()
 
         self._dub_thread.finished_signal.connect(_one_done)
         self._keep_alive(self._dub_thread)
@@ -743,6 +882,276 @@ class DubFeatureWidget(QWidget):
     def _run_only_render(self):
         self._refresh_host_cards()
         self._start_render()
+
+    # ════════════════════════════════════════════════════════════════════
+    #  ✅ KIỂM TRA TRƯỚC KHI RENDER + RETRY
+    #  Trước khi render cả loạt: soi từng tập xem đã dịch (_vi.srt) và (nếu
+    #  bật lồng) đã lồng tiếng (_dubbed.mp4) chưa. Tập nào thiếu -> gom lại
+    #  làm lại dịch→lồng. Làm lại tối đa _MAX_VERIFY_RETRY vòng; tập nào vẫn
+    #  hỏng sau khi hết vòng -> loại khỏi render (không đem video/sub lỗi đi
+    #  render), phần còn lại vẫn render bình thường.
+    # ════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
+    #  🔎 TÌM FILE LỖI  /  🔧 FIX FILE LỖI  (chạy độc lập, không render)
+    #  Tìm: quét hàng đợi, liệt kê tập chưa dịch (thiếu _vi.srt) và — nếu ô
+    #  'Có lồng tiếng' đang bật — tập chưa lồng (thiếu _dubbed.mp4).
+    #  Fix: chỉ làm lại ĐÚNG những tập vừa tìm ra (dịch lại → lồng lại), tối
+    #  đa _MAX_VERIFY_RETRY vòng; KHÔNG tự render.
+    # ════════════════════════════════════════════════════════════════════
+    def _find_bad_files(self):
+        files = self._files_from_host()
+        if not files:
+            QMessageBox.warning(self, "Không có file", "Hàng đợi Render đang trống!")
+            return
+        # Tôn trọng lựa chọn lồng tiếng hiện tại khi đánh giá 'đủ/thiếu'
+        self._auto_dub_on = self.chk_auto_dub.isChecked()
+        bad = []
+        for vp in files:
+            reason = self._episode_incomplete(vp)
+            if reason:
+                bad.append((vp, reason))
+        self._bad_found = list(bad)
+
+        self._log("──────── 🔎 KẾT QUẢ TÌM FILE LỖI ────────")
+        if not bad:
+            self._log(f"✅ Cả {len(files)} tập đều đã đủ "
+                      + ("(dịch + lồng tiếng)." if self._auto_dub_on else "(đã dịch).")
+                      + " Không có file lỗi.")
+        else:
+            self._log(f"⚠️ Có {len(bad)}/{len(files)} tập lỗi:")
+            for i, (vp, reason) in enumerate(bad, 1):
+                self._log(f"   {i}. {os.path.basename(vp)} — {reason}")
+            self._log("👉 Bấm '🔧 Fix file lỗi' để làm lại các tập trên.")
+        # Bật/tắt nút Fix theo kết quả
+        if hasattr(self, "btn_fix_bad"):
+            self.btn_fix_bad.setEnabled(bool(bad))
+
+    def _fix_bad_files(self):
+        if not self._bad_found:
+            QMessageBox.information(self, "Chưa có danh sách",
+                                    "Bấm '🔎 Tìm file lỗi' trước để quét đã.")
+            return
+        self._save_settings()
+        self._auto_dub_on = self.chk_auto_dub.isChecked()
+        videos = [vp for vp, _r in self._bad_found]
+        # Chỉ fix, không render; reset bộ đếm retry cho phiên fix này
+        self._fix_only_mode = True
+        self._render_after_dub = False
+        self._verify_round = 0
+        self._skip_from_render = set()
+        self._log(f"🔧 Bắt đầu FIX {len(videos)} tập lỗi (làm lại dịch → lồng, tối đa "
+                  f"{self._MAX_VERIFY_RETRY} vòng)...")
+        self._start_verify_retry(videos)
+
+    def _dubbed_for(self, video_path):
+        """Đường dẫn video đã lồng tiếng của 1 tập (theo stem gốc)."""
+        stem, ext = os.path.splitext(video_path)
+        if stem.endswith("_dubbed"):
+            return video_path
+        return stem + "_dubbed" + ext
+
+    def _episode_incomplete(self, video_path):
+        """Trả về lý do 1 tập CHƯA sẵn sàng render, hoặc None nếu đã đủ.
+        - Luôn cần _vi.srt (bản dịch tiếng Việt).
+        - Nếu bật lồng tiếng thì cần thêm _dubbed.mp4."""
+        vi = self._vi_srt_for(video_path)
+        if not os.path.exists(vi):
+            # Có thể là tập KHÔNG THOẠI (sub gốc rỗng) — không phải lỗi dịch.
+            # Nếu đúng vậy thì chuẩn bị giữ tiếng gốc rồi coi như đã đủ.
+            srt, _lang = self._find_existing_srt(video_path)
+            if srt and self._srt_is_empty(srt):
+                self._prepare_no_dialogue(video_path, srt)
+            else:
+                return "chưa có sub Việt (dịch lỗi/chưa dịch)"
+        if getattr(self, "_auto_dub_on", False):
+            dub = self._dubbed_for(video_path)
+            if not os.path.exists(dub):
+                # Nếu là tập không thoại (vi rỗng) thì tạo _dubbed = copy gốc
+                if self._srt_is_empty(vi):
+                    self._prepare_no_dialogue(video_path, vi)
+                    dub = self._dubbed_for(video_path)
+                if not os.path.exists(dub):
+                    return "chưa lồng tiếng"
+        return None
+
+    def _verify_before_render(self):
+        """Cổng kiểm tra chèn ngay trước render trong quy trình full.
+        Quét hàng đợi, gom tập lỗi rồi retry; hết retry mới render phần đạt."""
+        files = self._files_from_host()
+        bad = []
+        for vp in files:
+            if vp in self._skip_from_render:
+                continue
+            reason = self._episode_incomplete(vp)
+            if reason:
+                bad.append((vp, reason))
+
+        if not bad:
+            # Tất cả đã đủ
+            self._verify_round = 0
+            if getattr(self, "_fix_only_mode", False):
+                # Chạy từ nút '🔧 Fix' -> chỉ sửa, KHÔNG render
+                self._fix_only_mode = False
+                self._bad_found = []
+                if self._skip_from_render:
+                    self._log(f"⚠️ {len(self._skip_from_render)} tập không sửa được "
+                              "(thiếu srt nguồn để dịch lại): "
+                              + ", ".join(os.path.basename(v) for v in self._skip_from_render))
+                    self._log("✅ Các tập còn lại đã được làm lại xong.")
+                else:
+                    self._log("✅ Fix xong: mọi tập lỗi đã được làm lại thành công.")
+                self._set_buttons_enabled(True)
+                self._stop_card_poll()
+                return
+            if self._skip_from_render:
+                self._log(f"⚠️ Bỏ {len(self._skip_from_render)} tập lỗi khỏi render: "
+                          + ", ".join(os.path.basename(v) for v in self._skip_from_render))
+                self._exclude_skipped_cards()
+            self._log("✅ Kiểm tra xong: mọi tập đã dịch"
+                      + (" + lồng tiếng" if self._auto_dub_on else "") + ". Bắt đầu render.")
+            self._start_render()
+            return
+
+        # Còn tập lỗi
+        for vp, reason in bad:
+            self._log(f"🔎 Chưa đạt: {os.path.basename(vp)} — {reason}")
+
+        if self._verify_round >= self._MAX_VERIFY_RETRY:
+            # Hết lượt retry
+            still_bad = [os.path.basename(v) for v, _r in bad]
+            if getattr(self, "_fix_only_mode", False):
+                # Nút Fix: không render, chỉ báo tập nào không sửa được
+                self._fix_only_mode = False
+                self._verify_round = 0
+                self._bad_found = list(bad)   # giữ lại để bấm Fix tiếp nếu muốn
+                self._log(f"⛔ Đã thử làm lại {self._MAX_VERIFY_RETRY} vòng nhưng "
+                          f"{len(bad)} tập vẫn lỗi: " + ", ".join(still_bad))
+                self._log("   → Kiểm tra file srt gốc / đăng nhập Gemini rồi bấm '🔧 Fix' lại.")
+                self._set_buttons_enabled(True)
+                self._stop_card_poll()
+                return
+            # Luồng full: loại các tập vẫn lỗi, render phần còn lại
+            for vp, _r in bad:
+                self._skip_from_render.add(vp)
+            self._log(f"⛔ Đã retry {self._verify_round} vòng, "
+                      f"{len(bad)} tập vẫn lỗi → BỎ QUA, chỉ render các tập đạt.")
+            self._exclude_skipped_cards()
+            remain = [v for v in files if v not in self._skip_from_render]
+            if remain:
+                self._start_render()
+            else:
+                self._log("❌ Không còn tập nào đạt để render.")
+                self._set_buttons_enabled(True)
+                self._stop_card_poll()
+            return
+
+        # Còn lượt retry -> làm lại dịch + lồng cho các tập lỗi
+        self._verify_round += 1
+        self._log(f"🔁 RETRY vòng {self._verify_round}/{self._MAX_VERIFY_RETRY} "
+                  f"cho {len(bad)} tập lỗi (làm lại dịch → lồng tiếng)...")
+        self._start_verify_retry([vp for vp, _r in bad])
+
+    def _start_verify_retry(self, videos):
+        """Làm lại cho các tập lỗi: tập nào thiếu _vi.srt thì dịch lại từ srt
+        gốc; tập nào đã có _vi.srt mà thiếu _dubbed thì chỉ lồng lại. Xong
+        vòng này thì quay lại _verify_before_render để kiểm tra tiếp."""
+        self._translate_failed.clear()
+        self._dub_queue = []
+        self._dub_running = False
+
+        need_translate = []   # [(video, srt_gốc)]
+        need_dub_only = []    # [video] — đã có _vi.srt, chỉ thiếu lồng
+
+        for vp in videos:
+            vi = self._vi_srt_for(vp)
+            # Tập không thoại (srt gốc rỗng) -> giữ tiếng gốc, không dịch/lồng
+            srt0, _l0 = self._find_existing_srt(vp)
+            if (srt0 and self._srt_is_empty(srt0)) or (os.path.exists(vi) and self._srt_is_empty(vi)):
+                self._prepare_no_dialogue(vp, srt0 or vi)
+                continue
+            if not os.path.exists(vi):
+                # Chưa có bản dịch -> tìm srt nguồn để dịch lại
+                srt, lang = self._find_existing_srt(vp)
+                if srt and lang != "vi":
+                    need_translate.append((vp, srt))
+                elif srt and lang == "vi" and srt != vi:
+                    # srt cạnh là tiếng Việt sẵn -> copy thành _vi.srt
+                    try:
+                        import shutil
+                        shutil.copyfile(srt, vi)
+                        if self._auto_dub_on:
+                            need_dub_only.append(vp)
+                    except Exception:
+                        self._log(f"⏭ {os.path.basename(vp)}: không copy được sub Việt.")
+                else:
+                    self._log(f"⏭ {os.path.basename(vp)}: không có srt nguồn để dịch lại → bỏ.")
+                    self._skip_from_render.add(vp)
+            else:
+                # Đã có _vi.srt, chỉ thiếu lồng
+                if self._auto_dub_on:
+                    need_dub_only.append(vp)
+
+        self._set_buttons_enabled(False)
+        self._start_card_poll()
+
+        if need_translate:
+            # Dịch lại; sau khi dịch xong toàn bộ + lồng xong -> _on_translate_all_done
+            # sẽ gọi lại _verify_before_render.
+            self._chain_dub_after_translate = self._auto_dub_on
+            self._start_translate(need_translate)   # ⚠ hàm này reset _dub_queue=[]
+            # -> xếp hàng lồng cho tập chỉ thiếu lồng SAU khi reset, rồi đá chạy
+            if self._auto_dub_on and need_dub_only:
+                for vp in need_dub_only:
+                    if vp not in self._dub_queue:
+                        self._dub_queue.append(vp)
+                self._pump_dub_queue()
+        elif self._auto_dub_on and need_dub_only:
+            for vp in need_dub_only:
+                if vp not in self._dub_queue:
+                    self._dub_queue.append(vp)
+            # Không cần dịch, chỉ lồng lại
+            self._pump_dub_queue()
+        else:
+            # Không có gì để làm lại (không dịch được, không lồng) -> kiểm tra tiếp
+            QTimer.singleShot(200, self._verify_before_render)
+
+    def _exclude_skipped_cards(self):
+        """Gỡ các card thuộc _skip_from_render khỏi hàng đợi render của host,
+        để _start_render_all không đem tập lỗi đi render."""
+        if not self._skip_from_render:
+            return
+        cards = getattr(self.host, "cards", None)
+        if not isinstance(cards, list):
+            return
+        removed = []
+        for c in list(cards):
+            vp = getattr(c, "video_path", None)
+            # so cả bản gốc lẫn bản _dubbed cùng stem
+            stem = os.path.splitext(vp or "")[0]
+            base = stem[:-len("_dubbed")] if stem.endswith("_dubbed") else stem
+            hit = False
+            for bad in self._skip_from_render:
+                bstem = os.path.splitext(bad)[0]
+                bbase = bstem[:-len("_dubbed")] if bstem.endswith("_dubbed") else bstem
+                if base == bbase:
+                    hit = True
+                    break
+            if hit:
+                try:
+                    cards.remove(c)
+                    c.setParent(None)
+                    removed.append(vp)
+                except Exception:
+                    pass
+        if removed:
+            # cập nhật lại số đếm trên các nút render nếu host có hàm đó
+            for m in ("_reindex_cards", "_update_run_button", "_refresh_counts"):
+                fn = getattr(self.host, m, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
 
     def _start_render(self):
         fn = getattr(self.host, "_start_render_all", None)
@@ -765,16 +1174,30 @@ class DubFeatureWidget(QWidget):
             return
         self._save_settings()
         self.txt_log.clear()
+        # Reset trạng thái kiểm tra/retry cho lần chạy mới
+        self._verify_round = 0
+        self._translate_failed = set()
+        self._skip_from_render = set()
         self._log(f"🚀 LÀM TẤT CẢ với {len(files)} video. Đang phân loại...")
+
+        # Đặt sớm để _prepare_no_dialogue biết có cần tạo _dubbed hay không
+        self._auto_dub_on = self.chk_auto_dub.isChecked()
 
         need_stt = []          # chưa có srt -> phải tách
         need_translate = []    # có srt Trung/khác -> dịch
         ready_vi = []          # đã có sub Việt -> lồng luôn
+        no_dialogue = []       # srt rỗng (tập không thoại) -> giữ tiếng gốc
 
         for vp in files:
             srt, lang = self._find_existing_srt(vp)
             if not srt:
                 need_stt.append(vp)
+            elif self._srt_is_empty(srt):
+                # Tập không thoại: chuẩn bị _vi.srt rỗng + _dubbed (copy gốc)
+                if self._prepare_no_dialogue(vp, srt):
+                    no_dialogue.append(vp)
+                else:
+                    need_stt.append(vp)   # chuẩn bị fail -> thử tách lại
             elif lang == "vi":
                 vi = self._vi_srt_for(vp)
                 if srt != vi:
@@ -787,7 +1210,8 @@ class DubFeatureWidget(QWidget):
             else:
                 need_translate.append((vp, srt))
 
-        self._log(f"   • Cần tách sub: {len(need_stt)}  |  cần dịch: {len(need_translate)}  |  đã có sub Việt: {len(ready_vi)}")
+        self._log(f"   • Cần tách sub: {len(need_stt)}  |  cần dịch: {len(need_translate)}  "
+                  f"|  đã có sub Việt: {len(ready_vi)}  |  không thoại: {len(no_dialogue)}")
 
         # Cấu hình chuỗi full
         self._auto_dub_on = self.chk_auto_dub.isChecked()
@@ -814,6 +1238,10 @@ class DubFeatureWidget(QWidget):
                     srt, lang = self._find_existing_srt(vp)
                     if not srt:
                         self._log(f"⚠️ {os.path.basename(vp)}: tách sub thất bại, bỏ qua.")
+                        continue
+                    if self._srt_is_empty(srt):
+                        # Tách ra sub rỗng -> tập không thoại, giữ tiếng gốc
+                        self._prepare_no_dialogue(vp, srt)
                         continue
                     if lang == "vi":
                         vi = self._vi_srt_for(vp)
@@ -853,7 +1281,7 @@ class DubFeatureWidget(QWidget):
                 # chẳng có gì lồng
                 self._refresh_host_cards()
                 if self._render_after_dub:
-                    self._start_render()
+                    self._verify_before_render()
 
     def _refresh_host_cards(self):
         """Cho mỗi card trong hàng đợi tự dò lại sub trên đĩa (bản Việt hoặc
