@@ -22,6 +22,10 @@ jobs:
         python -m pip install --upgrade pip
         pip install PyQt6 requests nuitka ordered-set zstandard pydub edge-tts srt pysrt playwright pycryptodome Pillow yt-dlp
 
+    - name: Set MSVC heap size
+      shell: pwsh
+      run: echo "CL=/F536870912" >> $env:GITHUB_ENV
+
     - name: Build EXE with Nuitka
       # Dùng dấu ">" của YAML để gom tất cả các tham số bên dưới thành 1 dòng lệnh duy nhất, 
       # chống lỗi cú pháp xuống dòng của PowerShell
@@ -34,6 +38,8 @@ jobs:
         --include-package=edge_tts 
         --include-package=pydub 
         --include-package=yt_dlp 
+        --nofollow-import-to=yt_dlp.extractor.lazy_extractors
+        --jobs=1
         --include-module=capcut_widget 
         --include-module=translate_tab 
         --include-module=render_tab 
