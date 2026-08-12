@@ -484,14 +484,23 @@ class DubFeatureWidget(QWidget):
         # Không rõ Trung, không rõ Việt -> coi là ngôn ngữ khác (sẽ đem dịch)
         return "other"
 
+    @staticmethod
+    def _orig_stem_for(video_path):
+        """Stem gốc của video (bỏ hậu tố _dubbed nếu video_path đang trỏ
+        tới bản đã lồng tiếng), để luôn ghép đúng tên srt cạnh video gốc."""
+        stem, _ext = os.path.splitext(video_path)
+        if stem.endswith("_dubbed"):
+            return stem[:-len("_dubbed")]
+        return stem
+
     def _vi_srt_for(self, video_path):
         """Đường dẫn sub tiếng Việt đích của 1 video."""
-        return os.path.splitext(video_path)[0] + "_vi.srt"
+        return self._orig_stem_for(video_path) + "_vi.srt"
 
     def _find_existing_srt(self, video_path):
         """Tìm srt đang có cạnh video. Ưu tiên *_vi.srt, rồi tới *.srt.
         Trả về (path, lang) hoặc (None, None)."""
-        base = os.path.splitext(video_path)[0]
+        base = self._orig_stem_for(video_path)
         vi = base + "_vi.srt"
         raw = base + ".srt"
         # Ưu tiên bản _vi.srt nếu nội dung đúng là tiếng Việt
