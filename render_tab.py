@@ -940,7 +940,8 @@ class ChatGPTThumbnailThread(QThread):
     all_done = pyqtSignal(list)
 
     def __init__(self, src_image, base_prompt, out_dir, n_variants=4,
-                 variant_hints=None, show_browser=False, srt_text=""):
+                 variant_hints=None, show_browser=False, srt_text="",
+                 orientation="landscape"):
         super().__init__()
         self.src_image = src_image
         self.base_prompt = base_prompt.strip()
@@ -956,6 +957,7 @@ class ChatGPTThumbnailThread(QThread):
         self.show_browser = bool(show_browser)
         self._cancel = False
         self._src_ratio = None
+        self.orientation = orientation  # "landscape" = 16:9 ngang | "portrait" = 9:16 dọc
 
     def cancel(self):
         self._cancel = True
@@ -1014,20 +1016,46 @@ class ChatGPTThumbnailThread(QThread):
             return False, "Không thấy ô nhập ChatGPT (có thể chưa đăng nhập / CAPTCHA)."
         try:
             inp.click()
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(400)
             # ProseMirror: gõ trực tiếp an toàn hơn set innerText
             page.keyboard.insert_text(prompt_text)
-            page.wait_for_timeout(400)
+            # Prompt rất dài (~2000+ ký tự) → cần chờ ChatGPT render xong text
+            # trong ô ProseMirror mới bấm Send, không thì nút còn disabled.
+            page.wait_for_timeout(1500)
         except Exception:
             # fallback set nội dung
             try:
-                page.evaluate('''(t)=>{const el=document.querySelector("#prompt-textarea")||document.querySelector("[contenteditable='true']");if(el){el.focus();el.innerText=t;el.dispatchEvent(new Event('input',{bubbles:true}));}}''', prompt_text)
+                page.evaluate(
+                    '''(t)=>{const el=document.querySelector("#prompt-textarea")'''
+                    '''||document.querySelector("[contenteditable='true']");'''
+                    '''if(el){el.focus();el.innerText=t;'''
+                    '''el.dispatchEvent(new Event('input',{bubbles:true}));}}''',
+                    prompt_text)
+                page.wait_for_timeout(1500)
             except Exception:
                 pass
-        for attempt in range(4):
+
+        # Chờ nút Send ACTIVE (không disabled) tối đa 10s trước khi bấm.
+        # ChatGPT disable nút khi ô trống hoặc đang xử lý → cần đợi.
+        for _ in range(20):
             if self._cancel:
                 return False, "Đã hủy."
-            btn = self._find_el(page, _CGPT_SEND_SELS, timeout=2500)
+            try:
+                btn = page.query_selector(_CGPT_SEND_SELS[0])
+                if not btn:
+                    for s in _CGPT_SEND_SELS[1:]:
+                        btn = page.query_selector(s)
+                        if btn: break
+                if btn and btn.get_attribute("disabled") is None and btn.get_attribute("aria-disabled") != "true":
+                    break
+            except Exception:
+                pass
+            page.wait_for_timeout(500)
+
+        for attempt in range(5):
+            if self._cancel:
+                return False, "Đã hủy."
+            btn = self._find_el(page, _CGPT_SEND_SELS, timeout=3000)
             sent = False
             if btn:
                 try:
@@ -1040,17 +1068,21 @@ class ChatGPTThumbnailThread(QThread):
                     inp.click(); page.keyboard.press("Enter")
                 except Exception:
                     pass
-            page.wait_for_timeout(1000)
-            # kiểm tra ô nhập đã trống (đã gửi)
+            # Chờ lâu hơn: ChatGPT cần vài giây xử lý trước khi ô nhập trống
+            page.wait_for_timeout(2000)
+            # kiểm tra ô nhập đã trống (đã gửi thành công)
             try:
-                left = page.evaluate('''()=>{const el=document.querySelector("#prompt-textarea")||document.querySelector("[contenteditable='true']");return el?(el.innerText||"").trim():"";}''')
+                left = page.evaluate(
+                    '''()=>{const el=document.querySelector("#prompt-textarea")'''
+                    '''||document.querySelector("[contenteditable='true']");'''
+                    '''return el?(el.innerText||"").trim():"x";}''')
             except Exception:
                 left = ""
             if not left:
                 return True, ""
-            if attempt < 3:
-                self.log.emit(f"↩️ Chưa gửi được, thử lại ({attempt+2}/4)...\n")
-        return False, "ChatGPT không nhận prompt sau 4 lần."
+            if attempt < 4:
+                self.log.emit(f"↩️ Chưa gửi được, thử lại ({attempt+2}/5)...\n")
+        return False, "ChatGPT không nhận prompt sau 5 lần."
 
     def _grab_new_image(self, page, known_srcs, save_path):
         """Chờ ChatGPT vẽ xong ảnh (ổn định qua vài nhịp) rồi tải về."""
@@ -1131,7 +1163,14 @@ class ChatGPTThumbnailThread(QThread):
             if len(clean) > 8000:
                 clean = clean[:8000]
             srt_block = f"\n\n=== NỘI DUNG PHỤ ĐỀ (SRT) ĐỂ PHÂN TÍCH ===\n{clean}\n=== HẾT SRT ===\n"
-        prompt = f"{self.base_prompt}{srt_block}"
+        ratio_note = (
+            "\n\nYÊU CẦU BẮT BUỘC VỀ TỈ LỆ: Tạo ảnh khổ DỌC tỉ lệ 9:16 (portrait), "
+            "chiều cao lớn hơn chiều rộng. Phù hợp đăng Facebook/Reels/Stories. "
+            "KHÔNG tạo ảnh ngang."
+            if self.orientation == "portrait"
+            else "\n\nYÊU CẦU TỈ LỆ: Tạo ảnh khổ NGANG tỉ lệ 16:9 (landscape, 1536x1024)."
+        )
+        prompt = f"{self.base_prompt}{srt_block}{ratio_note}"
         self.log.emit(f"\n🖼️ ChatGPT đang phân tích SRT & tạo thumbnail...\n")
 
         pw = browser = ctx = None
@@ -2531,6 +2570,19 @@ class RenderWidget(QWidget):
         r2.addWidget(self.btn_thumb_run)
         v.addLayout(r2)
 
+        # Checkbox chọn khổ ảnh (ngang / dọc)
+        r_orient = QHBoxLayout()
+        self.chk_portrait = QCheckBox("📱 Khổ dọc 9:16 (Facebook / Reels / Stories)")
+        self.chk_portrait.setStyleSheet(
+            "QCheckBox { color:#A78BFA; font-size:11px; font-weight:bold; }"
+            "QCheckBox::indicator { width:14px; height:14px; }")
+        self.chk_portrait.setToolTip(
+            "Bỏ check = ảnh ngang 16:9 (YouTube)\n"
+            "Check = ảnh dọc 9:16 (Facebook / Reels / Stories)")
+        r_orient.addWidget(self.chk_portrait)
+        r_orient.addStretch()
+        v.addLayout(r_orient)
+
         self.thumb_result_row = QHBoxLayout()
         self.thumb_result_row.addStretch()
         
@@ -2618,9 +2670,11 @@ class RenderWidget(QWidget):
 
         if provider == "ChatGPT":
             # ChatGPT: chỉ tạo 1 ảnh duy nhất theo SRT (không nhiều biến thể).
+            orientation = "portrait" if getattr(self, "chk_portrait", None) and self.chk_portrait.isChecked() else "landscape"
             self._thumb_thread = ChatGPTThumbnailThread(
                 src_image=(src if has_img else ""), base_prompt=prompt, out_dir=out_dir,
-                n_variants=1, show_browser=True, srt_text=srt_text)
+                n_variants=1, show_browser=True, srt_text=srt_text,
+                orientation=orientation)
         else:
             self._thumb_thread = GeminiThumbnailThread(
                 src_image=src, base_prompt=prompt, out_dir=out_dir, n_variants=n,

@@ -45,6 +45,13 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QSettings, QTimer
 
+# ── Whisper STT (offline, cho VIDEO DÀI) — import mềm, thiếu không sập app ────
+try:
+    from whisper_stt import WhisperSttThread, _HAS_FW as _WHISPER_AVAILABLE
+except Exception:
+    WhisperSttThread = None
+    _WHISPER_AVAILABLE = False
+
 # ── Import lại toàn bộ "động cơ" từ honggou_tab (không viết lại) ──────────────
 _ENGINE_OK = True
 _ENGINE_ERR = ""
@@ -247,6 +254,41 @@ class DubFeatureWidget(QWidget):
         self.cmb_stt_src.setCurrentText(self.settings.value("stt_src", "zh-CN"))
         row_src.addWidget(self.cmb_stt_src, 1)
         lay.addLayout(row_src)
+
+        # Chọn ENGINE tách sub: CapCut (nhanh, cần mạng, KHÔNG làm video dài)
+        # hoặc Whisper (offline, chạy được video dài, có VAD lọc nhạc nền).
+        row_eng_stt = QHBoxLayout()
+        row_eng_stt.addWidget(_lbl("Engine STT:"))
+        self.cmb_stt_engine = QComboBox()
+        self.cmb_stt_engine.addItems(["☁️ CapCut (video ngắn)",
+                                      "💻 Whisper (video dài, offline)"])
+        self._style_combo_popup(self.cmb_stt_engine)
+        self.cmb_stt_engine.setCurrentText(
+            self.settings.value("stt_engine", "☁️ CapCut (video ngắn)"))
+        self.cmb_stt_engine.currentTextChanged.connect(self._on_stt_engine_changed)
+        row_eng_stt.addWidget(self.cmb_stt_engine, 1)
+        lay.addLayout(row_eng_stt)
+
+        # Chọn cỡ model Whisper (chỉ hiện khi dùng Whisper).
+        #   small  ~480MB — nhẹ; tiếng Anh tốt, tiếng Trung tạm
+        #   medium ~1.5GB — tiếng Trung tốt (khuyên cho drama Trung)
+        #   large-v3 ~3GB — chính xác nhất, cần máy khỏe
+        self.row_whisper_model = QHBoxLayout()
+        self.row_whisper_model.addWidget(_lbl("Model:"))
+        self.cmb_whisper_model = QComboBox()
+        self.cmb_whisper_model.addItems([
+            "small (nhẹ · EN tốt)",
+            "medium (khuyên · ZH tốt)",
+            "large-v3 (chính xác nhất)",
+        ])
+        self._style_combo_popup(self.cmb_whisper_model)
+        self.cmb_whisper_model.setCurrentText(
+            self.settings.value("whisper_model", "medium (khuyên · ZH tốt)"))
+        self.row_whisper_model.addWidget(self.cmb_whisper_model, 1)
+        lay.addLayout(self.row_whisper_model)
+        # Ẩn/hiện model theo engine đang chọn
+        self._on_stt_engine_changed(self.cmb_stt_engine.currentText())
+
         lay.addWidget(QLabel("ℹ️ Nút 'LÀM TẤT CẢ' tự nhận diện sub sẵn có:\n"
                              "sub Việt → lồng luôn; sub Trung/khác → dịch; không có → tách.",
                              styleSheet="color:#64748b; font-size:9px; border:none;"))
@@ -435,6 +477,8 @@ class DubFeatureWidget(QWidget):
     def _save_settings(self):
         s = self.settings
         s.setValue("stt_src", self.cmb_stt_src.currentText())
+        s.setValue("stt_engine", self.cmb_stt_engine.currentText())
+        s.setValue("whisper_model", self.cmb_whisper_model.currentText())
         s.setValue("trans_engine", self.cb_translate_engine.currentText())
         s.setValue("ds_key", self.txt_ds_key.text().strip())
         s.setValue("trans_workers", self.spn_trans_workers.value())
@@ -451,6 +495,19 @@ class DubFeatureWidget(QWidget):
 
     def _on_engine_changed(self, text):
         self.txt_ds_key.setVisible(text.startswith("🚀"))
+
+    def _on_stt_engine_changed(self, text):
+        """Ẩn dropdown model khi dùng CapCut, hiện khi dùng Whisper."""
+        is_whisper = text.startswith("💻")
+        for i in range(self.row_whisper_model.count()):
+            w = self.row_whisper_model.itemAt(i).widget()
+            if w:
+                w.setVisible(is_whisper)
+
+    def _whisper_model_name(self):
+        """Nhãn dropdown ('medium (khuyên...)') → tên model faster-whisper."""
+        label = self.cmb_whisper_model.currentText()
+        return label.split(" ", 1)[0].strip()   # 'medium', 'small', 'large-v3'
 
     # ════════════════════════════════════════════════════════════════════
     #  NHẬN DIỆN NGÔN NGỮ SRT — đọc nội dung thật, không dựa vào tên file
@@ -642,8 +699,24 @@ class DubFeatureWidget(QWidget):
         self._start_card_poll()
         self._stt_files = list(files)
         src = self.cmb_stt_src.currentText()
-        self._stt_thread = SttBatchThread(files, src_lang=src, out_lang="vi-VN",
-                                          use_trans=False, stt_workers=3)
+
+        use_whisper = self.cmb_stt_engine.currentText().startswith("💻")
+        if use_whisper:
+            if not (WhisperSttThread and _WHISPER_AVAILABLE):
+                self._log("❌ Chưa cài faster-whisper. Mở CMD chạy:  "
+                          "pip install faster-whisper  — rồi thử lại.")
+                self._set_buttons_enabled(True)
+                self._stop_card_poll()
+                return
+            model_name = self._whisper_model_name()
+            self._log(f"🧠 Dùng Whisper (model '{model_name}') — chạy được video dài.")
+            self._stt_thread = WhisperSttThread(
+                files, src_lang=src, out_lang="vi-VN",
+                use_trans=False, model_name=model_name)
+        else:
+            self._stt_thread = SttBatchThread(files, src_lang=src, out_lang="vi-VN",
+                                              use_trans=False, stt_workers=3)
+
         self._stt_thread.progress_signal.connect(self._log)
         self._stt_thread.finished_signal.connect(self._on_stt_finished)
         self._keep_alive(self._stt_thread)

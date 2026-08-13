@@ -303,7 +303,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.51"
+APP_VERSION = "1.0.52"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -813,15 +813,55 @@ class HonggouScanThread(QThread):
                 return
 
             detail = None
-            json_match = re.search(r'window\._ROUTER_DATA\s*=\s*(\{.+?\})\s*;?\s*</script>', html, re.DOTALL)
+            parse_stage = "init"
+
+            json_match = re.search(r'window\._ROUTER_DATA\s*=\s*(\{.+\})\s*;?\s*</script>', html, re.DOTALL)
+            if not json_match:
+                # phòng khi đổi tên biến / bỏ tiền tố window.
+                json_match = re.search(r'_ROUTER_DATA\s*=\s*(\{.+\})\s*;?\s*</script>', html, re.DOTALL)
+
             if json_match:
+                raw = json_match.group(1)
+                # cắt về JSON cân bằng dấu ngoặc thay vì non-greedy (tránh dừng ở } lồng nhau đầu tiên)
+                depth, end, in_str, esc = 0, None, False, False
+                for i, ch in enumerate(raw):
+                    if in_str:
+                        if esc: esc = False
+                        elif ch == '\\': esc = True
+                        elif ch == '"': in_str = False
+                        continue
+                    if ch == '"': in_str = True
+                    elif ch == '{': depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                if end:
+                    raw = raw[:end]
                 try:
-                    data = json.loads(json_match.group(1))
-                    detail = data.get("loaderData", {}).get("detail_page", {}).get("seriesDetail", {})
-                except json.JSONDecodeError: pass
+                    data = json.loads(raw)
+                    detail = (data.get("loaderData", {}) or {}).get("detail_page", {}) or {}
+                    detail = detail.get("seriesDetail", {}) or {}
+                    parse_stage = "ok" if detail else "path_miss"
+                except json.JSONDecodeError as e:
+                    parse_stage = f"json_err: {e}"
+            else:
+                low = html.lower()
+                if any(k in low for k in ("captcha", "verify", "验证", "滑块")):
+                    parse_stage = "blocked_captcha"
+                elif any(k in low for k in ("login", "sign in", "登录")):
+                    parse_stage = "need_login"
+                elif len(html) < 2000:
+                    parse_stage = f"html_too_short(len={len(html)})"
+                else:
+                    parse_stage = "no_router_data"
 
             if not detail:
-                self.error_signal.emit("Không bóc tách được dữ liệu. Vui lòng kiểm tra lại link.")
+                snippet = (html[:400].replace("\r", " ").replace("\n", " ") if html else "")
+                self.error_signal.emit(
+                    f"Không bóc tách được dữ liệu [{parse_stage}]. Vui lòng kiểm tra lại link.\n"
+                    f"---\nHTML mở đầu: {snippet}")
                 return
 
             series_id = str(detail.get("series_id") or "")
