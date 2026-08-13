@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings, QSize
 from PyQt6.QtGui import QTextCursor, QPixmap, QColor, QIcon
 from shared_utils import AsyncImageLoader, CREATE_NO_WINDOW
 from cookie_tab import get_cookie_file
+import yt_dlp
 
 def _sanitize(name): 
     return re.sub(r'[<>:"/\\|?*\n\r\t]', '_', name).strip()[:60]
@@ -454,7 +455,17 @@ class BilibiliDownloadThread(QThread):
             concurrent.futures.wait(futs)
         self.log.emit(f"🎉 HOÀN TẤT TẢI: {self.success_count}/{total} video.\n")
         self.user_log.emit(f"🎉 Hoàn tất: {self.success_count}/{total} tải thành công\n")
-        
+
+    def _dl_worker(self, vid, idx, tot):
+        self.pause_event.wait()
+        if self._cancel:
+            return False
+
+        vid_id = str(vid.get("id", ""))
+        desc = _sanitize(vid.get("desc", "") or "")
+        author = _sanitize(vid.get("author", "BilibiliUser") or "BilibiliUser")
+        user_dir = os.path.join(self.save_dir, "BilibiliDownload", author)
+        os.makedirs(user_dir, exist_ok=True)
 
         # Lưu thẳng file video vào thư mục tên kênh (KHÔNG tạo thư mục con riêng cho từng video).
         # Vẫn giữ %(playlist_index)s trong tên file để video nhiều tập/phần không bị ghi đè lẫn nhau.

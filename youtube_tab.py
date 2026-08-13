@@ -261,8 +261,95 @@ class YouTubeDownloadThread(QThread):
             concurrent.futures.wait(futs)
         self.log.emit(f"🎉 HOÀN TẤT TẢI: {self.success_count}/{total} video.\n")
         self.user_log.emit(f"🎉 Hoàn tất: {self.success_count}/{total} tải thành công\n")
-        
-        # === PHA DỊCH THUẬT (tuần tự, sau khi tải + Whisper xong) ===
+
+    def _format_for_res(self):
+        # Ánh xạ chế độ độ phân giải -> chuỗi format của yt-dlp
+        m = {
+            "4K":    "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
+            "2K":    "bestvideo[height<=1440]+bestaudio/best[height<=1440]/best",
+            "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+            "720p":  "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            "480p":  "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+        }
+        return m.get(self.resolution_mode, "bestvideo+bestaudio/best")
+
+    def _dl_worker(self, vid, idx, tot):
+        self.pause_event.wait()
+        if self._cancel:
+            return False
+
+        vid_id = str(vid.get("id", ""))
+        desc = _sanitize(vid.get("desc", "") or "")
+        author = _sanitize(vid.get("author", "YouTubeChannel") or "YouTubeChannel")
+        user_dir = os.path.join(self.save_dir, "YouTubeDownload", author)
+        os.makedirs(user_dir, exist_ok=True)
+
+        base_name = f"{desc} [{vid_id}]" if desc else f"{vid_id}"
+        outtmpl = os.path.join(user_dir, f"{base_name}.%(ext)s")
+
+        self.log.emit(f"[{idx}/{tot}] ⬇️ Bắt đầu tải: {vid_id}\n")
+        self.card_progress.emit(vid_id, -1)
+
+        cmd = [
+            get_ytdlp_path(),
+            "-f", self._format_for_res(),
+            "--merge-output-format", "mp4",
+            "-o", outtmpl,
+            "--no-warnings", "--no-playlist",
+            "--newline",
+            "--progress-template", "download:PCT %(progress._percent_str)s",
+        ]
+        if self.cookie_file and os.path.exists(self.cookie_file):
+            cmd += ["--cookies", self.cookie_file]
+        cmd.append(vid["url"])
+
+        success = False
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            if self._cancel:
+                break
+            self.pause_event.wait()
+            try:
+                kw = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", **kw
+                )
+                last_err_line = ""
+                for line in proc.stdout:
+                    if self._cancel:
+                        proc.terminate()
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("PCT"):
+                        try:
+                            pct = int(float(line.replace("PCT", "").replace("%", "").strip()))
+                            self.card_progress.emit(vid_id, pct)
+                        except ValueError:
+                            pass
+                    elif "ERROR" in line.upper():
+                        last_err_line = line
+                        self.log.emit(f"   {line}\n")
+                proc.wait()
+                if proc.returncode == 0:
+                    success = True
+                    self.card_progress.emit(vid_id, 100)
+                    break
+                else:
+                    if attempt < max_retries:
+                        self.log.emit(f"⚠️ [{idx}] Lỗi tải (thử lại {attempt}/{max_retries}) | {last_err_line[:120]}\n")
+                        time.sleep(2)
+                    else:
+                        self.log.emit(f"❌ [{idx}] Thất bại hoàn toàn: {vid_id} | {last_err_line[:200]}\n")
+            except Exception as e:
+                err_msg = str(e).replace("\n", " ").strip()
+                if attempt < max_retries:
+                    self.log.emit(f"⚠️ [{idx}] Lỗi tải (thử lại {attempt}/{max_retries}) | {err_msg[:120]}\n")
+                    time.sleep(2)
+                else:
+                    self.log.emit(f"❌ [{idx}] Thất bại hoàn toàn: {vid_id} | {err_msg}\n")
 
         with self.lock:
             self.done_count += 1
@@ -271,10 +358,10 @@ class YouTubeDownloadThread(QThread):
                 self.log.emit(f"✅ [XONG] {vid_id} -> {self.success_count}/{tot}\n")
                 self.user_log.emit(f"✅ Tải xong ({self.success_count}/{tot}): {vid_id}\n")
             else:
-                self.log.emit(f"❌ [BỎ QUA] {vid_id} do lỗi mạng.\n")
-                self.user_log.emit(f"❌ Lỗi mạng: {vid_id}\n")
+                self.log.emit(f"❌ [BỎ QUA] {vid_id} do lỗi.\n")
+                self.user_log.emit(f"❌ Lỗi tải: {vid_id}\n")
             self.total_progress.emit(self.done_count, tot)
-            
+
         return success
 
 # ============================================================

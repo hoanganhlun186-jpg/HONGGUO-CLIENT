@@ -33,10 +33,15 @@ from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 try:
     from shared_utils import (get_ffmpeg_path, get_optimal_ffmpeg_codec,
                               CREATE_NO_WINDOW)
+    try:
+        from shared_utils import get_codec_fallback_reason
+    except Exception:
+        def get_codec_fallback_reason(): return ""
 except Exception:
     CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
     def get_ffmpeg_path(): return shutil.which("ffmpeg") or "ffmpeg"
     def get_optimal_ffmpeg_codec(): return "libx264"
+    def get_codec_fallback_reason(): return ""
 
 # Mượn hằng số đăng nhập Gemini từ tab dịch (CHỈ mượn hằng số + auth file,
 # KHÔNG import/đụng luồng dịch GeminiTranslateThread). Luồng tạo thumbnail
@@ -64,6 +69,9 @@ def build_video_encoder_args(codec, crf_val=20, preset_hw="quality", preset_sw="
     """
     c = (codec or "").lower()
     args = ["-c:v", codec]
+    # Ép 8-bit 4:2:0: video nguồn 10-bit/4:4:4 khiến NVENC card cũ lỗi và file
+    # không phát được trên nhiều điện thoại/TV/QuickTime (màn đen, chỉ có tiếng).
+    args += ["-pix_fmt", "yuv420p"]
     use_crf = crf_val and crf_val > 0
 
     if "nvenc" in c:
@@ -892,27 +900,445 @@ class GeminiThumbnailThread(QThread):
         self.all_done.emit(saved)
 
 
+# ============================================================
+# LUỒNG TẠO THUMBNAIL BẰNG CHATGPT (web automation)
+# Cùng interface signal với GeminiThumbnailThread để UI cắm thẳng vào.
+# Auth riêng: chatgpt_auth.json (storage_state). Lần đầu chưa có sẽ mở
+# Chrome hiện để người dùng đăng nhập rồi tự lưu session.
+# ============================================================
+CHATGPT_AUTH_FILE = os.path.join(os.path.dirname(os.path.abspath(AUTH_FILE)),
+                                 "chatgpt_auth.json")
+
+_CGPT_INPUT_SELS = [
+    "#prompt-textarea",
+    "div#prompt-textarea[contenteditable='true']",
+    "div[contenteditable='true'].ProseMirror",
+    "textarea[data-testid='prompt-textarea']",
+    "textarea[placeholder]",
+]
+_CGPT_SEND_SELS = [
+    "button[data-testid='send-button']",
+    "button[aria-label*='Send' i]",
+    "button[aria-label*='Gửi' i]",
+]
+_CGPT_FILE_INPUT_SEL = "input[type='file']"
+_CGPT_RESULT_IMG_SELS = [
+    "[data-message-author-role='assistant'] img",
+    "img[src*='oaiusercontent']",
+    "img[src*='files.oaiusercontent']",
+    "img[alt*='Generated' i]",
+    "img[src^='blob:']",
+]
+
+
+class ChatGPTThumbnailThread(QThread):
+    """Tạo N thumbnail từ 1 ảnh gốc bằng ChatGPT web (tạo ảnh bằng DALL·E/
+    gpt-image). Mỗi biến thể 1 phiên Chrome riêng. Auth qua storage_state."""
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+    one_done = pyqtSignal(str)
+    all_done = pyqtSignal(list)
+
+    def __init__(self, src_image, base_prompt, out_dir, n_variants=4,
+                 variant_hints=None, show_browser=False, srt_text=""):
+        super().__init__()
+        self.src_image = src_image
+        self.base_prompt = base_prompt.strip()
+        self.out_dir = out_dir
+        self.srt_text = (srt_text or "").strip()
+        self.n_variants = max(1, min(8, int(n_variants)))
+        self.variant_hints = variant_hints or [
+            "Phong cách RỒNG LỬA: rồng vàng-đỏ khổng lồ bằng lửa cuộn quanh phía sau, biển lửa dung nham, tàn lửa bay, khí thế bá vương ngút trời.",
+            "Phong cách SẤM SÉT VẠN QUÂN: tia sét xanh-tím xé trời, luồng năng lượng điện bùng nổ, mây bão vần vũ, hào quang chớp giật hùng vĩ.",
+            "Phong cách BĂNG PHONG THẦN GIỚI: phượng hoàng băng, bão tuyết, ánh sáng vàng kim thần thánh, cung điện trên mây, huyền ảo choáng ngợp.",
+            "Phong cách HOÀNG KIM SỬ THI: hào quang vàng rực chói lòa, linh thú vàng cuộn quanh, tia sáng thần thánh tỏa, bụi vàng bay, khí thế đế vương.",
+        ]
+        self.show_browser = bool(show_browser)
+        self._cancel = False
+        self._src_ratio = None
+
+    def cancel(self):
+        self._cancel = True
+
+    def _find_el(self, page, sels, timeout=8000):
+        return _thumb_find_el(page, sels, timeout=timeout,
+                              cancel_check=lambda: self._cancel)
+
+    def _attach_image(self, page):
+        """Đính kèm ảnh qua input[type=file] ẩn (ưu tiên), fallback Ctrl+V."""
+        fi = page.query_selector(_CGPT_FILE_INPUT_SEL)
+        if not fi:
+            # ChatGPT có thể ẩn input trong shadow/portal; thử tìm sâu
+            try:
+                handle = page.evaluate_handle('''() => {
+                    const find = (root) => {
+                        let el = root.querySelector("input[type='file']");
+                        if (el) return el;
+                        for (const h of root.querySelectorAll('*')) {
+                            if (h.shadowRoot) { const f = find(h.shadowRoot); if (f) return f; }
+                        }
+                        return null;
+                    };
+                    return find(document);
+                }''')
+                fi = handle.as_element()
+            except Exception:
+                fi = None
+        if fi:
+            try:
+                fi.set_input_files(self.src_image)
+                # chờ ảnh preview đính kèm hiện trong ô soạn
+                for _ in range(30):  # ~15s
+                    if self._cancel:
+                        return False
+                    page.wait_for_timeout(500)
+                    has_att = page.evaluate('''() => {
+                        const imgs = document.querySelectorAll("img");
+                        for (const im of imgs) {
+                            const s = im.src || "";
+                            if (s.startsWith("blob:") || s.startsWith("data:image")) return true;
+                        }
+                        return !!document.querySelector("[class*='attachment'], [data-testid*='attachment'], img[alt*='upload' i]");
+                    }''')
+                    if has_att:
+                        self.log.emit("   📎 Đã đính kèm ảnh gốc vào ChatGPT.\n")
+                        return True
+            except Exception as e:
+                self.log.emit(f"   ↪️ input ẩn lỗi ({e}).\n")
+        self.log.emit("   ⚠️ Không đính kèm được ảnh (ChatGPT có thể đổi giao diện).\n")
+        return False
+
+    def _type_and_send(self, page, prompt_text):
+        inp = self._find_el(page, _CGPT_INPUT_SELS, timeout=10000)
+        if not inp:
+            return False, "Không thấy ô nhập ChatGPT (có thể chưa đăng nhập / CAPTCHA)."
+        try:
+            inp.click()
+            page.wait_for_timeout(300)
+            # ProseMirror: gõ trực tiếp an toàn hơn set innerText
+            page.keyboard.insert_text(prompt_text)
+            page.wait_for_timeout(400)
+        except Exception:
+            # fallback set nội dung
+            try:
+                page.evaluate('''(t)=>{const el=document.querySelector("#prompt-textarea")||document.querySelector("[contenteditable='true']");if(el){el.focus();el.innerText=t;el.dispatchEvent(new Event('input',{bubbles:true}));}}''', prompt_text)
+            except Exception:
+                pass
+        for attempt in range(4):
+            if self._cancel:
+                return False, "Đã hủy."
+            btn = self._find_el(page, _CGPT_SEND_SELS, timeout=2500)
+            sent = False
+            if btn:
+                try:
+                    if btn.get_attribute("disabled") is None and btn.get_attribute("aria-disabled") != "true":
+                        btn.click(); sent = True
+                except Exception:
+                    pass
+            if not sent:
+                try:
+                    inp.click(); page.keyboard.press("Enter")
+                except Exception:
+                    pass
+            page.wait_for_timeout(1000)
+            # kiểm tra ô nhập đã trống (đã gửi)
+            try:
+                left = page.evaluate('''()=>{const el=document.querySelector("#prompt-textarea")||document.querySelector("[contenteditable='true']");return el?(el.innerText||"").trim():"";}''')
+            except Exception:
+                left = ""
+            if not left:
+                return True, ""
+            if attempt < 3:
+                self.log.emit(f"↩️ Chưa gửi được, thử lại ({attempt+2}/4)...\n")
+        return False, "ChatGPT không nhận prompt sau 4 lần."
+
+    def _grab_new_image(self, page, known_srcs, save_path):
+        """Chờ ChatGPT vẽ xong ảnh (ổn định qua vài nhịp) rồi tải về."""
+        stable_src, stable_count = None, 0
+        for _ in range(600):  # ~300s, ảnh gpt-image vẽ khá lâu
+            if self._cancel:
+                return None
+            page.wait_for_timeout(500)
+            cand = page.evaluate('''(args) => {
+                const known = new Set(args.known), srcRatio = args.srcRatio;
+                let best = null, bestArea = 0;
+                document.querySelectorAll("img").forEach(im => {
+                    const s = im.src || im.currentSrc || "";
+                    if (!s || known.has(s)) return;
+                    if (!im.complete) return;
+                    const w = im.naturalWidth||0, h = im.naturalHeight||0;
+                    if (w < 256 || h < 256) return;
+                    // ưu tiên ảnh sinh ra (oaiusercontent / blob), bỏ avatar/icon
+                    const ratio = w/h;
+                    if (srcRatio && Math.abs(ratio - srcRatio) < 0.03) return; // né ảnh gốc
+                    const area = w*h;
+                    if (area > bestArea) { bestArea = area; best = {src:s, w, h}; }
+                });
+                return best;
+            }''', {"known": list(known_srcs), "srcRatio": self._src_ratio})
+            if not cand:
+                stable_src, stable_count = None, 0
+                continue
+            src = cand["src"]
+            if stable_count == 0 or src != stable_src:
+                self.log.emit(f"   👁️ Thấy ảnh {cand['w']}x{cand['h']}, chờ vẽ xong...\n")
+            if src == stable_src:
+                stable_count += 1
+            else:
+                stable_src, stable_count = src, 1
+            if stable_count >= 4:  # ~2s ổn định
+                return self._download_src(page, src, save_path)
+        return None
+
+    def _download_src(self, page, src, save_path):
+        try:
+            data_url = page.evaluate('''async (src) => {
+                try {
+                    const r = await fetch(src);
+                    const b = await r.blob();
+                    return await new Promise(res => {
+                        const fr = new FileReader();
+                        fr.onload = () => res(fr.result);
+                        fr.readAsDataURL(b);
+                    });
+                } catch (e) { return null; }
+            }''', src)
+            if not data_url or "," not in data_url:
+                self.log.emit("   ⚠️ Fetch ảnh không hợp lệ.\n")
+                return None
+            header, b64 = data_url.split(",", 1)
+            ext = ".png"
+            if "jpeg" in header or "jpg" in header: ext = ".jpg"
+            if "webp" in header: ext = ".webp"
+            save_path = os.path.splitext(save_path)[0] + ext
+            with open(save_path, "wb") as f:
+                f.write(base64.b64decode(b64))
+            return save_path
+        except Exception as e:
+            self.log.emit(f"⚠️ Lỗi tải ảnh: {e}\n")
+            return None
+
+    def _make_one_variant(self, i, stem):
+        if self._cancel:
+            return None
+        srt_block = ""
+        if self.srt_text:
+            # Cắt bớt SRT quá dài để không vỡ ô nhập (giữ ~8000 ký tự đầu là đủ
+            # để nắm cốt truyện/cao trào). Bỏ số thứ tự & timestamp cho gọn.
+            import re as _re
+            clean = _re.sub(r'\d+\s*\n\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}\s*\n', '', self.srt_text)
+            clean = _re.sub(r'\n{2,}', '\n', clean).strip()
+            if len(clean) > 8000:
+                clean = clean[:8000]
+            srt_block = f"\n\n=== NỘI DUNG PHỤ ĐỀ (SRT) ĐỂ PHÂN TÍCH ===\n{clean}\n=== HẾT SRT ===\n"
+        prompt = f"{self.base_prompt}{srt_block}"
+        self.log.emit(f"\n🖼️ ChatGPT đang phân tích SRT & tạo thumbnail...\n")
+
+        pw = browser = ctx = None
+        try:
+            from playwright.sync_api import sync_playwright
+            try:
+                from PyQt6.QtGui import QPixmap as _QPix
+                pm = _QPix(self.src_image)
+                if not pm.isNull() and pm.height() > 0:
+                    self._src_ratio = pm.width() / pm.height()
+            except Exception:
+                pass
+
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(headless=not self.show_browser,
+                                         channel="chrome", args=BROWSER_ARGS)
+            ctx = browser.new_context(storage_state=CHATGPT_AUTH_FILE, user_agent=UA,
+                                      viewport={"width": 1280, "height": 900})
+            ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+            page = ctx.new_page()
+            if self._cancel:
+                return None
+            page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+
+            if self.src_image and os.path.exists(self.src_image):
+                ok = self._attach_image(page)
+                if not ok:
+                    return None
+            try:
+                known = set(page.eval_on_selector_all("img", "els => els.map(e => e.src || '')"))
+            except Exception:
+                known = set()
+
+            ok, err = self._type_and_send(page, prompt)
+            if not ok:
+                self.log.emit(f"⚠️ {err} -> bỏ qua biến thể {i+1}.\n")
+                return None
+
+            out_path = os.path.join(self.out_dir, f"{stem}_thumb{i+1}.png")
+            got = self._grab_new_image(page, known, out_path)
+            if got:
+                self.log.emit(f"✅ Đã lưu: {os.path.basename(got)}\n")
+                self.one_done.emit(got)
+            else:
+                self.log.emit(f"❌ Không lấy được ảnh biến thể {i+1} "
+                              f"(ChatGPT không trả ảnh / đổi giao diện / hết lượt tạo ảnh).\n")
+            return got
+        except Exception as e:
+            self.log.emit(f"⚠️ Lỗi biến thể {i+1}: {e}\n")
+            return None
+        finally:
+            try:
+                if ctx: ctx.close()
+            except Exception: pass
+            try:
+                if browser: browser.close()
+                if pw: pw.stop()
+            except Exception: pass
+
+    def run(self):
+        if not os.path.exists(CHATGPT_AUTH_FILE):
+            self.log.emit("❌ Chưa đăng nhập ChatGPT. Hãy bấm 'Đăng nhập ChatGPT' để login 1 lần trước.\n")
+            self.all_done.emit([]); return
+        has_img = bool(self.src_image and os.path.exists(self.src_image))
+        if not has_img and not self.srt_text:
+            self.log.emit("❌ Cần ít nhất ảnh gốc HOẶC file SRT để tạo thumbnail.\n")
+            self.all_done.emit([]); return
+        os.makedirs(self.out_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(self.src_image))[0] if has_img else "thumbnail"
+
+        saved = []
+        for i in range(self.n_variants):
+            if self._cancel:
+                break
+            got = self._make_one_variant(i, stem)
+            if got:
+                saved.append(got)
+            self.progress.emit(i + 1, self.n_variants)
+        self.log.emit(f"\n🏁 Xong. Tạo được {len(saved)}/{self.n_variants} thumbnail (ChatGPT).\n")
+        self.all_done.emit(saved)
+
+
+class ChatGPTLoginThread(QThread):
+    """Mở Chrome hiện để người dùng tự đăng nhập ChatGPT, GIỮ cửa sổ mở cho
+    tới khi người dùng bấm nút xác nhận (confirm) trong app. Không tự phát hiện,
+    không tự tắt — tránh việc lưu nhầm phiên chưa đăng nhập rồi đóng sớm."""
+    log = pyqtSignal(str)
+    done = pyqtSignal(bool)
+
+    def __init__(self, timeout_login=600):
+        super().__init__()
+        self.timeout_login = timeout_login
+        self._confirmed = False
+        self._cancel = False
+
+    def confirm(self):
+        self._confirmed = True
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as e:
+            self.log.emit(f"❌ Thiếu Playwright: {e}\n")
+            self.done.emit(False); return
+
+        pw = browser = None
+        try:
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(headless=False, channel="chrome", args=BROWSER_ARGS)
+            ctx = browser.new_context(user_agent=UA, viewport={"width": 1280, "height": 900})
+            page = ctx.new_page()
+            page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+            self.log.emit("🔐 Cửa sổ Chrome đã mở. Hãy đăng nhập ChatGPT trong cửa sổ đó.\n")
+            self.log.emit("   👉 SAU KHI đã vào được tài khoản, bấm nút '✅ Tôi đã đăng nhập xong' trong app.\n")
+
+            import time as _t
+            deadline = _t.time() + self.timeout_login
+            while _t.time() < deadline:
+                if self._cancel:
+                    self.log.emit("⛔ Đã hủy đăng nhập.\n")
+                    self.done.emit(False); return
+                if self._confirmed:
+                    break
+                # kiểm tra cửa sổ còn sống không (người dùng lỡ tắt tay)
+                try:
+                    if page.is_closed():
+                        self.log.emit("⚠️ Cửa sổ đã bị đóng trước khi xác nhận.\n")
+                        self.done.emit(False); return
+                except Exception:
+                    pass
+                self.msleep(400)
+
+            if not self._confirmed:
+                self.log.emit("⚠️ Hết thời gian chờ. Hãy thử lại.\n")
+                self.done.emit(False); return
+
+            # Xác minh có cookie session trước khi lưu (cảnh báo nếu chưa thấy)
+            try:
+                cookies = ctx.cookies()
+                has_session = any(
+                    c.get("name", "").startswith("__Secure-next-auth.session-token") and c.get("value")
+                    for c in cookies
+                )
+            except Exception:
+                has_session = False
+
+            if not has_session:
+                self.log.emit("⚠️ Chưa thấy phiên đăng nhập ChatGPT (cookie session). "
+                              "Vẫn lưu, nhưng nếu tạo ảnh báo chưa đăng nhập thì hãy đăng nhập lại.\n")
+
+            page.wait_for_timeout(800)
+            ctx.storage_state(path=CHATGPT_AUTH_FILE)
+            self.log.emit("✅ Đã lưu phiên đăng nhập ChatGPT.\n")
+            self.done.emit(True)
+        except Exception as e:
+            self.log.emit(f"❌ Lỗi đăng nhập ChatGPT: {e}\n")
+            self.done.emit(False)
+        finally:
+            try:
+                if browser: browser.close()
+                if pw: pw.stop()
+            except Exception: pass
+
+
 _DEFAULT_THUMB_PROMPT = (
-    "Tạo ảnh thumbnail YouTube 16:9 HOÀN CHỈNH cho video review phim/drama Trung Quốc, "
-    "phong cách poster điện ảnh BOM TẤN, cực kỳ hoành tráng, dữ dội và có hồn. Giữ ĐÚNG "
-    "nhân vật chính và thần thái trong ảnh gốc (gương mặt sắc nét, biểu cảm mãnh liệt, "
-    "ánh mắt có thần).\n\n"
-    "HẬU CẢNH PHẢI EPIC & CÓ HỒN: dựng bối cảnh sử thi choáng ngợp — linh thú khổng lồ "
-    "bằng năng lượng (rồng vàng, phượng hoàng lửa) cuộn quanh phía sau, luồng năng lượng "
-    "bùng nổ, tia sáng tỏa mạnh, tàn lửa/tia điện bay, cung điện cổ mờ ảo phía xa, khói "
-    "sương huyền ảo. Ánh sáng điện ảnh tương phản cao, chiều sâu lớn, chi tiết dày đặc, "
-    "màu sắc rực rỡ bốc lửa. Nhân vật nổi bật giữa khung cảnh khí thế ngút trời, toát ra "
-    "sức mạnh và cảm xúc mạnh. Bố cục đặt nhân vật lệch xuống dưới hoặc sang bên, chừa "
-    "vùng trời/nền thoáng ở phía trên để đặt chữ mà không đè lên mặt.\n\n"
-    "CHỮ TIÊU ĐỀ: Đọc tên phim (chữ Trung) trong ảnh gốc, dịch sang TIẾNG VIỆT rồi RÚT "
-    "GỌN thành tiêu đề GIẬT TÍT thật ngắn — TỐI ĐA 2 DÒNG, mỗi dòng vài từ đắt giá, đúng "
-    "tinh thần phim (kiểu 'ĐỊNH MỆNH KHÓA CHẶT', 'NGHỊCH THIÊN CẢI MỆNH'). Ghi chữ IN HOA "
-    "to đậm, kiểu thư pháp/điện ảnh, gradient vàng-cam-đỏ phát sáng, viền đen dày đổ bóng.\n\n"
-    "VỊ TRÍ CHỮ CỰC KỲ QUAN TRỌNG: đặt chữ Ở PHÍA TRÊN hoặc vùng trống của ảnh, TUYỆT ĐỐI "
-    "KHÔNG che mặt, đầu hay thân nhân vật. Gương mặt nhân vật phải luôn rõ ràng, không bị "
-    "chữ đè lên. Nếu cần, thu nhỏ chữ để chừa mặt nhân vật.\n\n"
-    "BADGE: biểu tượng LOA đỏ + chữ 'Trọn Bộ' góc dưới trái, RUY BĂNG đỏ 'NEW' góc trên phải. "
-    "Bố cục chuyên nghiệp, hút mắt, đúng chuẩn thumbnail review phim triệu view."
+    "Bạn là chuyên gia phân tích phim + thiết kế thumbnail YouTube chuyên nghiệp, "
+    "chuyên phim ngắn, web drama, phim Trung Quốc, hành động, giang hồ, thần bài, "
+    "trả thù, tình cảm, fantasy, xuyên không.\n\n"
+    "Nếu có NỘI DUNG PHỤ ĐỀ (SRT) kèm bên dưới: TỰ đọc & phân tích để tìm nhân vật "
+    "chính, phản diện, xung đột chính, cảnh cao trào/hành động/trả thù/đấu trí/gây "
+    "sốc, khoảnh khắc biểu cảm mạnh nhất, và tình huống khiến người xem tò mò nhất. "
+    "Tự xác định THỂ LOẠI rồi chọn MỘT concept thumbnail mạnh nhất — nhìn vào là "
+    "muốn biết 'Chuyện gì đang xảy ra?'.\n\n"
+    "PHONG CÁCH: EPIC CINEMATIC MOVIE POSTER — ULTRA DETAILED — DRAMATIC LIGHTING "
+    "— HIGH IMPACT. Tỷ lệ 16:9. Nhân vật chính là trọng tâm, gương mặt rõ nét, cảm "
+    "xúc mạnh, ánh mắt có thần. Bố cục điện ảnh, chiều sâu rõ, ánh sáng chuyên "
+    "nghiệp, tương phản mạnh, màu bắt mắt, hậu cảnh hợp nội dung. Như poster phim "
+    "kinh phí lớn, KHÔNG giống ảnh chụp màn hình.\n\n"
+    "GIỮ NHÂN VẬT (nếu có ảnh gốc): giữ đúng khuôn mặt, thần thái, đặc điểm ngoại "
+    "hình; KHÔNG đổi giới tính/độ tuổi, KHÔNG làm biến dạng mặt. Có thể đổi tư "
+    "thế/trang phục/ánh sáng/bối cảnh/góc máy nhưng nhân vật vẫn dễ nhận diện.\n\n"
+    "BỐ CỤC: NHÂN VẬT → TÌNH HUỐNG → HẬU CẢNH → BRANDING. Không nhồi nhiều nhân "
+    "vật, không để hậu cảnh lấn át, không đặt chữ lên mặt. Rõ ngay cả khi hiển thị "
+    "nhỏ.\n\n"
+    "BRANDING CỐ ĐỊNH — BẮT BUỘC CÓ 2 THÀNH PHẦN:\n"
+    "• GÓC TRÊN BÊN TRÁI: biểu tượng LOA/megaphone điện ảnh nhỏ, hiện đại, kèm chữ "
+    "'PHIM MỚI'. Badge chuyên nghiệp, sắc nét, dễ đọc, có chiều sâu & ánh sáng nhẹ, "
+    "không quá to, không che nhân vật.\n"
+    "• GÓC TRÊN BÊN PHẢI: dải RUY-BĂNG/badge chữ 'TRỌN BỘ'. Có chiều sâu 3D nhẹ, "
+    "viền rõ, chữ lớn dễ đọc, không che mặt nhân vật.\n"
+    "Giữ ĐÚNG chữ 'PHIM MỚI' và 'TRỌN BỘ', KHÔNG đổi thành PHIM HAY/PHIM HOT/FULL "
+    "PHIM/XEM NGAY. KHÔNG bỏ 2 badge này.\n\n"
+    "TIÊU ĐỀ (nếu hợp): tự tạo 1 câu 2–7 từ, mạnh, ngắn, gây tò mò, liên quan trực "
+    "tiếp nội dung, IN HOA dễ đọc (kiểu 'HẮN ĐÃ TRỞ LẠI!', 'KẺ PHẢN BỘI LỘ DIỆN', "
+    "'CÔ ẤY ĐÃ TRẢ THÙ'). KHÔNG lấy nguyên câu thoại dài. Nếu hình đã đủ mạnh thì "
+    "không cần thêm chữ, tránh quá nhiều chữ. KHÔNG để chữ che mặt.\n\n"
+    "HIỆU ỨNG chỉ dùng khi hợp nội dung (khói/lửa/tia sáng/sấm sét/bụi/mưa/năng "
+    "lượng/neon/lens flare/cinematic glow/depth of field), KHÔNG lạm dụng. Màu theo "
+    "thể loại (hành động: tương phản mạnh; giang hồ: tối lạnh; thần bài: vàng/đỏ/"
+    "neon; tình cảm: sáng mềm; fantasy: huyền ảo; trả thù: tối tương phản cao).\n\n"
+    "MỤC TIÊU: nhìn là biết phim, thấy cao trào, muốn click, nhỏ vẫn rõ, nhận ra "
+    "cùng 1 kênh. Kết quả NGẦU — ĐIỆN ẢNH — KỊCH TÍNH — SẮC NÉT — CHUYÊN NGHIỆP. "
+    "CHỈ tạo 1 ảnh duy nhất, tỉ lệ 16:9 ngang (1536x1024)."
 )
 
 
@@ -942,6 +1368,87 @@ class MergeRenderedThread(QThread):
         except Exception:
             pass
         return None
+
+    def _prepare_thumbnail(self):
+        """Chuẩn hóa ảnh bìa thành JPG 1280×720 (chuẩn thumbnail YouTube), nền phủ
+        16:9 không méo. Trả về đường dẫn JPG tạm, hoặc None nếu không có ảnh."""
+        if not self.intro_image or not os.path.exists(self.intro_image):
+            return None
+        try:
+            from PIL import Image
+            im = Image.open(self.intro_image).convert("RGB")
+            tw, th = 1280, 720
+            # Phủ kín khung 16:9 (cover), cắt phần thừa — không để viền đen
+            src_ratio = im.width / im.height
+            dst_ratio = tw / th
+            if src_ratio > dst_ratio:
+                new_h = th
+                new_w = int(round(th * src_ratio))
+            else:
+                new_w = tw
+                new_h = int(round(tw / src_ratio))
+            try:
+                _RESAMPLE = Image.Resampling.LANCZOS  # Pillow >= 9.1
+            except AttributeError:
+                _RESAMPLE = Image.LANCZOS
+            im = im.resize((new_w, new_h), _RESAMPLE)
+            left = (new_w - tw) // 2
+            top = (new_h - th) // 2
+            im = im.crop((left, top, left + tw, top + th))
+            out_jpg = os.path.join(tempfile.gettempdir(), f"yt_thumb_{int(time.time())}.jpg")
+            im.save(out_jpg, "JPEG", quality=92)
+            return out_jpg
+        except Exception as e:
+            self.log.emit(f"   ⚠️ Không chuẩn hóa được ảnh bìa: {e}\n")
+            return None
+
+    def _export_thumbnail_beside_video(self, thumb_jpg):
+        """Copy thumbnail ra cạnh video với tên <video>_thumbnail.jpg để upload
+        thẳng lên YouTube Studio (YouTube KHÔNG đọc cover nhúng trong file)."""
+        if not thumb_jpg or not os.path.exists(thumb_jpg):
+            return
+        try:
+            import shutil
+            stem = os.path.splitext(self.out_file)[0]
+            dst = f"{stem}_thumbnail.jpg"
+            shutil.copyfile(thumb_jpg, dst)
+            self.log.emit(f"🖼️ Đã xuất thumbnail để up YouTube: {os.path.basename(dst)}\n")
+        except Exception as e:
+            self.log.emit(f"   ⚠️ Không xuất được file thumbnail: {e}\n")
+
+    def _embed_cover_mp4(self, ffmpeg, video_in, thumb_jpg, si):
+        """Nhúng thumbnail vào metadata tag 'covr' của MP4 (copy stream, rất nhanh).
+        Trả về True nếu thành công (đã ghi đè out_file)."""
+        if not thumb_jpg or not os.path.exists(thumb_jpg):
+            return False
+        tmp_out = os.path.splitext(self.out_file)[0] + f"_cov_{int(time.time())}.mp4"
+        cmd = [
+            ffmpeg, "-y",
+            "-i", video_in,
+            "-i", thumb_jpg,
+            "-map", "0:v:0", "-map", "0:a?", "-map", "1:v:0",
+            "-c", "copy",
+            "-c:v:1", "png",
+            "-disposition:v:1", "attached_pic",
+            "-movflags", "+faststart",
+            tmp_out
+        ]
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               startupinfo=si, text=True, encoding="utf-8", errors="replace")
+            if p.returncode == 0 and os.path.exists(tmp_out):
+                os.replace(tmp_out, self.out_file)
+                self.log.emit("🖼️ Đã nhúng ảnh bìa vào file MP4.\n")
+                return True
+            else:
+                self.log.emit(f"   ⚠️ Nhúng cover thất bại (bỏ qua, video vẫn OK):\n{(p.stderr or '')[-300:]}\n")
+        except Exception as e:
+            self.log.emit(f"   ⚠️ Lỗi nhúng cover (bỏ qua): {e}\n")
+        finally:
+            if os.path.exists(tmp_out):
+                try: os.remove(tmp_out)
+                except: pass
+        return False
 
     def run(self):
         ffmpeg = get_ffmpeg_path()
@@ -992,6 +1499,9 @@ class MergeRenderedThread(QThread):
                     f"setsar=1,fps=fps=source_fps"
                 )
                 merge_codec = get_optimal_ffmpeg_codec()
+                _fb = get_codec_fallback_reason()
+                if _fb:
+                    self.log.emit(f"   ⚠️ {_fb}\n")
                 enc_args = build_video_encoder_args(merge_codec, crf_val=20,
                                                     preset_hw="quality", preset_sw="medium")
                 cmd = [
@@ -1007,18 +1517,11 @@ class MergeRenderedThread(QThread):
                     self.out_file
                 ]
             else:
-                # Resolution đồng nhất → copy stream, chỉ reset timestamp
+                # Resolution đồng nhất → copy stream, chỉ reset timestamp.
+                # (Nhúng ảnh bìa + xuất thumbnail làm ở bước hậu xử lý bên dưới,
+                #  áp dụng chung cho cả nhánh re-encode lẫn copy.)
                 cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_txt]
-                if self.intro_image and os.path.exists(self.intro_image):
-                    self.log.emit("🖼️ Đang nhúng Ảnh Bìa (Cover Art) vào video...\n")
-                    cmd.extend([
-                        "-i", self.intro_image,
-                        "-map", "0:v:0", "-map", "0:a?", "-map", "1:v:0",
-                        "-c", "copy",
-                        "-disposition:v:1", "attached_pic"
-                    ])
-                else:
-                    cmd.extend(["-c", "copy"])
+                cmd.extend(["-c", "copy"])
                 cmd.extend(["-movflags", "+faststart", self.out_file])
 
             proc = subprocess.run(
@@ -1030,20 +1533,26 @@ class MergeRenderedThread(QThread):
             if proc.returncode == 0 and os.path.exists(self.out_file):
                 mode = "re-encode" if mixed else "copy stream"
                 self.log.emit(f"✅ Gộp trọn bộ thành công ({mode}): {os.path.basename(self.out_file)}\n")
+                thumb_jpg = self._prepare_thumbnail()
+                if thumb_jpg:
+                    self._embed_cover_mp4(ffmpeg, self.out_file, thumb_jpg, si)
+                    self._export_thumbnail_beside_video(thumb_jpg)
+                    try: os.remove(thumb_jpg)
+                    except: pass
                 self.done.emit(True, self.out_file)
             else:
                 err = proc.stderr[-800:] if proc.stderr else "Lỗi không xác định"
                 # Fallback: nếu re-encode bằng codec phần cứng lỗi -> thử lại
                 # bằng libx264 (CPU) cho chắc ăn, tránh hỏng cả bản gộp trọn bộ.
                 did_fallback = False
-                if mixed and "libx264" not in get_optimal_ffmpeg_codec().lower():
+                if mixed and "libx264" not in merge_codec.lower():
                     self.log.emit("⚠️ Gộp bằng codec phần cứng lỗi → thử lại bằng libx264 (CPU)...\n")
                     cmd_fb = [
                         ffmpeg, "-y",
                         "-f", "concat", "-safe", "0", "-i", list_txt,
                         "-video_track_timescale", "90000",
                         "-vf", vf,
-                        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                        "-c:v", "libx264", "-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-b:a", "192k",
                         "-af", "aresample=async=1",
                         "-movflags", "+faststart",
@@ -1056,6 +1565,12 @@ class MergeRenderedThread(QThread):
                     did_fallback = True
                 if did_fallback and proc.returncode == 0 and os.path.exists(self.out_file):
                     self.log.emit(f"✅ Gộp trọn bộ thành công (re-encode libx264): {os.path.basename(self.out_file)}\n")
+                    thumb_jpg = self._prepare_thumbnail()
+                    if thumb_jpg:
+                        self._embed_cover_mp4(ffmpeg, self.out_file, thumb_jpg, si)
+                        self._export_thumbnail_beside_video(thumb_jpg)
+                        try: os.remove(thumb_jpg)
+                        except: pass
                     self.done.emit(True, self.out_file)
                 else:
                     if did_fallback and proc.stderr:
@@ -1081,6 +1596,9 @@ class SingleRenderThread(QThread):
         self.log.emit(f"🎬 Bắt đầu Render & Ép phụ đề...\n")
         quality_text = self.cfg.get("render_quality", "⭐ Tốt (CRF 20)")
         self.log.emit(f"   📊 Chất lượng: {quality_text} | Codec: {get_optimal_ffmpeg_codec()}\n")
+        _fb = get_codec_fallback_reason()
+        if _fb:
+            self.log.emit(f"   ⚠️ {_fb}\n")
         codec = get_optimal_ffmpeg_codec()
 
         has_audio = False
@@ -1258,35 +1776,41 @@ class SingleRenderThread(QThread):
                 crf_val, preset_sw, preset_hw = 0, "fast", "speed"
             
             use_crf = crf_val > 0
-            
-            if "amf" in codec.lower() or "nvenc" in codec.lower() or "qsv" in codec.lower(): 
-                cmd.extend(["-c:v", codec])
-                if audio_map: cmd.extend(["-c:a", "aac", "-b:a", "192k"])
-                
+            self._hw_codec = codec  # lưu để fallback CPU nếu HW lỗi
+            self._enc_ctx = dict(crf_val=crf_val, preset_sw=preset_sw,
+                                 preset_hw=preset_hw, use_crf=use_crf,
+                                 audio_map=bool(audio_map))
+
+            enc_args = []
+            if "amf" in codec.lower() or "nvenc" in codec.lower() or "qsv" in codec.lower():
+                enc_args.extend(["-c:v", codec, "-pix_fmt", "yuv420p"])
+                if audio_map: enc_args.extend(["-c:a", "aac", "-b:a", "192k"])
+
                 if use_crf:
                     if "nvenc" in codec.lower():
                         # Dịch preset riêng cho NVIDIA để không báo lỗi
                         nv_preset = "hq" if preset_hw == "quality" else "fast"
-                        cmd.extend(["-rc", "constqp", "-qp", str(crf_val), "-preset", nv_preset])
+                        enc_args.extend(["-rc", "constqp", "-qp", str(crf_val), "-preset", nv_preset])
                     elif "amf" in codec.lower():
-                        cmd.extend(["-rc", "cqp", "-qp_i", str(crf_val), "-qp_p", str(crf_val), "-quality", preset_hw])
+                        enc_args.extend(["-rc", "cqp", "-qp_i", str(crf_val), "-qp_p", str(crf_val), "-quality", preset_hw])
                     elif "qsv" in codec.lower():
-                        cmd.extend(["-global_quality", str(crf_val), "-preset", preset_hw])
+                        enc_args.extend(["-global_quality", str(crf_val), "-preset", preset_hw])
                 else:
                     if "nvenc" in codec.lower():
                         nv_preset = "hq" if preset_hw == "quality" else "fast"
-                        cmd.extend(["-b:v", "1000k", "-preset", nv_preset])
+                        enc_args.extend(["-b:v", "1000k", "-preset", nv_preset])
                     else:
-                        cmd.extend(["-b:v", "1000k", "-preset", preset_hw])
-                cmd.extend(["-movflags", "+faststart", self.op])
-            else: 
-                cmd.extend(["-c:v", codec])
-                if audio_map: cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+                        enc_args.extend(["-b:v", "1000k", "-preset", preset_hw])
+                enc_args.extend(["-movflags", "+faststart", self.op])
+            else:
+                enc_args.extend(["-c:v", codec, "-pix_fmt", "yuv420p"])
+                if audio_map: enc_args.extend(["-c:a", "aac", "-b:a", "192k"])
                 if use_crf:
-                    cmd.extend(["-crf", str(crf_val), "-preset", preset_sw])
+                    enc_args.extend(["-crf", str(crf_val), "-preset", preset_sw])
                 else:
-                    cmd.extend(["-b:v", "1000k", "-preset", preset_sw])
-                cmd.extend(["-movflags", "+faststart", self.op])
+                    enc_args.extend(["-b:v", "1000k", "-preset", preset_sw])
+                enc_args.extend(["-movflags", "+faststart", self.op])
+            cmd.extend(enc_args)
         else:
             cmd.extend(["-map", "0:v"])
             if audio_map: cmd.extend(["-map", audio_map, "-c", "copy"])
@@ -1323,7 +1847,65 @@ class SingleRenderThread(QThread):
                 self.done.emit(True)
             else:
                 tail = "".join(list(stderr_lines)[-15:])
-                self.log.emit(f"❌ FFmpeg lỗi (code {proc.returncode})\n📋 Chi tiết:\n{tail}\n"); self.done.emit(False)
+                # ── Fallback CPU: nếu vừa render bằng codec phần cứng (NVENC/AMF/QSV)
+                #    mà lỗi (card đời cũ không hỗ trợ, hết session, driver cũ...) thì
+                #    tự hạ về libx264 (CPU) rồi chạy lại — thay vì báo lỗi luôn. ──
+                hw = getattr(self, "_hw_codec", "").lower()
+                is_hw = any(k in hw for k in ("nvenc", "amf", "qsv"))
+                if is_hw and not self._cancel:
+                    self.log.emit(
+                        f"⚠️ Card đồ họa không encode được bằng {self._hw_codec} "
+                        f"(code {proc.returncode}) → tự chuyển sang CPU (libx264)...\n"
+                    )
+                    ctx = getattr(self, "_enc_ctx", {})
+                    crf_val = ctx.get("crf_val", 20)
+                    preset_sw = ctx.get("preset_sw", "medium")
+                    use_crf = ctx.get("use_crf", True)
+                    # Thay phần enc_args cũ (đuôi cmd) bằng libx264. enc_args cũ luôn
+                    # kết thúc bằng [..., "-movflags", "+faststart", self.op] và bắt
+                    # đầu bằng ["-c:v", <hw_codec>]; ta cắt từ "-c:v" cuối cùng.
+                    try:
+                        cut = len(cmd) - 1 - cmd[::-1].index("-c:v")
+                        base_cmd = cmd[:cut]
+                    except ValueError:
+                        base_cmd = cmd  # phòng hờ, không nên xảy ra
+                    cpu_args = ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+                    if ctx.get("audio_map"):
+                        cpu_args += ["-c:a", "aac", "-b:a", "192k"]
+                    if use_crf:
+                        cpu_args += ["-crf", str(crf_val), "-preset", preset_sw]
+                    else:
+                        cpu_args += ["-b:v", "1000k", "-preset", preset_sw]
+                    cpu_args += ["-movflags", "+faststart", self.op]
+                    cmd_cpu = base_cmd + cpu_args
+
+                    kw = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
+                    proc = subprocess.Popen(cmd_cpu, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            text=True, encoding="utf-8", errors="replace", **kw)
+                    stderr_lines2 = deque(maxlen=40)
+                    last_report = time.time()
+                    for line in proc.stderr:
+                        stderr_lines2.append(line)
+                        if "time=" in line and time.time() - last_report > 20:
+                            m = re.search(r"time=(\d+:\d+:\d+)", line)
+                            if m: self.log.emit(f"   ⏳ Render (CPU): {m.group(1)}\n")
+                            last_report = time.time()
+                        if self._cancel:
+                            try: proc.terminate()
+                            except Exception: pass
+                            break
+                    proc.wait()
+                    if self._cancel:
+                        self.log.emit("⛔ Đã hủy render.\n"); self.done.emit(False)
+                    elif proc.returncode == 0:
+                        self.log.emit(f"✅ Render thành công bằng CPU (libx264) trong: {format_time(time.time() - start_t)}\n")
+                        self.done.emit(True)
+                    else:
+                        tail2 = "".join(list(stderr_lines2)[-15:])
+                        self.log.emit(f"❌ FFmpeg lỗi cả khi dùng CPU (code {proc.returncode})\n📋 Chi tiết:\n{tail2}\n")
+                        self.done.emit(False)
+                else:
+                    self.log.emit(f"❌ FFmpeg lỗi (code {proc.returncode})\n📋 Chi tiết:\n{tail}\n"); self.done.emit(False)
         except Exception as e:
             self.log.emit(f"❌ Lỗi: {e}\n"); self.done.emit(False)
         finally:
@@ -1585,6 +2167,7 @@ class RenderWidget(QWidget):
         self.cards = []                 # danh sách EpisodeCard trong grid
         self.selected_card = None
         self._thumb_src_path = None     # ảnh gốc cho thumbnail AI
+        self._thumb_srt_path = None     # SRT tập phim (không bắt buộc)
         self._thumb_thread = None
         self.blur_boxes = []
         self.sample_sub = None
@@ -1897,6 +2480,14 @@ class RenderWidget(QWidget):
         r1.addWidget(self.lbl_thumb_src, stretch=1); r1.addWidget(btn_pick)
         v.addLayout(r1)
 
+        r_srt = QHBoxLayout()
+        self.lbl_thumb_srt = QLabel("Chưa chọn SRT (không bắt buộc)")
+        self.lbl_thumb_srt.setStyleSheet("color:#8A8D98; font-size:10px; border:none;")
+        btn_pick_srt = QPushButton("Chọn SRT"); btn_pick_srt.setFixedWidth(90)
+        btn_pick_srt.clicked.connect(self._pick_thumb_srt)
+        r_srt.addWidget(self.lbl_thumb_srt, stretch=1); r_srt.addWidget(btn_pick_srt)
+        v.addLayout(r_srt)
+
         v.addWidget(QLabel("Prompt (sửa nếu thích):", styleSheet="color:#8A8D98; font-size:10px; border:none;"))
         self.txt_thumb_prompt = QPlainTextEdit()
         self.txt_thumb_prompt.setPlainText(_DEFAULT_THUMB_PROMPT)
@@ -1910,7 +2501,28 @@ class RenderWidget(QWidget):
         r2.addWidget(QLabel("Số ảnh:", styleSheet="color:#8A8D98; border:none; font-size:11px;"))
         self.spin_thumb_n = QSpinBox(); self.spin_thumb_n.setRange(1, 8)
         self.spin_thumb_n.setValue(4); self.spin_thumb_n.setFixedWidth(50)
-        r2.addWidget(self.spin_thumb_n); r2.addStretch()
+        r2.addWidget(self.spin_thumb_n)
+
+        r2.addWidget(QLabel("AI:", styleSheet="color:#8A8D98; border:none; font-size:11px;"))
+        self.cmb_thumb_provider = QComboBox()
+        self.cmb_thumb_provider.addItems(["ChatGPT", "Gemini"])
+        self.cmb_thumb_provider.setFixedWidth(100)
+        self.cmb_thumb_provider.setStyleSheet(
+            "QComboBox { background:#1B1D25; color:#ddd; border:1px solid #3B3E4D; border-radius:6px; padding:4px 8px; font-size:11px; }")
+        self.cmb_thumb_provider.currentTextChanged.connect(self._on_provider_changed)
+        r2.addWidget(self.cmb_thumb_provider)
+        # ChatGPT là mặc định -> khoá ô số ảnh ngay từ đầu
+        self.spin_thumb_n.setEnabled(False)
+        self.spin_thumb_n.setValue(1)
+
+        self.btn_thumb_login = QPushButton("🔐 Đăng nhập ChatGPT")
+        self.btn_thumb_login.setStyleSheet(
+            "QPushButton { background:#22242E; color:#A78BFA; border:1px solid #3B3E4D; border-radius:6px; padding:6px 10px; font-size:11px; font-weight:bold; }"
+            "QPushButton:hover { border-color:#7452FF; color:white; }")
+        self.btn_thumb_login.clicked.connect(self._login_chatgpt)
+        r2.addWidget(self.btn_thumb_login)
+
+        r2.addStretch()
         self.btn_thumb_run = QPushButton("✨ Tạo Thumbnail")
         self.btn_thumb_run.setStyleSheet(
             "QPushButton { background:#7452FF; color:white; border-radius:6px; padding:7px 14px; font-weight:bold; border:none; }"
@@ -1943,35 +2555,112 @@ class RenderWidget(QWidget):
             self.lbl_thumb_src.setText(os.path.basename(f))
             self.lbl_thumb_src.setStyleSheet("color:#10B981; font-size:10px; border:none;")
 
+    def _pick_thumb_srt(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Chọn file SRT của tập phim", "",
+            "Phụ đề (*.srt *.txt);;Tất cả (*)")
+        if f:
+            self._thumb_srt_path = f
+            self.lbl_thumb_srt.setText(os.path.basename(f))
+            self.lbl_thumb_srt.setStyleSheet("color:#10B981; font-size:10px; border:none;")
+
     def _start_thumbnail(self):
-        src = getattr(self, "_thumb_src_path", None)
-        if not src or not os.path.exists(src):
-            QMessageBox.information(self, "Chưa chọn ảnh", "Hãy chọn 1 ảnh gốc làm mẫu trước.")
-            return
         if getattr(self, "_thumb_thread", None) and self._thumb_thread.isRunning():
             QMessageBox.information(self, "Đang chạy", "Đang tạo thumbnail, vui lòng đợi.")
             return
-        if not os.path.exists(AUTH_FILE):
-            QMessageBox.warning(self, "Chưa đăng nhập Gemini",
-                                "Hãy bấm 'Đồng bộ Gemini' (ở tab dịch) để đăng nhập 1 lần trước.")
+
+        provider = self.cmb_thumb_provider.currentText()
+        src = getattr(self, "_thumb_src_path", None)
+        srt_path = getattr(self, "_thumb_srt_path", None)
+        has_img = bool(src and os.path.exists(src))
+        has_srt = bool(srt_path and os.path.exists(srt_path))
+
+        # Gemini vẫn cần ảnh gốc (luồng cũ). ChatGPT cho phép chỉ SRT.
+        if provider == "Gemini" and not has_img:
+            QMessageBox.information(self, "Chưa chọn ảnh", "Gemini cần ảnh gốc. Hãy chọn 1 ảnh gốc.")
             return
+        if provider == "ChatGPT" and not has_img and not has_srt:
+            QMessageBox.information(self, "Thiếu dữ liệu", "Hãy chọn ảnh gốc HOẶC file SRT.")
+            return
+
+        # Đọc SRT (nếu có)
+        srt_text = ""
+        if has_srt:
+            try:
+                with open(srt_path, "r", encoding="utf-8", errors="replace") as f:
+                    srt_text = f.read()
+            except Exception as e:
+                self._log(f"⚠️ Không đọc được SRT: {e}\n")
 
         prompt = self.txt_thumb_prompt.toPlainText().strip() or _DEFAULT_THUMB_PROMPT
         n = self.spin_thumb_n.value()
-        out_dir = os.path.join(os.path.dirname(src), "AI_Thumbnails")
+        # out_dir: cạnh ảnh gốc, nếu không có ảnh thì cạnh SRT
+        anchor = src if has_img else srt_path
+        out_dir = os.path.join(os.path.dirname(anchor), "AI_Thumbnails")
+
+        if provider == "ChatGPT":
+            if not os.path.exists(CHATGPT_AUTH_FILE):
+                QMessageBox.warning(self, "Chưa đăng nhập ChatGPT",
+                                    "Hãy bấm '🔐 Đăng nhập ChatGPT' để login 1 lần trước.")
+                return
+        else:
+            if not os.path.exists(AUTH_FILE):
+                QMessageBox.warning(self, "Chưa đăng nhập Gemini",
+                                    "Hãy bấm 'Đồng bộ Gemini' (ở tab dịch) để đăng nhập 1 lần trước.")
+                return
 
         self._clear_thumb_results()
         self.btn_thumb_run.setEnabled(False)
         self.btn_thumb_run.setText("⏳ Đang tạo...")
-        self._log(f"✨ Bắt đầu tạo {n} thumbnail từ: {os.path.basename(src)}\n")
+        _src_name = os.path.basename(src) if has_img else "(không ảnh)"
+        _srt_name = f" + SRT {os.path.basename(srt_path)}" if has_srt else ""
+        self._log(f"✨ Bắt đầu tạo {n} thumbnail bằng {provider} từ: {_src_name}{_srt_name}\n")
 
-        self._thumb_thread = GeminiThumbnailThread(
-            src_image=src, base_prompt=prompt, out_dir=out_dir, n_variants=n,
-            show_browser=True)
+        if provider == "ChatGPT":
+            # ChatGPT: chỉ tạo 1 ảnh duy nhất theo SRT (không nhiều biến thể).
+            self._thumb_thread = ChatGPTThumbnailThread(
+                src_image=(src if has_img else ""), base_prompt=prompt, out_dir=out_dir,
+                n_variants=1, show_browser=True, srt_text=srt_text)
+        else:
+            self._thumb_thread = GeminiThumbnailThread(
+                src_image=src, base_prompt=prompt, out_dir=out_dir, n_variants=n,
+                show_browser=True)
         self._thumb_thread.log.connect(self._log)
         self._thumb_thread.one_done.connect(self._add_thumb_result)
         self._thumb_thread.all_done.connect(self._on_thumb_all_done)
         self._thumb_thread.start()
+
+    def _on_provider_changed(self, name):
+        # ChatGPT chỉ tạo 1 ảnh -> khoá ô số ảnh cho khỏi hiểu nhầm
+        is_cgpt = (name == "ChatGPT")
+        self.spin_thumb_n.setEnabled(not is_cgpt)
+        if is_cgpt:
+            self.spin_thumb_n.setValue(1)
+
+    def _login_chatgpt(self):
+        # Nếu cửa sổ đăng nhập đang mở -> nút này là "xác nhận đã đăng nhập xong"
+        t = getattr(self, "_thumb_login_thread", None)
+        if t and t.isRunning():
+            self._log("✅ Đang lưu phiên đăng nhập...\n")
+            self.btn_thumb_login.setEnabled(False)
+            self.btn_thumb_login.setText("⏳ Đang lưu...")
+            t.confirm()
+            return
+
+        self._log("🔐 Mở cửa sổ đăng nhập ChatGPT...\n")
+        self._thumb_login_thread = ChatGPTLoginThread()
+        self._thumb_login_thread.log.connect(self._log)
+        self._thumb_login_thread.done.connect(self._on_chatgpt_login_done)
+        self._thumb_login_thread.start()
+        # Đổi nút thành nút xác nhận thủ công
+        self.btn_thumb_login.setText("✅ Tôi đã đăng nhập xong")
+
+    def _on_chatgpt_login_done(self, ok):
+        self.btn_thumb_login.setEnabled(True)
+        if ok:
+            self.btn_thumb_login.setText("✅ ChatGPT đã đăng nhập")
+        else:
+            self.btn_thumb_login.setText("🔐 Đăng nhập ChatGPT")
 
     def _clear_thumb_results(self):
         while self.thumb_result_row.count():

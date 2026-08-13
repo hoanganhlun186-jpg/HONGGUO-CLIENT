@@ -4,7 +4,7 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QListWidget, QListWidgetItem, QTextEdit, QFileDialog, QProgressBar, QFrame, QSplitter, QAbstractItemView, QComboBox, QCheckBox)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings, QSize
 from PyQt6.QtGui import QTextCursor, QPixmap, QColor, QIcon
-from shared_utils import CREATE_NO_WINDOW, browser_launch_kwargs
+from shared_utils import CREATE_NO_WINDOW, browser_launch_kwargs, get_ytdlp_path
 from cookie_tab import get_cookie_file
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -464,7 +464,103 @@ class XDownloadThread(QThread):
             
         self.log.emit(f"🎉 HOÀN THÀNH: {self.success_count}/{total} mục.\n")
         self.user_log.emit(f"🎉 Hoàn tất: {self.success_count}/{total} tải thành công\n")
-        
+
+    def _dl_worker(self, vid, idx, tot):
+        self.pause_event.wait()
+        if self._cancel:
+            return False
+
+        vid_id = str(vid.get("id", ""))
+        desc = _sanitize(vid.get("desc", "") or "")
+        author = _sanitize(vid.get("author", "X_User") or "X_User")
+        is_social = "X (Twitter)" in vid.get("platform", "")
+
+        # Bài viết X -> lưu theo tên user; link phim/stream trực tiếp -> thư mục chung
+        if is_social:
+            user_dir = os.path.join(self.save_dir, "XDownload", author)
+            m = re.search(r'/status/(\d+)', vid.get("url", ""))
+            name_id = m.group(1) if m else vid_id
+        else:
+            user_dir = os.path.join(self.save_dir, "XDownload", "DirectStream")
+            name_id = vid_id
+        os.makedirs(user_dir, exist_ok=True)
+
+        base_name = f"{desc} [{name_id}]" if desc else f"{name_id}"
+        outtmpl = os.path.join(user_dir, f"{base_name}.%(ext)s")
+
+        self.log.emit(f"[{idx}/{tot}] ⬇️ Bắt đầu tải: {name_id}\n")
+        self.card_progress.emit(vid_id, -1)
+
+        cmd = [
+            get_ytdlp_path(),
+            "-f", "bestvideo+bestaudio/best",
+            "--merge-output-format", "mp4",
+            "-o", outtmpl,
+            "--no-warnings", "--no-playlist", "--newline",
+            "--add-header", f"User-Agent:{UA}",
+            "--progress-template", "download:PCT %(progress._percent_str)s",
+        ]
+        if self.cookie_file and os.path.exists(self.cookie_file):
+            cmd += ["--cookies", self.cookie_file]
+        cmd.append(vid["url"])
+
+        success = False
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            if self._cancel:
+                break
+            self.pause_event.wait()
+            try:
+                kw = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", **kw
+                )
+                last_err_line = ""
+                for line in proc.stdout:
+                    if self._cancel:
+                        proc.terminate()
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("PCT"):
+                        try:
+                            pct = int(float(line.replace("PCT", "").replace("%", "").strip()))
+                            self.card_progress.emit(vid_id, pct)
+                        except ValueError:
+                            pass
+                    elif "ERROR" in line.upper():
+                        last_err_line = line
+                        self.log.emit(f"   {line}\n")
+                proc.wait()
+                if proc.returncode == 0:
+                    success = True
+                    self.card_progress.emit(vid_id, 100)
+                    break
+                elif attempt < max_retries:
+                    self.log.emit(f"⚠️ [{idx}] Lỗi tải (thử lại {attempt}/{max_retries}) | {last_err_line[:120]}\n")
+                    time.sleep(2)
+                else:
+                    self.log.emit(f"❌ [{idx}] Thất bại hoàn toàn: {name_id} | {last_err_line[:200]}\n")
+            except Exception as e:
+                err_msg = str(e).replace("\n", " ").strip()
+                if attempt < max_retries:
+                    self.log.emit(f"⚠️ [{idx}] Lỗi tải (thử lại {attempt}/{max_retries}) | {err_msg[:120]}\n")
+                    time.sleep(2)
+                else:
+                    self.log.emit(f"❌ [{idx}] Thất bại hoàn toàn: {name_id} | {err_msg}\n")
+
+        with self.lock:
+            self.done_count += 1
+            if success:
+                self.success_count += 1
+                self.user_log.emit(f"✅ Tải xong ({self.success_count}/{tot}): {name_id}\n")
+            else:
+                self.user_log.emit(f"❌ Lỗi tải: {name_id}\n")
+            self.total_progress.emit(self.done_count, tot)
+
+        return success
 
 # ============================================================
 # X WIDGET — Giao diện đồng bộ

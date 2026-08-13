@@ -196,10 +196,45 @@ def find_downloaded_video(directory: str, name_prefix: str) -> str:
 # 4. MẮT THẦN DÒ CARD ĐỒ HỌA (Dùng cho Workflow Render FFmpeg)
 # ====================================================================
 _CODEC_CACHE = None
+_CODEC_FALLBACK_REASON = ""  # lý do phải dùng CPU (để UI hiển thị)
+
+def get_codec_fallback_reason() -> str:
+    """Trả về lý do đã phải lùi về CPU (rỗng nếu đang dùng GPU bình thường)."""
+    return _CODEC_FALLBACK_REASON
+
+def _encoder_actually_works(codec: str) -> bool:
+    """Encode thử 1 frame testsrc bằng codec để xác nhận card/driver DÙNG ĐƯỢC
+    thật, không chỉ dựa vào tên hãng GPU. Card NVIDIA đời cũ (không có NVENC),
+    driver cũ, hoặc hết session sẽ trượt bước này -> tự về libx264."""
+    ffmpeg = get_ffmpeg_path()
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc=size=256x144:rate=1:duration=1",
+        "-frames:v", "1", "-pix_fmt", "yuv420p",
+        "-c:v", codec,
+    ]
+    cl = codec.lower()
+    if "nvenc" in cl:
+        cmd += ["-preset", "fast"]
+    elif "amf" in cl:
+        cmd += ["-quality", "speed"]
+    elif "qsv" in cl:
+        cmd += ["-preset", "fast"]
+    cmd += ["-f", "null", os.devnull]
+    try:
+        kw = {}
+        if os.name == "nt":
+            kw["creationflags"] = CREATE_NO_WINDOW
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25, **kw)
+        return r.returncode == 0
+    except Exception:
+        return False
 
 def get_optimal_ffmpeg_codec() -> str:
     """Dò card đồ họa để chọn codec nén phần cứng. Có CACHE (chỉ dò 1 lần).
-    Dùng PowerShell CIM thay 'wmic' vì Windows 11 mới đã gỡ wmic."""
+    Dùng PowerShell CIM thay 'wmic' vì Windows 11 mới đã gỡ wmic.
+    Sau khi đoán theo tên hãng, ENCODE THỬ 1 frame để chắc chắn dùng được;
+    card cũ/driver cũ không encode nổi sẽ tự lùi về libx264 (CPU)."""
     global _CODEC_CACHE
     if _CODEC_CACHE is not None:
         return _CODEC_CACHE
@@ -207,35 +242,50 @@ def get_optimal_ffmpeg_codec() -> str:
         _CODEC_CACHE = "libx264"
         return _CODEC_CACHE
 
-    vga_name = ""
+    guess = None
     # 1) nvidia-smi (nhanh nhất) -> chắc chắn NVIDIA
     try:
         r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True,
                            creationflags=CREATE_NO_WINDOW, timeout=6)
         if r.returncode == 0 and "gpu" in r.stdout.lower():
-            _CODEC_CACHE = "h264_nvenc"
-            return _CODEC_CACHE
+            guess = "h264_nvenc"
     except Exception:
         pass
     # 2) PowerShell CIM (thay wmic, chạy được trên Win10/11)
-    try:
-        ps = ("Get-CimInstance Win32_VideoController | "
-              "Select-Object -ExpandProperty Name")
-        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                          capture_output=True, text=True,
-                          creationflags=CREATE_NO_WINDOW, timeout=8)
-        vga_name = (r.stdout or "").lower()
-    except Exception:
+    if guess is None:
         vga_name = ""
+        try:
+            ps = ("Get-CimInstance Win32_VideoController | "
+                  "Select-Object -ExpandProperty Name")
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                              capture_output=True, text=True,
+                              creationflags=CREATE_NO_WINDOW, timeout=8)
+            vga_name = (r.stdout or "").lower()
+        except Exception:
+            vga_name = ""
+        if "nvidia" in vga_name:
+            guess = "h264_nvenc"
+        elif "amd" in vga_name or "radeon" in vga_name:
+            guess = "h264_amf"
+        elif "intel" in vga_name:
+            guess = "h264_qsv"
 
-    if "nvidia" in vga_name:
-        _CODEC_CACHE = "h264_nvenc"
-    elif "amd" in vga_name or "radeon" in vga_name:
-        _CODEC_CACHE = "h264_amf"
-    elif "intel" in vga_name:
-        _CODEC_CACHE = "h264_qsv"
+    # 3) XÁC MINH bằng encode thử. Chỉ nhận HW nếu chạy thật được.
+    global _CODEC_FALLBACK_REASON
+    if guess and _encoder_actually_works(guess):
+        _CODEC_CACHE = guess
+        _CODEC_FALLBACK_REASON = ""
     else:
         _CODEC_CACHE = "libx264"
+        if guess:
+            # Đoán được có GPU nhưng encode thử thất bại: card quá cũ KHÔNG hỗ trợ
+            # tăng tốc, HOẶC card mới nhưng driver chưa cập nhật/không tương thích.
+            _CODEC_FALLBACK_REASON = (
+                "GPU khong ma hoa duoc (card cu khong ho tro, hoac driver chua cap nhat) "
+                "-> dung CPU (libx264), render se cham hon."
+            )
+        else:
+            _CODEC_FALLBACK_REASON = ""  # không có GPU rời -> CPU là đúng, không cần cảnh báo
     return _CODEC_CACHE
 
 # ====================================================================
