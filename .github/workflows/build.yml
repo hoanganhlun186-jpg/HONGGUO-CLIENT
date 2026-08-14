@@ -77,6 +77,14 @@ jobs:
     # ffmpeg.exe / ffprobe.exe / yt-dlp.exe / aria2c.exe đã COMMIT SẴN trong repo
     # (checkout ở bước đầu đã có), nên KHÔNG cần bước tải nữa.
 
+    - name: Download VC++ Redistributable
+      shell: pwsh
+      run: |
+        # Máy khách mới cài Windows hay thiếu VC++ Runtime -> ctranslate2
+        # (faster-whisper) load DLL fail. Tải sẵn để cài kèm (cả installer
+        # LẪN bản zip auto-update).
+        Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "vc_redist.x64.exe"
+
     - name: Package into folder + zip
       shell: pwsh
       run: |
@@ -105,17 +113,25 @@ jobs:
         if (Test-Path "Voice.json") { Copy-Item "Voice.json" -Destination $pkg }
         if (Test-Path "capcut_tts_api") { Copy-Item "capcut_tts_api" -Destination $pkg -Recurse }
 
+        # NHÉT thư mục voice_samples (file mẫu NGHE THỬ đã tạo sẵn) vào gói
+        # để khách bấm "Nghe thử" là phát ngay, không phải tự tạo.
+        if (Test-Path "voice_samples") {
+            Copy-Item "voice_samples" -Destination $pkg -Recurse
+            $n = (Get-ChildItem "voice_samples" -Filter *.mp3 -Recurse | Measure-Object).Count
+            Write-Host "Da chep voice_samples ($n file mp3) vao goi."
+        } else {
+            Write-Host "CANH BAO: khong thay thu muc voice_samples - goi se thieu mau nghe thu."
+        }
+
+        # NHÉT vc_redist.x64.exe VÀO GÓI ZIP để bản auto-update (khách cập
+        # nhật online) cũng có VC++ Runtime — app tự cài lần đầu nếu thiếu.
+        if (-not (Test-Path "vc_redist.x64.exe")) { Write-Error "THIEU vc_redist.x64.exe"; exit 1 }
+        Copy-Item "vc_redist.x64.exe" -Destination $pkg
+
         "Giai nen thu muc nay ra 1 cho co dinh (VD C:\BoomStudio) roi chay BoomStudio.exe." | Out-File -FilePath "$pkg\HUONG_DAN.txt" -Encoding utf8
 
         # Nén cả THƯ MỤC (bản portable, cho ai thích giải nén chạy tay)
         Compress-Archive -Path $pkg -DestinationPath "BoomStudio.zip" -Force
-
-    - name: Download VC++ Redistributable
-      shell: pwsh
-      run: |
-        # Máy khách mới cài Windows hay thiếu VC++ Runtime -> ctranslate2
-        # (faster-whisper) load DLL fail. Tải sẵn để installer cài kèm.
-        Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "vc_redist.x64.exe"
 
     - name: Build Installer (Inno Setup)
       shell: pwsh

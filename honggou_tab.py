@@ -303,99 +303,74 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.54"
+APP_VERSION = "1.0.55"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
-# ── VBEE TTS ────────────────────────────────────────────────────────────────
-# Tích hợp giọng Vbee (vd Ngọc Huyền). Khách tự nhập app_id + token trong app.
-# Luồng: POST tạo request -> nhận request_id -> GET poll tới khi SUCCESS ->
-# tải audio_link (link chỉ sống 3 phút nên tải ngay).
-VBEE_TTS_URL = "https://vbee.vn/api/v1/tts"   # đổi 1 dòng này nếu Vbee đổi endpoint
-# Tiền tố đánh dấu giọng Vbee trong voice_type: "vbee:<voice_code>"
-VBEE_PREFIX = "vbee:"
+# ── PEKKA TTS ────────────────────────────────────────────────────────────────
+# Tích hợp giọng Pekka. Khách tự nhập api_key trong app.
+PEKKA_TTS_URL = "https://voice.getpekka.com/api/v1/tts/sync"
+PEKKA_PREFIX = "pekka:"
 
-
-def _vbee_synthesize(text, voice_code, app_id, token, out_path,
-                     ffmpeg_path=None, speed_rate="1.0", log=None):
-    """Gọi Vbee TTS cho 1 đoạn text, tải file mp3 về out_path.
-    Trả về True nếu thành công. log là hàm nhận chuỗi (tùy chọn)."""
-    import requests, time, urllib.request
+def _pekka_synthesize(text, voice_code, api_key, out_path, speed_rate="1.0", log=None):
+    import requests, time
 
     def _log(m):
-        if log:
-            log(m)
+        if log: log(m)
 
-    headers = {"Authorization": f"Bearer {token}",
-               "Content-Type": "application/json"}
+    # Thẻ bài (Headers) dùng chung cho cả lúc gửi Text và lúc tải Audio
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    
     body = {
-        "app_id": app_id,
-        "input_text": text,
-        "voice_code": voice_code,
-        "audio_type": "mp3",
-        "bitrate": 128,
-        "speed_rate": str(speed_rate),
-        # response_type "direct": không cần callback server (app desktop);
-        # nếu tài khoản chỉ cho "indirect" thì vẫn poll được bằng Get Request.
-        "response_type": "direct",
+        "text": text,
+        "voiceId": voice_code,
+        "speed": float(speed_rate)
     }
 
-    # 1) Tạo request
-    try:
-        r = requests.post(VBEE_TTS_URL, json=body, headers=headers, timeout=30)
-        data = r.json()
-    except Exception as e:
-        _log(f"❌ Vbee: lỗi kết nối tạo request ({str(e)[:60]})")
-        return False
-
-    if str(data.get("status")) != "1":
-        _log(f"❌ Vbee: {data.get('error_message', 'tạo request thất bại')}")
-        return False
-
-    result = data.get("result") or {}
-    request_id = result.get("request_id")
-    audio_link = result.get("audio_link")   # đôi khi có sẵn nếu direct
-    if not request_id and not audio_link:
-        _log("❌ Vbee: không nhận được request_id")
-        return False
-
-    # 2) Poll tới khi SUCCESS (nếu chưa có audio_link ngay)
-    if not audio_link:
-        poll_url = f"{VBEE_TTS_URL}/{request_id}"
-        for _ in range(90):   # tối đa ~180s
-            time.sleep(2)
-            try:
-                q = requests.get(poll_url, headers=headers, timeout=15).json()
-            except Exception:
+    # Vòng lặp chống lỗi: Thử tối đa 10 lần nếu bị chặn do quá tải API (Rate Limit 429)
+    for attempt in range(1, 11):
+        try:
+            # 1. Gọi API tạo audio (Dùng endpoint /sync cho văn bản ngắn)
+            r = requests.post("https://voice.getpekka.com/api/v1/tts/sync", json=body, headers=headers, timeout=30)
+            
+            if r.status_code == 429:
+                wait_time = attempt * 2
+                _log(f"⏳ Quá tải API Pekka, chờ {wait_time}s rồi thử lại...")
+                time.sleep(wait_time)
                 continue
-            res = q.get("result") or {}
-            st = res.get("status", "")
-            if st == "SUCCESS":
-                audio_link = res.get("audio_link")
-                break
-            if st == "FAILURE":
-                _log("❌ Vbee: tổng hợp thất bại (FAILURE)")
+                
+            data = r.json()
+            
+            if r.status_code != 200 or "url" not in data:
+                _log(f"❌ Pekka API Error: {data.get('error', r.status_code)}")
                 return False
-        if not audio_link:
-            _log("❌ Vbee: quá thời gian chờ (timeout)")
-            return False
 
-    # 3) Tải file (link chỉ sống 3 phút -> tải ngay)
-    try:
-        urllib.request.urlretrieve(audio_link, out_path)
-        return True
-    except Exception as e:
-        _log(f"❌ Vbee: lỗi tải audio ({str(e)[:60]})")
-        return False
+            # Lấy URL kết quả
+            audio_link = data["url"]
+            if audio_link.startswith("/"):
+                audio_link = "https://voice.getpekka.com" + audio_link
 
-# Báo cho demucs_manager biết URL wheels để cài offline
-if _DEMUCS_MANAGER_OK:
-    try:
-        from demucs_manager import set_wheels_url
-        set_wheels_url(GITHUB_REPO, f"v{APP_VERSION}")
-    except Exception:
-        pass
-MAX_CONCURRENT_DOWNLOADS = 3  
+            # 2. Thực hiện lệnh GET để tải file mp3 về (Mang theo header có API Key để không bị 403)
+            dl_req = requests.get(audio_link, headers=headers, timeout=30)
+            
+            if dl_req.status_code == 200:
+                with open(out_path, 'wb') as f:
+                    f.write(dl_req.content)
+                return True
+            else:
+                _log(f"❌ Pekka: Không thể tải file (Lỗi {dl_req.status_code})")
+                return False
+            
+        except Exception as e:
+            _log(f"⚠️ Lỗi mạng (Thử lại lần {attempt}/10): {str(e)[:40]}")
+            time.sleep(2)
+            
+    _log("❌ Đã thử 10 lần nhưng vẫn thất bại do máy chủ Pekka.")
+    return False
 
 # ==========================================
 # FFMPEG HELPER VÀ LUỒNG GỘP FILE (MERGE)
@@ -1798,14 +1773,13 @@ class DubThread(QThread):
     progress_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(int, int)   
 
-    def __init__(self, tasks, voice_type="BV074_streaming", rate="1.0", pitch="+0Hz", mute_original=True, orig_volume=15, remove_bgm=False, use_gpu=False, tts_workers=4, vbee_app_id="", vbee_token=""):
+    def __init__(self, tasks, voice_type="BV074_streaming", rate="1.0", pitch="+0Hz", mute_original=True, orig_volume=15, remove_bgm=False, use_gpu=False, tts_workers=4, pekka_api_key=""):
         super().__init__()
         self.tasks      = tasks
         self.voice_type = voice_type
         self.rate       = rate
         self.pitch      = pitch
-        self.vbee_app_id = vbee_app_id   # cho giọng Vbee
-        self.vbee_token  = vbee_token
+        self.pekka_api_key = pekka_api_key   # Đổi thành Pekka
         self.tts_workers = max(1, int(tts_workers))
         self.mute_original = mute_original
         self.remove_bgm = remove_bgm
@@ -1857,14 +1831,14 @@ class DubThread(QThread):
         from pydub.effects import speedup
 
         is_neural = "Neural" in self.voice_type
-        is_vbee = self.voice_type.startswith(VBEE_PREFIX)   # giọng Vbee
+        is_pekka = self.voice_type.startswith(PEKKA_PREFIX)   # Sửa is_vbee thành is_pekka
 
         # QUAN TRỌNG: chỉ khởi tạo CapCutClient khi THẬT SỰ cần dùng giọng
         # CapCut. Nếu khách chọn giọng 🌐 Edge TTS thì không cần CapCut chút
         # nào - Edge TTS phải chạy độc lập, không phụ thuộc CapCut có đăng
         # nhập/còn hạn hay không.
         client = None
-        if not is_neural and not is_vbee:
+        if not is_neural and not is_pekka:
             try:
                 from capcut_tts_api import CapCutClient
                 # Không truyền device cố định nữa - dùng CapCutClient() trần
@@ -1942,17 +1916,17 @@ class DubThread(QThread):
                                     comm = edge_tts.Communicate(text=text, voice=self.voice_type, **_edge_kwargs)
                                     await comm.save(seg_path)
                                 asyncio.run(_run_edge())
-                            elif is_vbee:
-                                # Giọng Vbee: voice_type dạng "vbee:<voice_code>"
-                                voice_code = self.voice_type[len(VBEE_PREFIX):]
-                                ok_vbee = _vbee_synthesize(
+                            elif is_pekka:
+                                # Giọng Pekka: voice_type dạng "pekka:<voiceId>"
+                                voice_code = self.voice_type[len(PEKKA_PREFIX):]
+                                ok_pekka = _pekka_synthesize(
                                     text, voice_code,
-                                    self.vbee_app_id, self.vbee_token,
-                                    seg_path, ffmpeg_path=ffmpeg,
+                                    self.pekka_api_key,
+                                    seg_path,
                                     speed_rate=self.rate,
                                     log=lambda m: self.progress_signal.emit(f"[{idx+1}] Dòng {i+1}: {m}"))
-                                if not ok_vbee:
-                                    raise RuntimeError("Vbee tổng hợp thất bại")
+                                if not ok_pekka:
+                                    raise RuntimeError("Pekka tổng hợp thất bại")
                             else:
                                 # Port Y HỆT logic từ capcut_widget.py (_tts_get_url) đã
                                 # xác nhận chạy nhanh - đảm bảo 100% giống hệt, không còn
@@ -2006,7 +1980,7 @@ class DubThread(QThread):
                                 audio_seg = AudioSegment.from_file(wav_path, format="wav")
                             cur = len(audio_seg)
                             if cur > target_dur and target_dur > 0:
-                                factor = min(cur/target_dur, 2.5)
+                                factor = min(cur/target_dur, 1.5)
                                 try: audio_seg = speedup(audio_seg, playback_speed=factor)
                                 except Exception: pass
                             elif cur < target_dur:
@@ -4321,7 +4295,7 @@ class HonggouWidget(QWidget):
             if not co_bia:
                 cover_url = m.get("cover_url") or ""
                 if series_id:
-                    self._search_missing_covers.append((row, series_id, cover_url))
+                        self._search_missing_covers.append((row, series_id, cover_url))
 
         if self._search_missing_covers:
             try:
@@ -4922,8 +4896,6 @@ class HonggouWidget(QWidget):
         mode = self.merge_mode_combo.currentIndex()
         files_to_merge = getattr(self, 'downloaded_file_paths', [])
         auto_stt = hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked()
-
-        self._merge_mode_after = mode
 
         # Nếu tick "Tách nhạc nền" -> xử lý theo 2 trường hợp:
         # 1) CÓ tick "Lồng tiếng": tách NGẦM ngay, lưu cache, DubThread dùng

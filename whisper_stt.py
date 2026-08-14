@@ -66,19 +66,48 @@ def _pick_device():
     return "cpu", "int8"
 
 
+def _load_model_cpu(model_name, progress=None):
+    """Tạo model chạy CPU (int8) — an toàn, không cần cuDNN."""
+    key = (model_name, "cpu", "int8")
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key], "cpu"
+    if progress:
+        progress(f"⏳ Nạp model Whisper '{model_name}' (cpu, int8)... "
+                 f"(lần đầu sẽ tải model về máy, hãy đợi)")
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    _MODEL_CACHE[key] = model
+    return model, "cpu"
+
+
 def _get_model(model_name, progress=None):
     """Nạp (hoặc lấy từ cache) WhisperModel. Lần đầu sẽ TẢI model về máy
-    (~small 480MB / medium 1.5GB / large-v3 3GB) rồi lưu lại dùng mãi."""
+    (~small 480MB / medium 1.5GB / large-v3 3GB) rồi lưu lại dùng mãi.
+
+    Ưu tiên GPU (cuda) nếu máy có; nếu tạo model GPU lỗi (thường do THIẾU
+    cuDNN 9 — máy có card NVIDIA nhưng chưa cài cuDNN) thì TỰ LÙI VỀ CPU
+    để vẫn chạy được, không crash."""
     device, compute = _pick_device()
+
+    # Máy không có GPU → CPU luôn
+    if device != "cuda":
+        return _load_model_cpu(model_name, progress)
+
+    # Có GPU → thử tạo model GPU
     key = (model_name, device, compute)
     if key in _MODEL_CACHE:
         return _MODEL_CACHE[key], device
     if progress:
         progress(f"⏳ Nạp model Whisper '{model_name}' ({device}, {compute})... "
                  f"(lần đầu sẽ tải model về máy, hãy đợi)")
-    model = WhisperModel(model_name, device=device, compute_type=compute)
-    _MODEL_CACHE[key] = model
-    return model, device
+    try:
+        model = WhisperModel(model_name, device=device, compute_type=compute)
+        _MODEL_CACHE[key] = model
+        return model, device
+    except Exception as e:
+        # GPU lỗi (hay gặp: thiếu cuDNN 9) → lùi về CPU
+        if progress:
+            progress(f"⚠️ GPU không dùng được ({str(e)[:80]}), tự chuyển sang CPU...")
+        return _load_model_cpu(model_name, progress)
 
 
 def _fmt_ts(seconds):
@@ -111,6 +140,19 @@ def _write_srt(segments, srt_path):
     return n
 
 
+def _do_transcribe(model, video_path, lang):
+    """Chạy transcribe + duyệt hết segments (materialize) để lỗi runtime
+    của GPU/cuDNN bùng ra NGAY tại đây, không phải lúc ghi file."""
+    segments, info = model.transcribe(
+        video_path,
+        language=lang,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
+        beam_size=5,
+    )
+    return list(segments)   # ép chạy ngay (generator vốn lazy)
+
+
 def transcribe_one(video_path, model_name="small", src_lang="zh",
                    progress=None):
     """Tách phụ đề 1 video → ghi <base>.srt cạnh video.
@@ -122,19 +164,26 @@ def transcribe_one(video_path, model_name="small", src_lang="zh",
         progress(f"🎧 [{device}] Đang nghe: {name}")
 
     # vad_filter=True → dùng Silero VAD tự lọc đoạn không có giọng người
-    # (nhạc nền, tiếng động), nên KHÔNG bị cắt nhầm giữa câu. Đây chính là
-    # cái CapCut/silencedetect không làm được với drama có nhạc nền.
-    segments, info = model.transcribe(
-        video_path,
-        language=lang,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
-        beam_size=5,
-    )
+    # (nhạc nền, tiếng động), nên KHÔNG bị cắt nhầm giữa câu.
+    try:
+        seg_list = _do_transcribe(model, video_path, lang)
+    except Exception as e:
+        # Nếu đang chạy GPU và lỗi lúc chạy thật (thường thiếu cuDNN) →
+        # bỏ model GPU khỏi cache, tạo lại bằng CPU rồi chạy lại 1 lần.
+        if device == "cuda":
+            if progress:
+                progress(f"⚠️ GPU lỗi khi chạy ({str(e)[:80]}), chuyển sang CPU và thử lại...")
+            _MODEL_CACHE.pop((model_name, "cuda", "float16"), None)
+            model, device = _load_model_cpu(model_name, progress)
+            if progress:
+                progress(f"🎧 [{device}] Đang nghe lại: {name}")
+            seg_list = _do_transcribe(model, video_path, lang)
+        else:
+            raise
 
     base, _ext = os.path.splitext(video_path)
     srt_path = base + ".srt"
-    n = _write_srt(segments, srt_path)
+    n = _write_srt(seg_list, srt_path)
     if progress:
         if n == 0:
             progress(f"🔇 {name}: không phát hiện thoại (tập không lời).")
