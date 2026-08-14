@@ -303,9 +303,90 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.53"
+APP_VERSION = "1.0.54"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
+
+# ── VBEE TTS ────────────────────────────────────────────────────────────────
+# Tích hợp giọng Vbee (vd Ngọc Huyền). Khách tự nhập app_id + token trong app.
+# Luồng: POST tạo request -> nhận request_id -> GET poll tới khi SUCCESS ->
+# tải audio_link (link chỉ sống 3 phút nên tải ngay).
+VBEE_TTS_URL = "https://vbee.vn/api/v1/tts"   # đổi 1 dòng này nếu Vbee đổi endpoint
+# Tiền tố đánh dấu giọng Vbee trong voice_type: "vbee:<voice_code>"
+VBEE_PREFIX = "vbee:"
+
+
+def _vbee_synthesize(text, voice_code, app_id, token, out_path,
+                     ffmpeg_path=None, speed_rate="1.0", log=None):
+    """Gọi Vbee TTS cho 1 đoạn text, tải file mp3 về out_path.
+    Trả về True nếu thành công. log là hàm nhận chuỗi (tùy chọn)."""
+    import requests, time, urllib.request
+
+    def _log(m):
+        if log:
+            log(m)
+
+    headers = {"Authorization": f"Bearer {token}",
+               "Content-Type": "application/json"}
+    body = {
+        "app_id": app_id,
+        "input_text": text,
+        "voice_code": voice_code,
+        "audio_type": "mp3",
+        "bitrate": 128,
+        "speed_rate": str(speed_rate),
+        # response_type "direct": không cần callback server (app desktop);
+        # nếu tài khoản chỉ cho "indirect" thì vẫn poll được bằng Get Request.
+        "response_type": "direct",
+    }
+
+    # 1) Tạo request
+    try:
+        r = requests.post(VBEE_TTS_URL, json=body, headers=headers, timeout=30)
+        data = r.json()
+    except Exception as e:
+        _log(f"❌ Vbee: lỗi kết nối tạo request ({str(e)[:60]})")
+        return False
+
+    if str(data.get("status")) != "1":
+        _log(f"❌ Vbee: {data.get('error_message', 'tạo request thất bại')}")
+        return False
+
+    result = data.get("result") or {}
+    request_id = result.get("request_id")
+    audio_link = result.get("audio_link")   # đôi khi có sẵn nếu direct
+    if not request_id and not audio_link:
+        _log("❌ Vbee: không nhận được request_id")
+        return False
+
+    # 2) Poll tới khi SUCCESS (nếu chưa có audio_link ngay)
+    if not audio_link:
+        poll_url = f"{VBEE_TTS_URL}/{request_id}"
+        for _ in range(90):   # tối đa ~180s
+            time.sleep(2)
+            try:
+                q = requests.get(poll_url, headers=headers, timeout=15).json()
+            except Exception:
+                continue
+            res = q.get("result") or {}
+            st = res.get("status", "")
+            if st == "SUCCESS":
+                audio_link = res.get("audio_link")
+                break
+            if st == "FAILURE":
+                _log("❌ Vbee: tổng hợp thất bại (FAILURE)")
+                return False
+        if not audio_link:
+            _log("❌ Vbee: quá thời gian chờ (timeout)")
+            return False
+
+    # 3) Tải file (link chỉ sống 3 phút -> tải ngay)
+    try:
+        urllib.request.urlretrieve(audio_link, out_path)
+        return True
+    except Exception as e:
+        _log(f"❌ Vbee: lỗi tải audio ({str(e)[:60]})")
+        return False
 
 # Báo cho demucs_manager biết URL wheels để cài offline
 if _DEMUCS_MANAGER_OK:
@@ -738,8 +819,9 @@ class SearchMoviesThread(QThread):
                 data = res.json()
                 if data.get("status") == "success": self.results_signal.emit(data.get("data", []))
                 else: self.error_signal.emit(data.get("message", "Lỗi tìm kiếm"))
-            else: self.error_signal.emit(f"Máy chủ trả về mã lỗi: {res.status_code}")
-        except Exception as e: self.error_signal.emit(str(e))
+            else: self.error_signal.emit("Máy chủ đang quá tải. Vui lòng chờ 1-2 phút rồi bấm lại nhé!")
+        except Exception:
+            self.error_signal.emit("Máy chủ đang quá tải. Vui lòng chờ 1-2 phút rồi bấm lại nhé!")
 
 class HonggouScanThread(QThread):
     scan_result = pyqtSignal(dict)
@@ -905,13 +987,15 @@ class HonggouScanThread(QThread):
                 err_msg = res.text
                 try: err_msg = res.json().get("detail", res.text)
                 except: pass
-                suffix = "\n(Server quá tải, đã tự thử lại 3 lần)" if res.status_code in _RETRY_CODES else ""
-                self.error_signal.emit(f"Máy chủ từ chối (Mã {res.status_code}):\n{err_msg}{suffix}")
+                if res.status_code in _RETRY_CODES:
+                    self.error_signal.emit("Máy chủ đang quá tải. Vui lòng chờ 1-2 phút rồi bấm lại nhé!")
+                else:
+                    self.error_signal.emit(f"Máy chủ từ chối yêu cầu (Mã {res.status_code}). Vui lòng thử lại sau ít phút.")
 
         except requests.exceptions.RequestException as e: 
-            self.error_signal.emit(f"Lỗi kết nối web gốc: {str(e)}")
-        except Exception as e: 
-            self.error_signal.emit(f"Lỗi quét link: {str(e)}")
+            self.error_signal.emit("Máy chủ đang quá tải. Vui lòng chờ 1-2 phút rồi bấm lại nhé!")
+        except Exception:
+            self.error_signal.emit("Máy chủ đang quá tải. Vui lòng chờ 1-2 phút rồi bấm lại nhé!")
 
 class JobStatusMonitorThread(QThread):
     update_signal = pyqtSignal(dict)
@@ -985,7 +1069,7 @@ class StreamDownloadThread(QThread):
             self.all_done_signal.emit()
             
         except Exception as e:
-            self.error_signal.emit(f"Lỗi kết nối lấy link:\n{str(e)}")
+            self.error_signal.emit("Máy chủ đang quá tải. Vui lòng chờ 1-2 phút rồi bấm lại nhé!")
 
 class RetryDeadLinkThread(QThread):
     new_link_signal = pyqtSignal(dict)
@@ -1714,12 +1798,14 @@ class DubThread(QThread):
     progress_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(int, int)   
 
-    def __init__(self, tasks, voice_type="BV074_streaming", rate="1.0", pitch="+0Hz", mute_original=True, orig_volume=15, remove_bgm=False, use_gpu=False, tts_workers=4):
+    def __init__(self, tasks, voice_type="BV074_streaming", rate="1.0", pitch="+0Hz", mute_original=True, orig_volume=15, remove_bgm=False, use_gpu=False, tts_workers=4, vbee_app_id="", vbee_token=""):
         super().__init__()
         self.tasks      = tasks
         self.voice_type = voice_type
         self.rate       = rate
         self.pitch      = pitch
+        self.vbee_app_id = vbee_app_id   # cho giọng Vbee
+        self.vbee_token  = vbee_token
         self.tts_workers = max(1, int(tts_workers))
         self.mute_original = mute_original
         self.remove_bgm = remove_bgm
@@ -1771,13 +1857,14 @@ class DubThread(QThread):
         from pydub.effects import speedup
 
         is_neural = "Neural" in self.voice_type
+        is_vbee = self.voice_type.startswith(VBEE_PREFIX)   # giọng Vbee
 
         # QUAN TRỌNG: chỉ khởi tạo CapCutClient khi THẬT SỰ cần dùng giọng
         # CapCut. Nếu khách chọn giọng 🌐 Edge TTS thì không cần CapCut chút
         # nào - Edge TTS phải chạy độc lập, không phụ thuộc CapCut có đăng
         # nhập/còn hạn hay không.
         client = None
-        if not is_neural:
+        if not is_neural and not is_vbee:
             try:
                 from capcut_tts_api import CapCutClient
                 # Không truyền device cố định nữa - dùng CapCutClient() trần
@@ -1855,6 +1942,17 @@ class DubThread(QThread):
                                     comm = edge_tts.Communicate(text=text, voice=self.voice_type, **_edge_kwargs)
                                     await comm.save(seg_path)
                                 asyncio.run(_run_edge())
+                            elif is_vbee:
+                                # Giọng Vbee: voice_type dạng "vbee:<voice_code>"
+                                voice_code = self.voice_type[len(VBEE_PREFIX):]
+                                ok_vbee = _vbee_synthesize(
+                                    text, voice_code,
+                                    self.vbee_app_id, self.vbee_token,
+                                    seg_path, ffmpeg_path=ffmpeg,
+                                    speed_rate=self.rate,
+                                    log=lambda m: self.progress_signal.emit(f"[{idx+1}] Dòng {i+1}: {m}"))
+                                if not ok_vbee:
+                                    raise RuntimeError("Vbee tổng hợp thất bại")
                             else:
                                 # Port Y HỆT logic từ capcut_widget.py (_tts_get_url) đã
                                 # xác nhận chạy nhanh - đảm bảo 100% giống hệt, không còn
@@ -2547,7 +2645,8 @@ class HonggouWidget(QWidget):
                 headers={"Authorization": f"Bearer {self.auth_token}"}, timeout=20)
             data = res.json()
         except Exception as e:
-            QMessageBox.warning(self, "Lỗi", f"Không tải được danh sách: {e}"); return
+            QMessageBox.warning(self, "Máy chủ đang bận",
+                                "Máy chủ đang quá tải.\nVui lòng chờ 1-2 phút rồi bấm lại nhé!"); return
         if data.get("status") != "success":
             QMessageBox.warning(self, "Lỗi", data.get("message", "Có lỗi xảy ra")); return
         series = data.get("series", [])
@@ -4694,7 +4793,8 @@ class HonggouWidget(QWidget):
                 except Exception: pass
         except Exception as e:
             if not silent:
-                QMessageBox.warning(self, "Lỗi tải ảnh bìa", f"Không tải được ảnh bìa:\n{e}")
+                QMessageBox.warning(self, "Máy chủ đang bận",
+                                    "Máy chủ đang quá tải.\nVui lòng chờ 1-2 phút rồi thử lại nhé!")
             # silent mode: lỗi thì bỏ qua, không làm gián đoạn tiến trình tải phim
 
     def _bump_total_progress(self):
@@ -4724,12 +4824,7 @@ class HonggouWidget(QWidget):
                 "Thanh Niên Tự Tin [BV075_streaming]",
             ]
         self.cmb_dub_voice.addItems(voices)
-        # Thêm giọng Edge TTS (online, miễn phí) - đánh dấu 🌐 để phân biệt
-        # với giọng CapCut phía trên. voice_type lấy trong [] vẫn là
-        # "vi-VN-NamMinhNeural"/"vi-VN-HoaiMyNeural" -> DubThread tự nhận ra
-        # có chữ "Neural" và route sang gọi edge_tts.Communicate.
-        edge_items = [f"🌐 {label} [{vid}]" for label, (vid, _pitch, _rate) in EDGE_TTS_VOICES.items()]
-        self.cmb_dub_voice.addItems(edge_items)
+        # Đã bỏ giọng Edge TTS (🌐) theo yêu cầu — chỉ giữ giọng CapCut.
         for i in range(self.cmb_dub_voice.count()):
             if "BV074_streaming]" in self.cmb_dub_voice.itemText(i):
                 self.cmb_dub_voice.setCurrentIndex(i); break
@@ -6018,7 +6113,9 @@ class LoginScreen(QWidget):
                 self.settings.setValue("username", user); self.settings.setValue("password", pwd); self.settings.setValue("auth_token", data.get("token", "")) 
                 self.login_success.emit(user, data.get("expiry", "Vô thời hạn"), bool(data.get("vip_unlocked", False)))
             else: QMessageBox.critical(self, "Lỗi", data.get("message", "Đăng nhập thất bại"))
-        except Exception as e: QMessageBox.critical(self, "Lỗi mạng", f"Không thể kết nối đến Hệ thống:\n{e}")
+        except Exception:
+            QMessageBox.critical(self, "Máy chủ đang bận",
+                                 "Máy chủ đang quá tải.\nVui lòng chờ 1-2 phút rồi bấm Đăng Nhập lại nhé!")
         self.btn_login.setText("Đăng Nhập"); self.btn_login.setEnabled(True)
 
     def _handle_register(self):

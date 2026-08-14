@@ -207,11 +207,13 @@ class GeminiTranslateThread(QThread):
     item_failed = pyqtSignal(int, str)
     all_done = pyqtSignal()
     
-    def __init__(self, queue_items, prompt_preset_key, model_key, chunk_size=100, translate_workers=1, show_browser=False):
+    def __init__(self, queue_items, prompt_preset_key, model_key, chunk_size=100, translate_workers=1, show_browser=False, target_lang="vi"):
         super().__init__()
         self.queue_items = list(queue_items)
         self.preset_text = PROMPT_PRESETS.get(prompt_preset_key, list(PROMPT_PRESETS.values())[0])
         self.model_key = model_key
+        # Ngôn ngữ đích: 'vi' (mặc định) hoặc 'en'. Quyết định prompt dịch.
+        self.target_lang = (target_lang or "vi").lower()
         self.chunk_size = chunk_size
         self.translate_workers = max(1, min(4, int(translate_workers)))
         # Hiện trình duyệt Chrome khi dịch (để soi Gemini chạy) hay chạy ẩn.
@@ -565,7 +567,23 @@ class GeminiTranslateThread(QThread):
                 # ====================================================
                 # BẢN FIX: ÉP BUỘC AI PHẢI DÙNG TIẾNG VIỆT CÓ DẤU
                 # ====================================================
-                strict_rules = f"""QUY TẮC TUYỆT ĐỐI (VI PHẠM SẼ LỖI PHẦN MỀM):
+                if self.target_lang == "en":
+                    strict_rules = f"""ABSOLUTE RULES (BREAKING THEM CRASHES THE SOFTWARE):
+1. EACH source line is numbered [1], [2], [3]... You MUST return EXACTLY {len(lines_to_translate)} lines, each KEEPING its number at the start in the format: [number] English translation. Example: "[1] Hello". Translate every line from [1] to [{len(lines_to_translate)}], skip no number, do not merge two numbers into one line, even if two source lines are identical.
+2. NO explanations, NO greetings. NO markdown tags. RETURN ONLY the "[number] content" lines.
+3. TRANSLATE INTO NATURAL, FLUENT ENGLISH with correct spelling and grammar.
+4. TRANSLATE 100% CLEAN, leave NO Chinese/Han characters. Leave NO line blank - short interjections ("嗯","啊","哎") must still be translated ("Hmm","Ah","Oh"...).
+5. KEEP IT CONCISE SO THE TTS VOICE IS NOT RUSHED:
+   - Translate by MEANING, tight, natural enough to read aloud within the line duration - not too long, not clipped.
+   - Drop filler words when the sentence still sounds natural when READ ALOUD.
+   - Shorten EACH sentence individually, do NOT merge lines - keep the exact line count from rule 1.
+   - Lines must SOUND natural like movie dialogue, flowing, not stumbling.
+6. APPLY THE FOLLOWING CONTEXT, TONE AND FORMS OF ADDRESS TO THE TRANSLATION (do not change address forms midway):
+---
+{clean_ctx}
+---"""
+                else:
+                    strict_rules = f"""QUY TẮC TUYỆT ĐỐI (VI PHẠM SẼ LỖI PHẦN MỀM):
 1. MỖI dòng gốc có đánh số dạng [1], [2], [3]... BẮT BUỘC trả về ĐÚNG {len(lines_to_translate)} dòng, mỗi dòng GIỮ NGUYÊN số đó ở đầu theo định dạng: [số] bản dịch tiếng Việt. Ví dụ: "[1] Xin chào". Dịch đủ từ [1] đến [{len(lines_to_translate)}], không thiếu số nào, không gộp 2 số vào 1 dòng, kể cả khi 2 câu gốc giống hệt nhau.
 2. KHÔNG giải thích, KHÔNG CHÀO HỎI. KHÔNG dùng thẻ markdown. CHỈ TRẢ VỀ các dòng "[số] nội dung".
 3. BẮT BUỘC SỬ DỤNG TIẾNG VIỆT CÓ DẤU CHUẨN CHÍNH TẢ (Ví dụ: "Không", tuyệt đối không viết "Khong"). Đảm bảo giữ nguyên các dấu thanh của tiếng Việt.
@@ -580,7 +598,11 @@ class GeminiTranslateThread(QThread):
 {clean_ctx}
 ---"""
                 
-                final_prompt = f"{self.preset_text}\n\n{strict_rules}\n\nDịch {len(lines_to_translate)} dòng sau (giữ nguyên số [n] ở đầu mỗi dòng):\n{text_payload}"
+                if self.target_lang == "en":
+                    _ask = f"Translate the following {len(lines_to_translate)} lines into English (keep the [n] number at the start of each line):"
+                else:
+                    _ask = f"Dịch {len(lines_to_translate)} dòng sau (giữ nguyên số [n] ở đầu mỗi dòng):"
+                final_prompt = f"{self.preset_text}\n\n{strict_rules}\n\n{_ask}\n{text_payload}"
                 
                 if retry_count == 0:
                     if batch_size == len(chunk):
@@ -762,7 +784,8 @@ class GeminiTranslateThread(QThread):
             text_vi = translated_results.get(stt, b["text"])
             final_srt_content += f"{stt}\n{timecode}\n{text_vi}\n\n"
             
-        vi_path = os.path.splitext(srt_path)[0] + "_vi.srt"
+        _suf = "_en" if getattr(self, "target_lang", "vi") == "en" else "_vi"
+        vi_path = os.path.splitext(srt_path)[0] + _suf + ".srt"
         with open(vi_path, "w", encoding="utf-8") as f: 
             f.write(final_srt_content.strip() + "\n")
             
@@ -904,13 +927,15 @@ class DeepSeekTranslateThread(QThread):
     all_done = pyqtSignal()
 
     def __init__(self, queue_items, api_key, genre="Phụ đề phim",
-                 target_style="Tự nhiên, dễ nghe", full_series_mode=False):
+                 target_style="Tự nhiên, dễ nghe", full_series_mode=False,
+                 target_lang="vi"):
         super().__init__()
         self.queue_items = list(queue_items)
         self.api_key = api_key
         self.genre = genre
         self.target_style = target_style
         self.full_series_mode = full_series_mode
+        self.target_lang = (target_lang or "vi").lower()
         self._cancel = False
 
     def cancel(self):
@@ -953,7 +978,8 @@ class DeepSeekTranslateThread(QThread):
 
         for b in blocks:
             b.text = translated_results.get(b.idx, b.text)
-        vi_path = os.path.splitext(srt_path)[0] + "_vi.srt"
+        _suf = "_en" if getattr(self, "target_lang", "vi") == "en" else "_vi"
+        vi_path = os.path.splitext(srt_path)[0] + _suf + ".srt"
         with open(vi_path, "w", encoding="utf-8") as f:
             f.write(dst.rebuild_srt(blocks))
 

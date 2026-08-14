@@ -2231,10 +2231,22 @@ class RenderWidget(QWidget):
             QCheckBox::indicator:checked { background:#10B981; border:1px solid #10B981; }
         """)
 
+        # Helper: bọc 1 widget vào vùng cuộn dọc — để màn hình NHỎ / scale 125%
+        # không bị tràn, các mục đè lên nhau. Nội dung dài tự có thanh cuộn.
+        def _wrap_scroll(inner):
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            sc.setFrameShape(QFrame.Shape.NoFrame)
+            sc.setStyleSheet("QScrollArea { border:none; background:transparent; }")
+            sc.setWidget(inner)
+            return sc
+        self._wrap_scroll = _wrap_scroll
+
         main = QHBoxLayout(self); main.setContentsMargins(10, 10, 10, 10); main.setSpacing(10)
 
         # ---------- CỘT TRÁI: GRID GHÉP CẶP ----------
-        left = QFrame(); left.setMinimumWidth(300); left.setMaximumWidth(340)
+        left = QFrame(); left.setMinimumWidth(240); left.setMaximumWidth(340)
         left.setStyleSheet("background:#151821; border-radius:8px; border:1px solid #1F222D;")
         ll = QVBoxLayout(left); ll.setContentsMargins(10, 10, 10, 10)
         head_q = QHBoxLayout()
@@ -2316,7 +2328,7 @@ class RenderWidget(QWidget):
         main.addWidget(center, stretch=6)
 
         # ---------- CỘT PHẢI: DESIGN ----------
-        right = QFrame(); right.setMinimumWidth(320); right.setMaximumWidth(380)
+        right = QFrame(); right.setMinimumWidth(280); right.setMaximumWidth(380)
         right.setStyleSheet("background:#151821; border-radius:8px; border:1px solid #1F222D;")
         rl = QVBoxLayout(right); rl.setContentsMargins(5, 5, 5, 5)
 
@@ -2333,8 +2345,9 @@ class RenderWidget(QWidget):
         self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
         self.tab_design = QWidget()
         self.tab_thumb = QWidget()
-        self.tabs.addTab(self.tab_design, "🎨 Thiết kế")
-        self.tabs.addTab(self.tab_thumb, "🖼️ Thumbnail")
+        # Bọc trong vùng cuộn: màn nhỏ không còn tràn/đè các mục lên nhau.
+        self.tabs.addTab(self._wrap_scroll(self.tab_design), "🎨 Thiết kế")
+        self.tabs.addTab(self._wrap_scroll(self.tab_thumb), "🖼️ Thumbnail")
         # Tab con: Tách sub → Dịch → Lồng tiếng (tái dùng thread từ honggou_tab).
         # Import an toàn: thiếu module thì bỏ qua, không làm hỏng tab Render.
         try:
@@ -2531,6 +2544,9 @@ class RenderWidget(QWidget):
         self.txt_thumb_prompt = QPlainTextEdit()
         self.txt_thumb_prompt.setPlainText(_DEFAULT_THUMB_PROMPT)
         self.txt_thumb_prompt.setFixedHeight(120)
+        # Ngắt dòng theo bề rộng + tắt thanh cuộn ngang -> không bị tràn/thụt ngang
+        self.txt_thumb_prompt.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.txt_thumb_prompt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.txt_thumb_prompt.setStyleSheet(
             "QPlainTextEdit { background:#1B1D25; color:#E5E6E8; border:1px solid #3B3E4D; "
             "border-radius:6px; font-size:11px; padding:4px; }")
@@ -2545,30 +2561,31 @@ class RenderWidget(QWidget):
         r2.addWidget(QLabel("AI:", styleSheet="color:#8A8D98; border:none; font-size:11px;"))
         self.cmb_thumb_provider = QComboBox()
         self.cmb_thumb_provider.addItems(["ChatGPT", "Gemini"])
-        self.cmb_thumb_provider.setFixedWidth(100)
         self.cmb_thumb_provider.setStyleSheet(
             "QComboBox { background:#1B1D25; color:#ddd; border:1px solid #3B3E4D; border-radius:6px; padding:4px 8px; font-size:11px; }")
         self.cmb_thumb_provider.currentTextChanged.connect(self._on_provider_changed)
-        r2.addWidget(self.cmb_thumb_provider)
+        r2.addWidget(self.cmb_thumb_provider, 1)   # co giãn theo cột, không cứng 100px
         # ChatGPT là mặc định -> khoá ô số ảnh ngay từ đầu
         self.spin_thumb_n.setEnabled(False)
         self.spin_thumb_n.setValue(1)
+        v.addLayout(r2)
 
+        # Hàng riêng cho 2 nút -> không dồn chung 1 hàng gây tràn ngang
+        r2b = QHBoxLayout()
         self.btn_thumb_login = QPushButton("🔐 Đăng nhập ChatGPT")
         self.btn_thumb_login.setStyleSheet(
             "QPushButton { background:#22242E; color:#A78BFA; border:1px solid #3B3E4D; border-radius:6px; padding:6px 10px; font-size:11px; font-weight:bold; }"
             "QPushButton:hover { border-color:#7452FF; color:white; }")
         self.btn_thumb_login.clicked.connect(self._login_chatgpt)
-        r2.addWidget(self.btn_thumb_login)
+        r2b.addWidget(self.btn_thumb_login, 1)
 
-        r2.addStretch()
         self.btn_thumb_run = QPushButton("✨ Tạo Thumbnail")
         self.btn_thumb_run.setStyleSheet(
             "QPushButton { background:#7452FF; color:white; border-radius:6px; padding:7px 14px; font-weight:bold; border:none; }"
             "QPushButton:hover { background:#6035E0; }")
         self.btn_thumb_run.clicked.connect(self._start_thumbnail)
-        r2.addWidget(self.btn_thumb_run)
-        v.addLayout(r2)
+        r2b.addWidget(self.btn_thumb_run, 1)
+        v.addLayout(r2b)
 
         # Checkbox chọn khổ ảnh (ngang / dọc)
         r_orient = QHBoxLayout()

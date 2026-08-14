@@ -28,9 +28,14 @@ from PyQt6.QtCore import QThread, pyqtSignal
 try:
     from faster_whisper import WhisperModel
     _HAS_FW = True
-except Exception:
+    _FW_IMPORT_ERROR = ""
+except Exception as _e:
     WhisperModel = None
     _HAS_FW = False
+    # Lưu lỗi THẬT (thường là ctranslate2 thiếu DLL), không nuốt mất —
+    # để lúc chạy in ra biết đúng bệnh: thiếu thư viện hay thiếu DLL.
+    import traceback as _tb
+    _FW_IMPORT_ERROR = "".join(_tb.format_exception_only(type(_e), _e)).strip()
 
 # Map ngôn ngữ của app (zh-CN, en-US...) → mã Whisper (zh, en...)
 _LANG_MAP = {
@@ -165,7 +170,15 @@ class WhisperSttThread(QThread):
 
     def run(self):
         if not _HAS_FW:
-            self._log("❌ Chưa cài faster-whisper. Chạy:  pip install faster-whisper")
+            if _FW_IMPORT_ERROR:
+                # Thư viện CÓ trong gói nhưng import lỗi (hay gặp: ctranslate2
+                # thiếu DLL runtime). In lý do thật để sửa đúng chỗ.
+                self._log("❌ Whisper không dùng được — thư viện có nhưng nạp lỗi.")
+                self._log(f"   Lý do: {_FW_IMPORT_ERROR}")
+                self._log("   (Nếu là ctranslate2/DLL: thiếu Visual C++ Runtime "
+                          "hoặc build thiếu DLL — không phải chưa cài.)")
+            else:
+                self._log("❌ Chưa cài faster-whisper. Chạy:  pip install faster-whisper")
             self.finished_signal.emit(0, len(self.files))
             return
 

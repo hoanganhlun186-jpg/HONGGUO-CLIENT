@@ -77,32 +77,65 @@ except Exception as e:  # noqa
 CUSTOM_PROMPT_KEY = "✏️ Tự nhập prompt"
 
 
-def _load_dub_voices():
-    """Nạp danh sách giọng: Voice.json (CapCut) + Edge TTS. Giống hệt
-    honggou_tab._load_dub_voices nhưng đứng độc lập."""
+# Tiếng Anh: chỉ giữ đúng 4 giọng đã chọn (theo thứ tự hiển thị).
+_EN_VOICE_WHITELIST = [
+    "DiT_en_female_jessie",   # Jessie - nữ Mỹ truyền cảm
+    "en_us_007",              # Male Profess - nam chuyên nghiệp
+    "BV510_streaming",        # English - chuẩn
+    "BV029_streaming",        # American Female - nữ Mỹ
+]
+
+
+def _load_dub_voices(lang="vi"):
+    """Nạp danh sách giọng CapCut từ Voice.json theo NGÔN NGỮ.
+    lang='vi' -> tất cả giọng tiếng Việt;
+    lang='en' -> CHỈ 4 giọng Anh trong _EN_VOICE_WHITELIST."""
     import json
+    lang = (lang or "vi").lower()
     voices = []
     try:
         vpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Voice.json")
         with open(vpath, "r", encoding="utf-8") as f:
             data = json.load(f)
-        for v in data:
-            if v.get("lan") == "vi" or v.get("lang") == "vi-VN":
-                name = v.get("display_name") or v.get("voice_type")
-                vt = v.get("voice_type")
-                if vt:
+        if lang == "en":
+            # Lọc đúng 4 giọng, giữ nguyên thứ tự whitelist
+            by_vt = {v.get("voice_type"): v for v in data}
+            for vt in _EN_VOICE_WHITELIST:
+                v = by_vt.get(vt)
+                if v:
+                    name = v.get("display_name") or vt
                     voices.append(f"{name} [{vt}]")
+        else:
+            # Giọng Vbee Ngọc Huyền (đặt lên đầu). voice_type mang tiền tố
+            # "vbee:" để DubThread nhận ra và gọi API Vbee thay vì CapCut.
+            voices.append("🔊 Ngọc Huyền (Vbee) [vbee:hn_female_ngochuyen_full_48k-fhg]")
+            for v in data:
+                vlan = (v.get("lan") or "").lower()
+                vlang = (v.get("lang") or "").lower()
+                if vlan == lang or vlang.startswith(lang + "-"):
+                    name = v.get("display_name") or v.get("voice_type")
+                    vt = v.get("voice_type")
+                    if vt:
+                        voices.append(f"{name} [{vt}]")
     except Exception:
         pass
     if not voices:
-        voices = [
-            "Cô Gái Hoạt Ngôn [BV074_streaming]",
-            "Giọng Bé [BV074_streaming_dsp]",
-            "Nhỏ Ngọt Ngào [BV421_vivn_streaming]",
-            "Thanh Niên Tự Tin [BV075_streaming]",
-        ]
-    edge_items = [f"🌐 {label} [{vid}]" for label, (vid, _p, _r) in EDGE_TTS_VOICES.items()]
-    return voices + edge_items
+        if lang == "en":
+            voices = [
+                "Jessie [DiT_en_female_jessie]",
+                "Male Profess [en_us_007]",
+                "English [BV510_streaming]",
+                "American Female [BV029_streaming]",
+            ]
+        else:
+            voices = [
+                "Cô Gái Hoạt Ngôn [BV074_streaming]",
+                "Giọng Bé [BV074_streaming_dsp]",
+                "Nhỏ Ngọt Ngào [BV421_vivn_streaming]",
+                "Thanh Niên Tự Tin [BV075_streaming]",
+            ]
+    # Đã bỏ giọng Edge TTS (🌐) — chỉ giữ giọng CapCut.
+    return voices
 
 
 class DubFeatureWidget(QWidget):
@@ -294,7 +327,20 @@ class DubFeatureWidget(QWidget):
                              styleSheet="color:#64748b; font-size:9px; border:none;"))
 
         # ── 2) DỊCH ──────────────────────────────────────────────────
-        lay.addWidget(QLabel("② Dịch sang tiếng Việt", styleSheet="font-weight:bold; color:#10B981; border:none; margin-top:6px;"))
+        lay.addWidget(QLabel("② Dịch & Lồng tiếng", styleSheet="font-weight:bold; color:#10B981; border:none; margin-top:6px;"))
+
+        # Chọn ngôn ngữ đích: Việt (mặc định) hoặc Anh. Đổi cái này sẽ đổi luôn
+        # danh sách giọng lồng ở mục ③ cho khớp ngôn ngữ.
+        row_tgt = QHBoxLayout()
+        row_tgt.addWidget(_lbl("Ngôn ngữ đích:"))
+        self.cmb_target_lang = QComboBox()
+        self.cmb_target_lang.addItems(["🇻🇳 Tiếng Việt", "🇬🇧 Tiếng Anh"])
+        self._style_combo_popup(self.cmb_target_lang)
+        _saved_tgt = self.settings.value("target_lang", "vi")
+        self.cmb_target_lang.setCurrentIndex(1 if _saved_tgt == "en" else 0)
+        self.cmb_target_lang.currentIndexChanged.connect(self._on_target_lang_changed)
+        row_tgt.addWidget(self.cmb_target_lang, 1)
+        lay.addLayout(row_tgt)
 
         row_eng = QHBoxLayout()
         row_eng.addWidget(_lbl("Engine:"))
@@ -333,7 +379,8 @@ class DubFeatureWidget(QWidget):
         row_voice = QHBoxLayout()
         row_voice.addWidget(_lbl("Giọng:"))
         self.cmb_dub_voice = QComboBox()
-        self.cmb_dub_voice.addItems(_load_dub_voices())
+        _init_lang = "en" if self.settings.value("target_lang", "vi") == "en" else "vi"
+        self._populate_voice_combo(_init_lang)
         self._style_combo_popup(self.cmb_dub_voice)
         saved_voice = self.settings.value("dub_voice", "")
         if saved_voice:
@@ -347,6 +394,22 @@ class DubFeatureWidget(QWidget):
                     break
         row_voice.addWidget(self.cmb_dub_voice, 1)
         lay.addLayout(row_voice)
+
+        # ── Ô nhập Vbee (chỉ hiện khi chọn giọng Vbee) ──────────────
+        _vbee_style = ("QLineEdit { background:#11121A; border:1px solid #2D303D; "
+                       "padding:7px; color:white; border-radius:4px; font-weight:bold; }")
+        self.txt_vbee_appid = QLineEdit(self.settings.value("vbee_app_id", ""))
+        self.txt_vbee_appid.setPlaceholderText("Vbee app_id...")
+        self.txt_vbee_appid.setStyleSheet(_vbee_style)
+        lay.addWidget(self.txt_vbee_appid)
+        self.txt_vbee_token = QLineEdit(self.settings.value("vbee_token", ""))
+        self.txt_vbee_token.setPlaceholderText("Vbee token (Bearer)...")
+        self.txt_vbee_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.txt_vbee_token.setStyleSheet(_vbee_style)
+        lay.addWidget(self.txt_vbee_token)
+        # Ẩn/hiện theo giọng đang chọn; nối tín hiệu và gọi 1 lần cho trạng thái đầu
+        self.cmb_dub_voice.currentTextChanged.connect(self._on_dub_voice_changed)
+        self._on_dub_voice_changed(self.cmb_dub_voice.currentText())
 
         row_rate = QHBoxLayout()
         row_rate.addWidget(_lbl("Tốc độ:"))
@@ -484,6 +547,11 @@ class DubFeatureWidget(QWidget):
         s.setValue("trans_workers", self.spn_trans_workers.value())
         s.setValue("auto_dub", self.chk_auto_dub.isChecked())
         s.setValue("dub_voice", self.cmb_dub_voice.currentText())
+        if hasattr(self, "cmb_target_lang"):
+            s.setValue("target_lang", self._target_lang())
+        if hasattr(self, "txt_vbee_appid"):
+            s.setValue("vbee_app_id", self.txt_vbee_appid.text().strip())
+            s.setValue("vbee_token", self.txt_vbee_token.text().strip())
         s.setValue("dub_rate", self.spn_dub_rate.value())
         s.setValue("tts_workers", self.spn_tts_workers.value())
         s.setValue("mute_original", self.chk_mute_original.isChecked())
@@ -492,6 +560,51 @@ class DubFeatureWidget(QWidget):
         s.setValue("use_gpu", self.chk_use_gpu.isChecked())
         if hasattr(self, "chk_auto_render"):
             s.setValue("auto_render", self.chk_auto_render.isChecked())
+
+    def _target_lang(self):
+        """Mã ngôn ngữ đích đang chọn: 'vi' hoặc 'en'. Mặc định 'vi'."""
+        try:
+            return "en" if self.cmb_target_lang.currentIndex() == 1 else "vi"
+        except Exception:
+            return "vi"
+
+    def _target_lang_name(self):
+        """Tên đầy đủ cho prompt dịch: 'Vietnamese' / 'English'."""
+        return "English" if self._target_lang() == "en" else "Vietnamese"
+
+    def _populate_voice_combo(self, lang):
+        """Nạp danh sách giọng vào cmb_dub_voice theo ngôn ngữ, và TÔ MÀU:
+        giọng tiếng Anh -> chữ xanh dương + cờ 🇬🇧 để dễ nhận biết."""
+        from PyQt6.QtGui import QColor
+        self.cmb_dub_voice.clear()
+        items = _load_dub_voices(lang)
+        for txt in items:
+            if lang == "en":
+                self.cmb_dub_voice.addItem("🇬🇧 " + txt)
+                # tô chữ xanh dương cho item vừa thêm
+                idx = self.cmb_dub_voice.count() - 1
+                self.cmb_dub_voice.setItemData(
+                    idx, QColor("#38bdf8"), Qt.ItemDataRole.ForegroundRole)
+            else:
+                self.cmb_dub_voice.addItem(txt)
+
+    def _on_target_lang_changed(self, _idx):
+        """Đổi ngôn ngữ đích -> nạp lại danh sách giọng cho khớp (Việt/Anh)."""
+        lang = self._target_lang()
+        cur = self.cmb_dub_voice.currentText()
+        self._populate_voice_combo(lang)
+        # cố giữ lựa chọn cũ nếu vẫn còn trong danh sách mới
+        i = self.cmb_dub_voice.findText(cur)
+        if i >= 0:
+            self.cmb_dub_voice.setCurrentIndex(i)
+        self.settings.setValue("target_lang", lang)
+
+    def _on_dub_voice_changed(self, text):
+        """Chỉ hiện ô app_id/token Vbee khi giọng đang chọn là giọng Vbee."""
+        is_vbee = "[vbee:" in (text or "")
+        if hasattr(self, "txt_vbee_appid"):
+            self.txt_vbee_appid.setVisible(is_vbee)
+            self.txt_vbee_token.setVisible(is_vbee)
 
     def _on_engine_changed(self, text):
         self.txt_ds_key.setVisible(text.startswith("🚀"))
@@ -550,20 +663,25 @@ class DubFeatureWidget(QWidget):
             return stem[:-len("_dubbed")]
         return stem
 
+    def _tgt_suffix(self):
+        """Hậu tố file sub theo ngôn ngữ đích: '_vi' hoặc '_en'."""
+        return "_en" if self._target_lang() == "en" else "_vi"
+
     def _vi_srt_for(self, video_path):
-        """Đường dẫn sub tiếng Việt đích của 1 video."""
-        return self._orig_stem_for(video_path) + "_vi.srt"
+        """Đường dẫn sub ĐÍCH của 1 video (theo ngôn ngữ đang chọn: _vi hoặc _en).
+        Giữ tên hàm cũ để không phải đổi các chỗ gọi."""
+        return self._orig_stem_for(video_path) + self._tgt_suffix() + ".srt"
 
     def _find_existing_srt(self, video_path):
         """Tìm srt đang có cạnh video. Ưu tiên *_vi.srt, rồi tới *.srt.
         Trả về (path, lang) hoặc (None, None)."""
         base = self._orig_stem_for(video_path)
-        vi = base + "_vi.srt"
+        tgt = base + self._tgt_suffix() + ".srt"   # _vi.srt hoặc _en.srt
         raw = base + ".srt"
-        # Ưu tiên bản _vi.srt nếu nội dung đúng là tiếng Việt
-        if os.path.exists(vi):
-            lang = self._detect_srt_lang(vi)
-            return vi, lang
+        # Ưu tiên bản dịch đích (đúng ngôn ngữ đang chọn) nếu đã có
+        if os.path.exists(tgt):
+            lang = self._detect_srt_lang(tgt)
+            return tgt, lang
         if os.path.exists(raw):
             lang = self._detect_srt_lang(raw)
             return raw, lang
@@ -732,7 +850,7 @@ class DubFeatureWidget(QWidget):
             self._stop_card_poll()
 
     # ════════════════════════════════════════════════════════════════════
-    #  ② NÚT: CHỈ DỊCH  (nhận diện; Việt thì bỏ qua, còn lại dịch sang Việt)
+    #  ② NÚT: CHỈ DỊCH  (đã đúng ngôn ngữ đích thì bỏ qua; còn lại dịch sang đích)
     # ════════════════════════════════════════════════════════════════════
     def _run_only_translate(self):
         files = self._files_from_host()
@@ -750,18 +868,22 @@ class DubFeatureWidget(QWidget):
             if self._srt_is_empty(srt):
                 self._log(f"🔇 {os.path.basename(vp)}: tập không thoại — bỏ qua dịch.")
                 continue
-            if lang == "vi":
-                # Đã là tiếng Việt -> chỉ cần bảo đảm có bản _vi.srt
-                vi = self._vi_srt_for(vp)
-                if srt != vi:
+            tgt = self._target_lang()          # 'vi' hoặc 'en'
+            tgt_name = "tiếng Anh" if tgt == "en" else "tiếng Việt"
+            if lang == tgt:
+                # Sub đã đúng ngôn ngữ đích -> chỉ cần bảo đảm có bản _vi.srt/_en.srt
+                dst = self._vi_srt_for(vp)
+                if srt != dst:
                     try:
                         import shutil
-                        shutil.copyfile(srt, vi)
+                        shutil.copyfile(srt, dst)
                     except Exception:
                         pass
-                self._log(f"✅ {os.path.basename(vp)}: sub đã là tiếng Việt — bỏ qua dịch.")
+                self._log(f"✅ {os.path.basename(vp)}: sub đã là {tgt_name} — bỏ qua dịch.")
             else:
-                self._log(f"🌐 {os.path.basename(vp)}: sub {('tiếng Trung' if lang=='zh' else 'ngôn ngữ khác')} → sẽ dịch sang Việt.")
+                src_desc = ("tiếng Trung" if lang == "zh" else
+                            "tiếng Việt" if lang == "vi" else "ngôn ngữ khác")
+                self._log(f"🌐 {os.path.basename(vp)}: sub {src_desc} → sẽ dịch sang {tgt_name}.")
                 to_translate.append((vp, srt))
 
         if not to_translate:
@@ -809,7 +931,7 @@ class DubFeatureWidget(QWidget):
                 self._set_buttons_enabled(True)
                 return
             self._log("🚀 Dịch bằng DeepSeek...")
-            self._gtrans_thread = DeepSeekTranslateThread(queue, api_key=key, full_series_mode=False)
+            self._gtrans_thread = DeepSeekTranslateThread(queue, api_key=key, full_series_mode=False, target_lang=self._target_lang())
         else:
             if not _GEMINI_AVAILABLE or GeminiTranslateThread is None:
                 self._log("❌ Thiếu module dịch Gemini (translate_tab.py).")
@@ -832,10 +954,12 @@ class DubFeatureWidget(QWidget):
             if show_browser and workers > 1:
                 workers = 1
                 self._log("👁 Bật hiện trình duyệt → tạm 1 tập/lượt.")
-            self._log("🌐 Dịch bằng Gemini...")
+            _tgt = self._target_lang()
+            self._log(f"🌐 Dịch bằng Gemini sang {'tiếng Anh' if _tgt=='en' else 'tiếng Việt'}...")
             self._gtrans_thread = GeminiTranslateThread(
                 queue, preset, "Auto (Mặc định)", 80,
-                translate_workers=workers, show_browser=show_browser)
+                translate_workers=workers, show_browser=show_browser,
+                target_lang=_tgt)
 
         self._set_buttons_enabled(False)
         self._start_card_poll()
@@ -880,21 +1004,22 @@ class DubFeatureWidget(QWidget):
             if os.path.exists(vi):
                 ready.append(vp)
                 continue
-            # Chưa có _vi.srt: nếu có srt cạnh đó mà là tiếng Việt thì dùng luôn
+            # Chưa có sub đích: nếu có srt cạnh đó ĐÚNG ngôn ngữ đích thì dùng luôn
             srt, lang = self._find_existing_srt(vp)
-            if srt and lang == "vi":
+            if srt and lang == self._target_lang():
                 try:
                     import shutil
                     shutil.copyfile(srt, vi)
                     ready.append(vp)
                 except Exception:
-                    self._log(f"⏭ {os.path.basename(vp)}: không copy được sub Việt.")
+                    self._log(f"⏭ {os.path.basename(vp)}: không copy được sub.")
             else:
-                self._log(f"⏭ Bỏ qua (chưa có sub tiếng Việt): {os.path.basename(vp)}")
+                _tn = "tiếng Anh" if self._target_lang() == "en" else "tiếng Việt"
+                self._log(f"⏭ Bỏ qua (chưa có sub {_tn}): {os.path.basename(vp)}")
 
         if not ready:
-            QMessageBox.warning(self, "Không có sub Việt",
-                                "Không tập nào có sub tiếng Việt để lồng.\nHãy dịch trước.")
+            QMessageBox.warning(self, "Chưa có sub để lồng",
+                                f"Không tập nào có sub {'tiếng Anh' if self._target_lang()=='en' else 'tiếng Việt'} để lồng.\nHãy dịch trước.")
             return
         self._render_after_dub = False   # chạy riêng: lồng xong thì dừng
         self._dub_queue = list(ready)
@@ -932,11 +1057,14 @@ class DubFeatureWidget(QWidget):
         tts_workers = self.spn_tts_workers.value()
 
         self._log(f"🎙 Lồng tiếng: {os.path.basename(video_path)}...")
+        _vbee_appid = self.txt_vbee_appid.text().strip() if hasattr(self, "txt_vbee_appid") else ""
+        _vbee_token = self.txt_vbee_token.text().strip() if hasattr(self, "txt_vbee_token") else ""
         self._dub_thread = DubThread(
             [{"video": video_path, "srt": vi_srt}],
             voice_type=voice_type, rate=rate, pitch=pitch,
             mute_original=mute_orig, orig_volume=orig_vol,
-            remove_bgm=remove_bgm, use_gpu=use_gpu, tts_workers=tts_workers)
+            remove_bgm=remove_bgm, use_gpu=use_gpu, tts_workers=tts_workers,
+            vbee_app_id=_vbee_appid, vbee_token=_vbee_token)
         self._dub_thread.progress_signal.connect(lambda m: self._log(m.strip()))
 
         def _one_done(ok, failed):
@@ -1154,17 +1282,17 @@ class DubFeatureWidget(QWidget):
             if not os.path.exists(vi):
                 # Chưa có bản dịch -> tìm srt nguồn để dịch lại
                 srt, lang = self._find_existing_srt(vp)
-                if srt and lang != "vi":
+                if srt and lang != self._target_lang():
                     need_translate.append((vp, srt))
-                elif srt and lang == "vi" and srt != vi:
-                    # srt cạnh là tiếng Việt sẵn -> copy thành _vi.srt
+                elif srt and lang == self._target_lang() and srt != vi:
+                    # srt cạnh đã đúng ngôn ngữ đích -> copy thành sub đích (_vi/_en)
                     try:
                         import shutil
                         shutil.copyfile(srt, vi)
                         if self._auto_dub_on:
                             need_dub_only.append(vp)
                     except Exception:
-                        self._log(f"⏭ {os.path.basename(vp)}: không copy được sub Việt.")
+                        self._log(f"⏭ {os.path.basename(vp)}: không copy được sub.")
                 else:
                     self._log(f"⏭ {os.path.basename(vp)}: không có srt nguồn để dịch lại → bỏ.")
                     self._skip_from_render.add(vp)
@@ -1280,7 +1408,7 @@ class DubFeatureWidget(QWidget):
                     no_dialogue.append(vp)
                 else:
                     need_stt.append(vp)   # chuẩn bị fail -> thử tách lại
-            elif lang == "vi":
+            elif lang == self._target_lang():
                 vi = self._vi_srt_for(vp)
                 if srt != vi:
                     try:
@@ -1325,7 +1453,7 @@ class DubFeatureWidget(QWidget):
                         # Tách ra sub rỗng -> tập không thoại, giữ tiếng gốc
                         self._prepare_no_dialogue(vp, srt)
                         continue
-                    if lang == "vi":
+                    if lang == self._target_lang():
                         vi = self._vi_srt_for(vp)
                         if srt != vi:
                             try:
@@ -1515,7 +1643,13 @@ def attach_dub_tab(render_widget):
         if tabs is None:
             return None
         w = DubFeatureWidget(render_widget)
-        tabs.addTab(w, "🔤 Sub·Dịch·Lồng")
+        # Bọc trong vùng cuộn (nếu RenderWidget có helper) — để màn hình nhỏ /
+        # scale 125% không bị tràn, các mục đè lên nhau.
+        _wrap = getattr(render_widget, "_wrap_scroll", None)
+        if _wrap is not None:
+            tabs.addTab(_wrap(w), "🔤 Sub·Dịch·Lồng")
+        else:
+            tabs.addTab(w, "🔤 Sub·Dịch·Lồng")
         render_widget.dub_feature_tab = w
         return w
     except Exception as e:  # noqa

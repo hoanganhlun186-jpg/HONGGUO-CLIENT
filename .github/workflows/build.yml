@@ -47,6 +47,8 @@ jobs:
         --include-module=whisper_stt 
         --include-package=faster_whisper 
         --include-package=ctranslate2 
+        --include-package-data=ctranslate2 
+        --include-package-data=faster_whisper 
         --include-module=deepseek_translate 
         --include-module=shared_utils 
         --include-module=cenc_decrypt 
@@ -107,6 +109,13 @@ jobs:
 
         # Nén cả THƯ MỤC (bản portable, cho ai thích giải nén chạy tay)
         Compress-Archive -Path $pkg -DestinationPath "BoomStudio.zip" -Force
+
+    - name: Download VC++ Redistributable
+      shell: pwsh
+      run: |
+        # Máy khách mới cài Windows hay thiếu VC++ Runtime -> ctranslate2
+        # (faster-whisper) load DLL fail. Tải sẵn để installer cài kèm.
+        Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "vc_redist.x64.exe"
 
     - name: Build Installer (Inno Setup)
       shell: pwsh
