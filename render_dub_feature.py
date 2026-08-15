@@ -274,6 +274,7 @@ class DubFeatureWidget(QWidget):
         self._gemini_login_thread = None
         self._dub_queue = []
         self._dub_running = False
+        self._dub_threads = {}   # nhiều tập lồng song song: video_path -> thread
         self._auto_dub_on = False
         self._MAX_VERIFY_RETRY = 2        
         self._verify_round = 0            
@@ -550,10 +551,17 @@ class DubFeatureWidget(QWidget):
         row_rate.addWidget(self.spn_dub_rate)
         row_rate.addWidget(_lbl("Số luồng TTS:"))
         self.spn_tts_workers = QSpinBox()
-        self.spn_tts_workers.setRange(1, 8)
+        self.spn_tts_workers.setRange(1, 50)   # cho tăng cao (Pekka/Vbee cho phép)
         self.spn_tts_workers.setValue(int(self.settings.value("tts_workers", 4)))
         self._style_num(self.spn_tts_workers)
         row_rate.addWidget(self.spn_tts_workers)
+        # Số tập lồng SONG SONG cùng lúc (mỗi tập 1 thread riêng)
+        row_rate.addWidget(_lbl("Số tập cùng lúc:"))
+        self.spn_dub_parallel = QSpinBox()
+        self.spn_dub_parallel.setRange(1, 20)
+        self.spn_dub_parallel.setValue(int(self.settings.value("dub_parallel", 1)))
+        self._style_num(self.spn_dub_parallel)
+        row_rate.addWidget(self.spn_dub_parallel)
         row_rate.addStretch()
         lay.addLayout(row_rate)
 
@@ -814,6 +822,8 @@ class DubFeatureWidget(QWidget):
             s.setValue("pekka_api_key", self.txt_pekka_apikey.text().strip())
         s.setValue("dub_rate", self.spn_dub_rate.value())
         s.setValue("tts_workers", self.spn_tts_workers.value())
+        if hasattr(self, "spn_dub_parallel"):
+            s.setValue("dub_parallel", self.spn_dub_parallel.value())
         s.setValue("mute_original", self.chk_mute_original.isChecked())
         s.setValue("orig_volume", self.spn_orig_volume.value())
         s.setValue("remove_bgm", self.chk_remove_bgm.isChecked())
@@ -1405,15 +1415,25 @@ class DubFeatureWidget(QWidget):
         self._pump_dub_queue()
 
     def _pump_dub_queue(self):
-        if self._dub_running or not self._dub_queue:
-            return
-        video_path = self._dub_queue.pop(0)
-        vi_srt = self._vi_srt_for(video_path)
-        if not os.path.exists(vi_srt):
-            QTimer.singleShot(120, self._pump_dub_queue)
-            return
-        self._dub_running = True
+        # Chạy nhiều tập SONG SONG: giữ tối đa N thread lồng cùng lúc.
+        if not hasattr(self, "_dub_threads"):
+            self._dub_threads = {}   # video_path -> thread
+        parallel = self.spn_dub_parallel.value() if hasattr(self, "spn_dub_parallel") else 1
+        # Khởi động thêm tập cho tới khi đủ số song song hoặc hết hàng đợi
+        while self._dub_queue and len(self._dub_threads) < parallel:
+            video_path = self._dub_queue.pop(0)
+            vi_srt = self._vi_srt_for(video_path)
+            if not os.path.exists(vi_srt):
+                # sub chưa sẵn -> để lại cuối hàng, thử lại sau
+                self._dub_queue.append(video_path)
+                QTimer.singleShot(200, self._pump_dub_queue)
+                return
+            self._start_one_dub(video_path, vi_srt)
+        # Cập nhật cờ đang chạy
+        self._dub_running = len(self._dub_threads) > 0
 
+    def _start_one_dub(self, video_path, vi_srt):
+        """Khởi động 1 thread lồng cho 1 tập (chạy song song với các tập khác)."""
         sel = self._current_voice_value()
         voice_type = sel[sel.rfind("[") + 1:-1] if "[" in sel else "BV074_streaming"
         rate = f"{self.spn_dub_rate.value():.1f}"
@@ -1432,19 +1452,24 @@ class DubFeatureWidget(QWidget):
 
         self._log(f"🎙 Lồng tiếng: {os.path.basename(video_path)}...")
         _pekka_apikey = self.txt_pekka_apikey.text().strip() if hasattr(self, "txt_pekka_apikey") else ""
-        self._dub_thread = DubThread(
+        th = DubThread(
             [{"video": video_path, "srt": vi_srt}],
             voice_type=voice_type, rate=rate, pitch=pitch,
             mute_original=mute_orig, orig_volume=orig_vol,
             remove_bgm=remove_bgm, use_gpu=use_gpu, tts_workers=tts_workers,
             pekka_api_key=_pekka_apikey)
-        self._dub_thread.progress_signal.connect(lambda m: self._log(m.strip()))
+        th.progress_signal.connect(lambda m: self._log(m.strip()))
+        self._dub_threads[video_path] = th
 
-        def _one_done(ok, failed):
-            self._dub_running = False
+        def _one_done(ok, failed, _vp=video_path):
+            # Gỡ thread vừa xong khỏi danh sách đang chạy
+            self._dub_threads.pop(_vp, None)
+            # Còn tập trong hàng -> khởi động tiếp cho đủ số song song
             if self._dub_queue:
                 self._pump_dub_queue()
-            else:
+            # Hết cả hàng đợi lẫn thread đang chạy -> xong toàn bộ
+            if not self._dub_queue and not self._dub_threads:
+                self._dub_running = False
                 trans_running = (getattr(self, "_gtrans_thread", None) is not None
                                  and self._gtrans_thread.isRunning())
                 if not trans_running:
@@ -1455,9 +1480,9 @@ class DubFeatureWidget(QWidget):
                     if getattr(self, "_render_after_dub", False):
                         self._verify_before_render()
 
-        self._dub_thread.finished_signal.connect(_one_done)
-        self._keep_alive(self._dub_thread)
-        self._dub_thread.start()
+        th.finished_signal.connect(_one_done)
+        self._keep_alive(th)
+        th.start()
 
     def _run_only_render(self):
         self._refresh_host_cards()
