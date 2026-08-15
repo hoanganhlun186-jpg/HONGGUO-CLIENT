@@ -20,7 +20,7 @@ jobs:
     - name: Install Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install PyQt6 requests nuitka ordered-set zstandard pydub edge-tts srt pysrt playwright pycryptodome Pillow yt-dlp faster-whisper
+        pip install PyQt6 requests nuitka ordered-set zstandard pydub edge-tts srt pysrt playwright pycryptodome Pillow yt-dlp faster-whisper av tokenizers huggingface_hub onnxruntime
 
     - name: Set MSVC heap size
       shell: pwsh
@@ -47,8 +47,14 @@ jobs:
         --include-module=whisper_stt 
         --include-package=faster_whisper 
         --include-package=ctranslate2 
+        --include-package=av 
+        --include-package=tokenizers 
+        --include-package=huggingface_hub 
+        --include-package=onnxruntime 
+        --include-package-data=av 
         --include-package-data=ctranslate2 
         --include-package-data=faster_whisper 
+        --include-package-data=onnxruntime 
         --include-module=deepseek_translate 
         --include-module=shared_utils 
         --include-module=cenc_decrypt 

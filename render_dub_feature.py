@@ -1189,11 +1189,23 @@ class DubFeatureWidget(QWidget):
         if use_whisper:
             if not (WhisperSttThread and _WHISPER_AVAILABLE):
                 if _WHISPER_IMPORT_ERROR:
-                    # Thư viện CÓ trong gói nhưng nạp lỗi — thường thiếu
-                    # Visual C++ Runtime (ctranslate2) hoặc thiếu DLL.
+                    # Thư viện CÓ trong gói nhưng nạp lỗi.
                     self._log("❌ Whisper không dùng được — thư viện có sẵn nhưng nạp lỗi.")
                     self._log(f"   Lý do: {_WHISPER_IMPORT_ERROR}")
-                    self._try_install_vc_redist()
+                    _err_low = _WHISPER_IMPORT_ERROR.lower()
+                    _is_dll = ("dll" in _err_low or "ctranslate2" in _err_low
+                               or "runtime" in _err_low
+                               or "the specified module could not be found" in _err_low)
+                    if _is_dll:
+                        # Lỗi DLL/runtime → mời cài Visual C++ Runtime
+                        self._try_install_vc_redist()
+                    else:
+                        # Lỗi thiếu module (vd 'No module named av.utils') →
+                        # do build sót thư viện, cài VC++ vô ích. Báo rõ.
+                        self._log("   ➤ Đây là lỗi THIẾU THƯ VIỆN trong bản build, "
+                                  "không phải thiếu Visual C++ Runtime.")
+                        self._log("   ➤ Hãy CẬP NHẬT app lên bản mới nhất (bản đã "
+                                  "vá gồm đủ thư viện) rồi thử lại.")
                 else:
                     self._log("❌ Chưa cài faster-whisper. Mở CMD chạy:  "
                               "pip install faster-whisper  — rồi thử lại.")
