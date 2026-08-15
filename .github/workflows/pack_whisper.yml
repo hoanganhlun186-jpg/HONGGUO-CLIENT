@@ -1,0 +1,48 @@
+name: Đóng gói Whisper (chạy tay 1 lần)
+
+# Chạy TAY từ tab Actions (không tự động). Mục đích: dùng đúng Python 3.11 của
+# GitHub để tải các thư viện Whisper (faster-whisper, av, onnxruntime,
+# ctranslate2, tokenizers) và nén thành whisper_pack.zip. Tải file zip đó về
+# rồi up lên Google Drive, lấy link cho whisper_stt.py.
+
+on:
+  workflow_dispatch:   # nút "Run workflow" bấm tay
+
+jobs:
+  pack:
+    runs-on: windows-latest
+    steps:
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Tải thư viện Whisper vào thư mục whisper_libs
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          # --target: cài vào 1 thư mục riêng (portable), không cần Python trên máy khách
+          python -m pip install faster-whisper av onnxruntime ctranslate2 tokenizers huggingface_hub --target whisper_libs
+
+      - name: Dọn bớt file thừa cho nhẹ gói
+        shell: pwsh
+        run: |
+          # Xóa __pycache__ và thông tin metadata để giảm dung lượng
+          Get-ChildItem -Path whisper_libs -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -Path whisper_libs -Recurse -Directory -Filter "*.dist-info" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Nén thành whisper_pack.zip
+        shell: pwsh
+        run: |
+          # Nén NỘI DUNG bên trong whisper_libs (để giải nén ra thấy ngay
+          # faster_whisper/, av/... đúng như whisper_stt.py mong đợi)
+          Compress-Archive -Path "whisper_libs\*" -DestinationPath "whisper_pack.zip" -Force
+          $size = (Get-Item "whisper_pack.zip").Length / 1MB
+          Write-Host ("whisper_pack.zip: {0:N1} MB" -f $size)
+
+      - name: Đưa file zip lên Artifacts để tải về
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper_pack
+          path: whisper_pack.zip
+          retention-days: 7
