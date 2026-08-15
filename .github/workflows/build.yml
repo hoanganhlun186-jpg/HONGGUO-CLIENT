@@ -31,6 +31,7 @@ jobs:
       # chống lỗi cú pháp xuống dòng của PowerShell
       run: >
         python -m nuitka --standalone --windows-disable-console 
+        --python-flag=no_asserts 
         --enable-plugin=pyqt6 
         --include-package=capcut_tts_api 
         --include-package=Crypto 
@@ -46,15 +47,16 @@ jobs:
         --include-module=render_dub_feature 
         --include-module=whisper_stt 
         --include-package=faster_whisper 
-        --include-package=ctranslate2 
-        --include-package=av 
-        --include-package=tokenizers 
         --include-package=huggingface_hub 
-        --include-package=onnxruntime 
-        --include-package-data=av 
-        --include-package-data=ctranslate2 
         --include-package-data=faster_whisper 
+        --include-package-data=ctranslate2 
+        --include-package-data=av 
+        --include-package-data=tokenizers 
         --include-package-data=onnxruntime 
+        --nofollow-import-to=ctranslate2 
+        --nofollow-import-to=av 
+        --nofollow-import-to=tokenizers 
+        --nofollow-import-to=onnxruntime 
         --include-module=deepseek_translate 
         --include-module=shared_utils 
         --include-module=cenc_decrypt 
