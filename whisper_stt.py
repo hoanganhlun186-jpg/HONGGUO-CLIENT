@@ -20,22 +20,81 @@
     # GPU (tùy chọn, nhanh hơn nhiều): cần CUDA 12 + cuDNN 9
 ═══════════════════════════════════════════════════════════
 """
-import os, traceback
+import os, traceback, sys, zipfile, urllib.request
 from PyQt6.QtCore import QThread, pyqtSignal
 
-# faster-whisper import mềm — thiếu thì báo lỗi rõ ràng lúc chạy,
-# không làm sập cả app khi mới mở.
-try:
-    from faster_whisper import WhisperModel
-    _HAS_FW = True
-    _FW_IMPORT_ERROR = ""
-except Exception as _e:
-    WhisperModel = None
-    _HAS_FW = False
-    # Lưu lỗi THẬT (thường là ctranslate2 thiếu DLL), không nuốt mất —
-    # để lúc chạy in ra biết đúng bệnh: thiếu thư viện hay thiếu DLL.
-    import traceback as _tb
-    _FW_IMPORT_ERROR = "".join(_tb.format_exception_only(type(_e), _e)).strip()
+# ═══════════════════════════════════════════════════════════════════
+#  GÓI WHISPER TẢI RIÊNG (không nhồi vào build .exe để tránh Nuitka crash)
+#  Thư viện faster-whisper + av + ctranslate2 + onnxruntime được đóng gói
+#  sẵn thành 1 file zip, up lên Google Drive. Khách bấm Whisper lần đầu
+#  -> tự tải về, giải nén vào thư mục app, rồi import.
+# ═══════════════════════════════════════════════════════════════════
+# ⚠️ ĐỔI link này thành link tải TRỰC TIẾP của bạn trên Google Drive.
+#    Cách lấy link trực tiếp: up file whisper_pack.zip lên Drive -> chia sẻ
+#    "Bất kỳ ai có liên kết" -> lấy FILE_ID -> dùng dạng:
+#    https://drive.google.com/uc?export=download&id=FILE_ID
+WHISPER_PACK_URL = "https://drive.usercontent.google.com/download?id=1GFaQDQR10nzd5cLl5ZH4qT6I7bgEGyB0&export=download&confirm=t"
+
+def _whisper_libs_dir():
+    """Thư mục chứa thư viện Whisper đã giải nén (cạnh app)."""
+    base = os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, "frozen", False) else __file__))
+    return os.path.join(base, "whisper_libs")
+
+def _try_import_fw():
+    """Thử import faster_whisper. Trả về (WhisperModel, error_str)."""
+    try:
+        from faster_whisper import WhisperModel
+        return WhisperModel, ""
+    except Exception as e:
+        import traceback as _tb
+        return None, "".join(_tb.format_exception_only(type(e), e)).strip()
+
+def download_whisper_pack(progress=None):
+    """Tải gói whisper_pack.zip từ Drive về + giải nén. Trả về True nếu OK.
+    progress: hàm nhận chuỗi để báo tiến độ (tùy chọn)."""
+    def _log(m):
+        if progress:
+            progress(m)
+    libs = _whisper_libs_dir()
+    zip_path = os.path.join(os.path.dirname(libs), "whisper_pack.zip")
+    try:
+        _log("⏳ Đang tải gói Whisper (~100MB), lần đầu hơi lâu...")
+
+        req = urllib.request.Request(WHISPER_PACK_URL,
+              headers={"User-Agent": "Mozilla/5.0"})
+        downloaded = 0
+        with urllib.request.urlopen(req) as resp, open(zip_path, "wb") as f:
+            while True:
+                chunk = resp.read(512 * 1024)  # 512KB
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                _log(f"⏳ Đang tải... {downloaded // 1_000_000} MB")
+
+        _log("📦 Đang giải nén gói Whisper...")
+        os.makedirs(libs, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(libs)
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
+        _log("✅ Đã cài xong gói Whisper!")
+        return True
+    except Exception as e:
+        _log(f"❌ Tải gói Whisper lỗi: {str(e)[:120]}")
+        return False
+
+# faster-whisper import mềm. Nếu thiếu, thử thêm thư mục whisper_libs (đã tải
+# từ Drive) vào sys.path rồi import lại.
+WhisperModel, _FW_IMPORT_ERROR = _try_import_fw()
+if WhisperModel is None:
+    _libs = _whisper_libs_dir()
+    if os.path.isdir(_libs) and _libs not in sys.path:
+        sys.path.insert(0, _libs)
+        WhisperModel, _FW_IMPORT_ERROR = _try_import_fw()
+_HAS_FW = WhisperModel is not None
 
 # Map ngôn ngữ của app (zh-CN, en-US...) → mã Whisper (zh, en...)
 _LANG_MAP = {
@@ -66,48 +125,19 @@ def _pick_device():
     return "cpu", "int8"
 
 
-def _load_model_cpu(model_name, progress=None):
-    """Tạo model chạy CPU (int8) — an toàn, không cần cuDNN."""
-    key = (model_name, "cpu", "int8")
-    if key in _MODEL_CACHE:
-        return _MODEL_CACHE[key], "cpu"
-    if progress:
-        progress(f"⏳ Nạp model Whisper '{model_name}' (cpu, int8)... "
-                 f"(lần đầu sẽ tải model về máy, hãy đợi)")
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
-    _MODEL_CACHE[key] = model
-    return model, "cpu"
-
-
 def _get_model(model_name, progress=None):
     """Nạp (hoặc lấy từ cache) WhisperModel. Lần đầu sẽ TẢI model về máy
-    (~small 480MB / medium 1.5GB / large-v3 3GB) rồi lưu lại dùng mãi.
-
-    Ưu tiên GPU (cuda) nếu máy có; nếu tạo model GPU lỗi (thường do THIẾU
-    cuDNN 9 — máy có card NVIDIA nhưng chưa cài cuDNN) thì TỰ LÙI VỀ CPU
-    để vẫn chạy được, không crash."""
+    (~small 480MB / medium 1.5GB / large-v3 3GB) rồi lưu lại dùng mãi."""
     device, compute = _pick_device()
-
-    # Máy không có GPU → CPU luôn
-    if device != "cuda":
-        return _load_model_cpu(model_name, progress)
-
-    # Có GPU → thử tạo model GPU
     key = (model_name, device, compute)
     if key in _MODEL_CACHE:
         return _MODEL_CACHE[key], device
     if progress:
         progress(f"⏳ Nạp model Whisper '{model_name}' ({device}, {compute})... "
                  f"(lần đầu sẽ tải model về máy, hãy đợi)")
-    try:
-        model = WhisperModel(model_name, device=device, compute_type=compute)
-        _MODEL_CACHE[key] = model
-        return model, device
-    except Exception as e:
-        # GPU lỗi (hay gặp: thiếu cuDNN 9) → lùi về CPU
-        if progress:
-            progress(f"⚠️ GPU không dùng được ({str(e)[:80]}), tự chuyển sang CPU...")
-        return _load_model_cpu(model_name, progress)
+    model = WhisperModel(model_name, device=device, compute_type=compute)
+    _MODEL_CACHE[key] = model
+    return model, device
 
 
 def _fmt_ts(seconds):
@@ -140,19 +170,6 @@ def _write_srt(segments, srt_path):
     return n
 
 
-def _do_transcribe(model, video_path, lang):
-    """Chạy transcribe + duyệt hết segments (materialize) để lỗi runtime
-    của GPU/cuDNN bùng ra NGAY tại đây, không phải lúc ghi file."""
-    segments, info = model.transcribe(
-        video_path,
-        language=lang,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
-        beam_size=5,
-    )
-    return list(segments)   # ép chạy ngay (generator vốn lazy)
-
-
 def transcribe_one(video_path, model_name="small", src_lang="zh",
                    progress=None):
     """Tách phụ đề 1 video → ghi <base>.srt cạnh video.
@@ -164,26 +181,19 @@ def transcribe_one(video_path, model_name="small", src_lang="zh",
         progress(f"🎧 [{device}] Đang nghe: {name}")
 
     # vad_filter=True → dùng Silero VAD tự lọc đoạn không có giọng người
-    # (nhạc nền, tiếng động), nên KHÔNG bị cắt nhầm giữa câu.
-    try:
-        seg_list = _do_transcribe(model, video_path, lang)
-    except Exception as e:
-        # Nếu đang chạy GPU và lỗi lúc chạy thật (thường thiếu cuDNN) →
-        # bỏ model GPU khỏi cache, tạo lại bằng CPU rồi chạy lại 1 lần.
-        if device == "cuda":
-            if progress:
-                progress(f"⚠️ GPU lỗi khi chạy ({str(e)[:80]}), chuyển sang CPU và thử lại...")
-            _MODEL_CACHE.pop((model_name, "cuda", "float16"), None)
-            model, device = _load_model_cpu(model_name, progress)
-            if progress:
-                progress(f"🎧 [{device}] Đang nghe lại: {name}")
-            seg_list = _do_transcribe(model, video_path, lang)
-        else:
-            raise
+    # (nhạc nền, tiếng động), nên KHÔNG bị cắt nhầm giữa câu. Đây chính là
+    # cái CapCut/silencedetect không làm được với drama có nhạc nền.
+    segments, info = model.transcribe(
+        video_path,
+        language=lang,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
+        beam_size=5,
+    )
 
     base, _ext = os.path.splitext(video_path)
     srt_path = base + ".srt"
-    n = _write_srt(seg_list, srt_path)
+    n = _write_srt(segments, srt_path)
     if progress:
         if n == 0:
             progress(f"🔇 {name}: không phát hiện thoại (tập không lời).")
@@ -218,18 +228,26 @@ class WhisperSttThread(QThread):
         self.progress_signal.emit(msg)
 
     def run(self):
+        global WhisperModel, _HAS_FW, _FW_IMPORT_ERROR
         if not _HAS_FW:
-            if _FW_IMPORT_ERROR:
-                # Thư viện CÓ trong gói nhưng import lỗi (hay gặp: ctranslate2
-                # thiếu DLL runtime). In lý do thật để sửa đúng chỗ.
-                self._log("❌ Whisper không dùng được — thư viện có nhưng nạp lỗi.")
-                self._log(f"   Lý do: {_FW_IMPORT_ERROR}")
-                self._log("   (Nếu là ctranslate2/DLL: thiếu Visual C++ Runtime "
-                          "hoặc build thiếu DLL — không phải chưa cài.)")
-            else:
-                self._log("❌ Chưa cài faster-whisper. Chạy:  pip install faster-whisper")
-            self.finished_signal.emit(0, len(self.files))
-            return
+            # Chưa có thư viện Whisper -> TỰ TẢI gói từ Google Drive rồi thử lại.
+            self._log("⚙️ Whisper chưa sẵn sàng — đang tự tải bộ thư viện Whisper...")
+            ok_dl = download_whisper_pack(progress=lambda m: self._log(m))
+            if ok_dl:
+                # Thêm thư mục vừa giải nén vào path và import lại
+                _libs = _whisper_libs_dir()
+                if _libs not in sys.path:
+                    sys.path.insert(0, _libs)
+                WhisperModel, _FW_IMPORT_ERROR = _try_import_fw()
+                _HAS_FW = WhisperModel is not None
+            if not _HAS_FW:
+                self._log("❌ Vẫn chưa dùng được Whisper sau khi tải.")
+                if _FW_IMPORT_ERROR:
+                    self._log(f"   Lý do: {_FW_IMPORT_ERROR}")
+                self._log("   ➤ Kiểm tra mạng, hoặc báo admin cập nhật link gói Whisper.")
+                self.finished_signal.emit(0, len(self.files))
+                return
+            self._log("✅ Whisper đã sẵn sàng, bắt đầu tách sub...")
 
         ok = failed = 0
         total = len(self.files)
@@ -251,3 +269,23 @@ class WhisperSttThread(QThread):
                 self._log(f"❌ Lỗi {os.path.basename(vp)}: {e}")
                 self._log(traceback.format_exc(limit=2))
         self.finished_signal.emit(ok, failed)
+
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("TEST TẢI WHISPER PACK TỪ GOOGLE DRIVE")
+    print("=" * 50)
+    ok = download_whisper_pack(progress=lambda m: print(m))
+    if ok:
+        print("\n✅ Tải và giải nén thành công!")
+        # Thêm vào path và thử import
+        _libs = _whisper_libs_dir()
+        if _libs not in sys.path:
+            sys.path.insert(0, _libs)
+        model, err = _try_import_fw()
+        if model:
+            print("✅ Import faster_whisper thành công!")
+        else:
+            print(f"❌ Import thất bại: {err}")
+    else:
+        print("\n❌ Tải thất bại!")
