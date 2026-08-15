@@ -40,6 +40,11 @@ jobs:
         --include-package=pydub 
         --include-package=yt_dlp 
         --nofollow-import-to=yt_dlp.extractor.lazy_extractors
+        --nofollow-import-to=faster_whisper
+        --nofollow-import-to=ctranslate2
+        --nofollow-import-to=av
+        --nofollow-import-to=onnxruntime
+        --nofollow-import-to=tokenizers
         --jobs=1
         --include-module=capcut_widget 
         --include-module=translate_tab 
