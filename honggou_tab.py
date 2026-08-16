@@ -303,7 +303,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.61"
+APP_VERSION = "1.0.62"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -1979,10 +1979,18 @@ class DubThread(QThread):
                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=_flags)
                                 audio_seg = AudioSegment.from_file(wav_path, format="wav")
                             cur = len(audio_seg)
+                            # CHỐNG ÉP CHỮ: câu đọc dài hơn ô SRT thì tua nhanh
+                            # lại cho khớp, NHƯNG chỉ tối đa 1.3× (trước là 1.5×).
+                            # Khách đã có thể tự tăng tốc độ đọc (rate) bên TTS,
+                            # nên tua thêm quá nhiều ở đây làm giọng bị dí/méo.
+                            # Câu nào vượt 1.3× thì chỉ tua tới 1.3× rồi để tràn
+                            # nhẹ sang khoảng lặng dòng sau (nghe tự nhiên hơn ép kịch).
+                            MAX_SPEEDUP = 1.3
                             if cur > target_dur and target_dur > 0:
-                                factor = min(cur/target_dur, 1.5)
-                                try: audio_seg = speedup(audio_seg, playback_speed=factor)
-                                except Exception: pass
+                                factor = min(cur/target_dur, MAX_SPEEDUP)
+                                if factor > 1.01:
+                                    try: audio_seg = speedup(audio_seg, playback_speed=factor)
+                                    except Exception: pass
                             elif cur < target_dur:
                                 audio_seg += AudioSegment.silent(duration=target_dur-cur)
                             return (i, start_ms, audio_seg)  

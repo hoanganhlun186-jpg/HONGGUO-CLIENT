@@ -184,6 +184,41 @@ class GoogleManualLoginThread(QThread):
 
 _TIMESTAMP_LINE_RE = re.compile(r'^\d{1,2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{3}$')
 
+# Bộ ký tự có dấu của tiếng Việt (nguyên âm mang thanh + đ). Dùng để phát
+# hiện Gemini "lười" trả về tiếng Việt KHÔNG DẤU (vd "toi di hoc" thay vì
+# "tôi đi học"). Khi tỉ lệ chữ có dấu quá thấp -> ép dịch lại.
+_VN_DIACRITIC_CHARS = set(
+    "àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợ"
+    "ùúủũụưừứửữựỳýỷỹỵđ"
+    "ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ"
+    "ÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ"
+)
+
+def _diacritic_ratio(text):
+    """Tỉ lệ chữ cái có dấu / tổng chữ cái Latin. 0.0 nếu không có chữ Latin."""
+    latin = 0
+    accented = 0
+    for ch in text:
+        if ch in _VN_DIACRITIC_CHARS:
+            latin += 1
+            accented += 1
+        elif ('a' <= ch <= 'z') or ('A' <= ch <= 'Z'):
+            latin += 1
+    if latin == 0:
+        return 0.0
+    return accented / latin
+
+def _looks_unaccented_vi(text, min_letters=40, threshold=0.03):
+    """Đoán 'text' có phải tiếng Việt bị mất dấu không. Chỉ xét khi đủ dài
+    (min_letters) và tỉ lệ chữ có dấu dưới ngưỡng (threshold) - tránh báo
+    nhầm câu ngắn hoặc câu toàn tên riêng/số."""
+    letters = sum(1 for ch in text
+                  if ('a' <= ch <= 'z') or ('A' <= ch <= 'Z')
+                  or ch in _VN_DIACRITIC_CHARS)
+    if letters < min_letters:
+        return False
+    return _diacritic_ratio(text) < threshold
+
 def _count_real_lines(text):
     """Đếm số dòng THẬT (không tính rác Gemini hay tự chèn thêm: số thứ tự
     trần trụi, dòng timestamp tự bịa). Dùng chung cho cả bước chờ Gemini
@@ -549,6 +584,9 @@ class GeminiTranslateThread(QThread):
             max_retries = 5
             retry_count = 0
             progressive_steps = 0
+            # Bật khi lần dịch trước bị MẤT DẤU -> lần sau bơm thêm câu nhắc
+            # mạnh vào prompt để Gemini chú ý viết tiếng Việt CÓ DẤU.
+            force_accent_reminder = False
             
             # SỬ DỤNG batch_size CHIA LƯỢNG GỬI (TRÁNH LỖI OUT OF RANGE)
             batch_size = len(chunk_to_translate)
@@ -603,6 +641,15 @@ class GeminiTranslateThread(QThread):
                 else:
                     _ask = f"Dịch {len(lines_to_translate)} dòng sau (giữ nguyên số [n] ở đầu mỗi dòng):"
                 final_prompt = f"{self.preset_text}\n\n{strict_rules}\n\n{_ask}\n{text_payload}"
+                # Nếu lần trước bị mất dấu -> chèn cảnh báo mạnh lên ĐẦU prompt
+                if force_accent_reminder and self.target_lang != "en":
+                    final_prompt = (
+                        "‼️ LƯU Ý CỰC KỲ QUAN TRỌNG: Bản dịch trước của bạn bị "
+                        "MẤT DẤU tiếng Việt (viết 'toi di hoc' thay vì 'tôi đi học'). "
+                        "LẦN NÀY BẮT BUỘC viết tiếng Việt CÓ DẤU ĐẦY ĐỦ, đúng chính "
+                        "tả từng chữ. Đây là lỗi nghiêm trọng nhất, tuyệt đối không "
+                        "lặp lại.\n\n"
+                    ) + final_prompt
                 
                 if retry_count == 0:
                     if batch_size == len(chunk):
@@ -720,7 +767,27 @@ class GeminiTranslateThread(QThread):
                     retry_count += 1
                     time.sleep(2)
                     continue
-                    
+
+                # ── KIỂM TRA MẤT DẤU: Gemini lâu lâu trả tiếng Việt KHÔNG DẤU
+                # ("toi di hoc" thay vì "tôi đi học"). Chỉ áp dụng khi dịch
+                # sang tiếng Việt (target_lang != 'en'). Nếu cả khối gần như
+                # không có dấu -> vứt, ép dịch lại (giống xử lý sót chữ Hán).
+                if self.target_lang != "en" and _looks_unaccented_vi(joined_temp):
+                    ratio = _diacritic_ratio(joined_temp)
+                    self.log.emit(f"⚠️ CẢNH BÁO: Khối {i+1} bị MẤT DẤU tiếng Việt "
+                                  f"(tỉ lệ chữ có dấu {ratio*100:.1f}%). Ép AI dịch lại!\n")
+                    force_accent_reminder = True   # lần sau bơm nhắc mạnh vào prompt
+                    # Nhắc thẳng vào prompt lần sau để AI chú ý bỏ dấu
+                    if retry_count >= 2 and batch_size > 20:
+                        half = max(1, batch_size // 2)
+                        self.log.emit(f"✂️ Tự động chia nhỏ: {batch_size} câu → {half} câu...\n")
+                        batch_size = half
+                    try: page.goto("about:blank"); page.wait_for_timeout(200)
+                    except Exception: pass
+                    retry_count += 1
+                    time.sleep(2)
+                    continue
+
                 # FIX 2: Xử lý lệch Timeline dựa trên batch_size và current_batch
                 if len(temp_lines) < len(current_batch):
                     self.log.emit(f"⚠️ AI dịch thiếu ({len(temp_lines)}/{len(current_batch)} dòng). Chắc chắn AI đã bỏ sót câu ở giữa!\n")

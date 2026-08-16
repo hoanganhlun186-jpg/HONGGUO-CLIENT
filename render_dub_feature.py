@@ -119,6 +119,41 @@ def _load_dub_voices(lang="vi", source="capcut"):
 # --------------------------------------------------------------------------- #
 # LUỒNG TẢI DANH SÁCH GIỌNG PEKKA (API)                                       #
 # --------------------------------------------------------------------------- #
+class PekkaUsageWorker(QThread):
+    """Kiểm tra API key Pekka: gọi GET /api/v1/usage lấy hạn mức còn lại.
+    done -> dict {plan, creditBalance, creditsExpireAt, creditsPerMonth}."""
+    done = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, api_key):
+        super().__init__()
+        self.api_key = api_key
+
+    def run(self):
+        import requests
+        key = (self.api_key or "").strip()
+        if not key:
+            self.error.emit("Chưa nhập API Key.")
+            return
+        try:
+            headers = {"Authorization": f"Bearer {key}"}
+            r = requests.get(
+                "https://voice.getpekka.com/api/v1/usage",
+                headers=headers,
+                timeout=20,
+            )
+            if r.status_code in (401, 403):
+                self.error.emit(f"Key sai hoặc đã hết hạn (HTTP {r.status_code}).")
+                return
+            if r.status_code != 200:
+                self.error.emit(f"HTTP {r.status_code}: {r.text[:120]}")
+                return
+            data = r.json()
+            self.done.emit(data if isinstance(data, dict) else {})
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class PekkaVoicesWorker(QThread):
     done = pyqtSignal(list)
     error = pyqtSignal(str)
@@ -383,6 +418,15 @@ class DubFeatureWidget(QWidget):
         lay.addWidget(self.btn_gemini)
         self._refresh_gemini_btn()
 
+        # ── Nút kiểm tra hạn mức API Pekka (lồng tiếng) ──────────────────
+        self.btn_check_pekka = QPushButton("🔍 Check API Pekka (lồng tiếng)")
+        self.btn_check_pekka.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_check_pekka.clicked.connect(self._check_pekka_api)
+        self.btn_check_pekka.setStyleSheet(
+            "QPushButton { background:#0EA5E9; color:white; padding:7px; border-radius:6px; font-weight:bold; border:none; }"
+            "QPushButton:hover { background:#0284C7; }")
+        lay.addWidget(self.btn_check_pekka)
+
         lay.addWidget(QLabel("① Tách phụ đề (STT)", styleSheet="font-weight:bold; color:#10B981; border:none;"))
         row_src = QHBoxLayout()
         row_src.addWidget(_lbl("Ngôn ngữ gốc:"))
@@ -642,6 +686,78 @@ class DubFeatureWidget(QWidget):
         root.addWidget(self.txt_log)
 
         self._on_engine_changed(self.cb_translate_engine.currentText())
+
+    def _pekka_key(self):
+        """Lấy Pekka API key: ưu tiên ô nhập (nếu đã tạo), fallback settings."""
+        if hasattr(self, "txt_pekka_apikey"):
+            k = self.txt_pekka_apikey.text().strip()
+            if k:
+                return k
+        return (self.settings.value("pekka_api_key", "") or "").strip()
+
+    def _check_pekka_api(self):
+        """Bấm nút Check API Pekka -> gọi /api/v1/usage, hiện hạn mức còn lại."""
+        api_key = self._pekka_key()
+        if not api_key:
+            QMessageBox.warning(self, "Chưa có API Key",
+                                "Vui lòng nhập Pekka API Key trước (mục nguồn giọng "
+                                "'Pekka - API trả phí'), rồi bấm Check lại.")
+            return
+        self.btn_check_pekka.setEnabled(False)
+        self.btn_check_pekka.setText("⏳ Đang kiểm tra...")
+        self._pekka_usage_worker = PekkaUsageWorker(api_key)
+        self._pekka_usage_worker.done.connect(self._on_pekka_usage)
+        self._pekka_usage_worker.error.connect(self._on_pekka_usage_error)
+        self._pekka_usage_worker.start()
+
+    def _on_pekka_usage(self, data):
+        self.btn_check_pekka.setEnabled(True)
+        self.btn_check_pekka.setText("🔍 Check API Pekka (lồng tiếng)")
+
+        plan = str(data.get("plan", "?"))
+        bal = data.get("creditBalance")
+        per_month = data.get("creditsPerMonth")
+        expire = data.get("creditsExpireAt", "")
+
+        def _fmt(n):
+            try: return f"{int(n):,}".replace(",", ".")
+            except Exception: return str(n)
+
+        # Rút gọn ngày hết hạn: '2026-08-16T00:00:00.000Z' -> '2026-08-16'
+        expire_short = expire.split("T")[0] if isinstance(expire, str) and "T" in expire else str(expire)
+
+        lines = ["✅ API Key HỢP LỆ.", ""]
+        lines.append(f"• Gói: {plan}")
+        if bal is not None:
+            lines.append(f"• Số dư credits: {_fmt(bal)}")
+        if per_month is not None:
+            lines.append(f"• Hạn mức/tháng: {_fmt(per_month)}")
+        if expire_short:
+            lines.append(f"• Credits hết hạn: {expire_short}")
+        msg = "\n".join(lines)
+
+        # Log ra panel + popup cho khách thấy rõ
+        try: self._log("🔍 Pekka: " + msg.replace("\n", "  "))
+        except Exception: pass
+
+        # Cảnh báo nếu sắp hết credit
+        try:
+            if bal is not None and int(bal) <= 0:
+                QMessageBox.warning(self, "Hết credits Pekka",
+                                    msg + "\n\n⚠️ Số dư đã hết, không lồng tiếng được.")
+                return
+        except Exception:
+            pass
+        QMessageBox.information(self, "Check API Pekka", msg)
+
+    def _on_pekka_usage_error(self, err_msg):
+        self.btn_check_pekka.setEnabled(True)
+        self.btn_check_pekka.setText("🔍 Check API Pekka (lồng tiếng)")
+        try: self._log(f"❌ Check API Pekka lỗi: {err_msg}")
+        except Exception: pass
+        QMessageBox.critical(self, "API Key KHÔNG dùng được",
+                             f"Không kiểm tra được API Pekka:\n\n{err_msg}\n\n"
+                             "➤ Kiểm tra lại API Key hoặc kết nối mạng.")
 
     def _fetch_pekka_voices(self):
         """Xử lý sự kiện bấm nút Tải danh sách giọng Pekka"""
@@ -1197,28 +1313,13 @@ class DubFeatureWidget(QWidget):
 
         use_whisper = self.cmb_stt_engine.currentText().startswith("💻")
         if use_whisper:
-            if not (WhisperSttThread and _WHISPER_AVAILABLE):
-                if _WHISPER_IMPORT_ERROR:
-                    # Thư viện CÓ trong gói nhưng nạp lỗi.
-                    self._log("❌ Whisper không dùng được — thư viện có sẵn nhưng nạp lỗi.")
-                    self._log(f"   Lý do: {_WHISPER_IMPORT_ERROR}")
-                    _err_low = _WHISPER_IMPORT_ERROR.lower()
-                    _is_dll = ("dll" in _err_low or "ctranslate2" in _err_low
-                               or "runtime" in _err_low
-                               or "the specified module could not be found" in _err_low)
-                    if _is_dll:
-                        # Lỗi DLL/runtime → mời cài Visual C++ Runtime
-                        self._try_install_vc_redist()
-                    else:
-                        # Lỗi thiếu module (vd 'No module named av.utils') →
-                        # do build sót thư viện, cài VC++ vô ích. Báo rõ.
-                        self._log("   ➤ Đây là lỗi THIẾU THƯ VIỆN trong bản build, "
-                                  "không phải thiếu Visual C++ Runtime.")
-                        self._log("   ➤ Hãy CẬP NHẬT app lên bản mới nhất (bản đã "
-                                  "vá gồm đủ thư viện) rồi thử lại.")
-                else:
-                    self._log("❌ Chưa cài faster-whisper. Mở CMD chạy:  "
-                              "pip install faster-whisper  — rồi thử lại.")
+            # Chỉ cần class tồn tại là cho chạy. WhisperSttThread.run() tự lo
+            # kiểm tra thư viện, TỰ TẢI gói whisper_libs từ Drive rồi import lại.
+            # KHÔNG chặn theo _WHISPER_AVAILABLE (biến đó đóng băng lúc khởi động
+            # app, khi pack chưa tải — dựa vào nó sẽ chặn nhầm mãi mãi).
+            if WhisperSttThread is None:
+                self._log("❌ Không nạp được module whisper_stt (thiếu file trong build).")
+                self._log("   ➤ Kiểm tra whisper_stt.py có được đóng gói vào app không.")
                 self._set_buttons_enabled(True)
                 self._stop_card_poll()
                 return
