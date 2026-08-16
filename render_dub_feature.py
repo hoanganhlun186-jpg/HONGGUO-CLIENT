@@ -19,7 +19,7 @@ except Exception:
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
     QCheckBox, QSpinBox, QDoubleSpinBox, QTextEdit, QMessageBox, QLineEdit,
-    QScrollArea, QFrame, QDialog, QListView
+    QScrollArea, QFrame, QDialog, QListView, QProgressBar
 )
 from PyQt6.QtCore import Qt, QSettings, QTimer, QThread, pyqtSignal
 
@@ -677,6 +677,29 @@ class DubFeatureWidget(QWidget):
         row_fix.addWidget(self.btn_fix_bad)
         root.addLayout(row_fix)
 
+        # ── Thanh tiến trình: Tách sub (mẻ) + Lồng tiếng (từng tập) ──
+        def _mk_prog(caption):
+            wrap = QVBoxLayout(); wrap.setSpacing(2)
+            lbl = QLabel(caption)
+            lbl.setStyleSheet("color:#8A8D98; font-size:10px; border:none;")
+            bar = QProgressBar(); bar.setRange(0, 100); bar.setValue(0)
+            bar.setFixedHeight(14); bar.setTextVisible(True); bar.setFormat("%p%")
+            bar.setStyleSheet(
+                "QProgressBar { background:#2D303D; border:none; border-radius:3px; "
+                "color:#E5E7EB; font-size:9px; text-align:center; } "
+                "QProgressBar::chunk { background:#10B981; border-radius:3px; }")
+            wrap.addWidget(lbl); wrap.addWidget(bar)
+            return wrap, lbl, bar
+
+        _w1, self.lbl_stt_prog, self.bar_stt = _mk_prog("① Tách sub")
+        _w2, self.lbl_dub_prog, self.bar_dub = _mk_prog("③ Lồng tiếng")
+        root.addLayout(_w1)
+        root.addLayout(_w2)
+        # Trạng thái đếm tập lồng tiếng
+        self._dub_total_eps = 0
+        self._dub_done_eps = 0
+        self._dub_cur_path = None
+
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.document().setMaximumBlockCount(500)
@@ -898,6 +921,16 @@ class DubFeatureWidget(QWidget):
     def _log(self, msg):
         self.txt_log.append(msg)
         self.txt_log.verticalScrollBar().setValue(self.txt_log.verticalScrollBar().maximum())
+
+    def _total_step(self, n=1, stage=""):
+        """Đẩy n 'việc' đã xong vào thanh TỔNG trên host (nếu đang bật)."""
+        if not getattr(self, "_total_on", False):
+            return
+        try:
+            if hasattr(self.host, "total_progress_step"):
+                self.host.total_progress_step(n, stage=stage)
+        except Exception:
+            pass
 
     def _keep_alive(self, th):
         if not hasattr(self, "_threads_alive"):
@@ -1337,11 +1370,30 @@ class DubFeatureWidget(QWidget):
                                               use_trans=False, stt_workers=3)
 
         self._stt_thread.progress_signal.connect(self._log)
+        if hasattr(self._stt_thread, "pct_signal"):
+            self.bar_stt.setValue(0)
+            self.lbl_stt_prog.setText(f"① Tách sub · 0/{len(files)}")
+            self._stt_total = len(files)
+            self._stt_done_prev = 0
+            self._stt_thread.pct_signal.connect(self._on_stt_pct)
         self._stt_thread.finished_signal.connect(self._on_stt_finished)
         self._keep_alive(self._stt_thread)
         self._stt_thread.start()
 
+    def _on_stt_pct(self, pct):
+        self.bar_stt.setValue(int(pct))
+        total = getattr(self, "_stt_total", 0)
+        if total:
+            done = round(pct / 100 * total)
+            self.lbl_stt_prog.setText(f"① Tách sub · {done}/{total}")
+            # Đẩy phần chênh lệch số file xong vào thanh TỔNG
+            prev = getattr(self, "_stt_done_prev", 0)
+            if done > prev:
+                self._total_step(done - prev, stage="Tách sub")
+                self._stt_done_prev = done
+
     def _on_stt_finished(self, ok, failed):
+        self.bar_stt.setValue(100)
         self._log(f"✅ Tách sub xong: {ok} ok, {failed} lỗi.")
         self._set_buttons_enabled(True)
         chain = getattr(self, "_chain_after_stt", None)
@@ -1398,6 +1450,7 @@ class DubFeatureWidget(QWidget):
         self._dub_running = False
 
         def _on_item_done(idx, video_path, vi_path):
+            self._total_step(1, stage="Dịch")
             if getattr(self, "_chain_dub_after_translate", False) and vi_path and os.path.exists(vi_path):
                 self._log(f"✅ Dịch xong {os.path.basename(video_path)} → xếp hàng lồng tiếng.")
                 self._dub_queue.append(video_path)
@@ -1470,6 +1523,16 @@ class DubFeatureWidget(QWidget):
             self._set_buttons_enabled(True)
             self._stop_card_poll()
             self._log("🎉 Hoàn tất bước dịch.")
+            if getattr(self, "_total_on", False):
+                try:
+                    if hasattr(self.host, "total_progress_end"):
+                        self.host.total_progress_end()
+                    if hasattr(self.host, "lbl_big_prog"):
+                        self.host.big_render_prog.setValue(100)
+                        self.host.lbl_big_prog.setText("Tiến độ tổng · XONG ✅")
+                except Exception:
+                    pass
+                self._total_on = False
             return
         if not self._dub_queue and not self._dub_running:
             self._set_buttons_enabled(True)
@@ -1510,6 +1573,9 @@ class DubFeatureWidget(QWidget):
         self._render_after_dub = False
         self._dub_queue = list(ready)
         self._dub_running = False
+        self._dub_done_eps = 0
+        self.bar_dub.setValue(0)
+        self.lbl_dub_prog.setText(f"③ Lồng tiếng · 0/{len(ready)} tập")
         self._set_buttons_enabled(False)
         self._start_card_poll()
         self._log(f"③ Lồng tiếng {len(ready)} tập...")
@@ -1532,6 +1598,26 @@ class DubFeatureWidget(QWidget):
             self._start_one_dub(video_path, vi_srt)
         # Cập nhật cờ đang chạy
         self._dub_running = len(self._dub_threads) > 0
+
+    def _dub_counts(self):
+        """(done, total) hiện thời cho hàng đợi lồng tiếng."""
+        running = len(getattr(self, "_dub_threads", {}) or {})
+        queued = len(getattr(self, "_dub_queue", []) or [])
+        done = getattr(self, "_dub_done_eps", 0)
+        total = done + running + queued
+        return done, max(total, done)
+
+    def _on_dub_pct(self, video_path, pct):
+        # Thanh hiện % của tập đang lồng (nếu chạy song song nhiều tập, hiện tập
+        # báo tiến trình gần nhất — vẫn là % thật của 1 tập cụ thể).
+        self._dub_cur_path = video_path
+        self.bar_dub.setValue(int(pct))
+        done, total = self._dub_counts()
+        name = os.path.basename(video_path)
+        if total:
+            self.lbl_dub_prog.setText(f"③ Lồng tiếng · {done}/{total} tập · {name} ({int(pct)}%)")
+        else:
+            self.lbl_dub_prog.setText(f"③ Lồng tiếng · {name} ({int(pct)}%)")
 
     def _start_one_dub(self, video_path, vi_srt):
         """Khởi động 1 thread lồng cho 1 tập (chạy song song với các tập khác)."""
@@ -1560,11 +1646,17 @@ class DubFeatureWidget(QWidget):
             remove_bgm=remove_bgm, use_gpu=use_gpu, tts_workers=tts_workers,
             pekka_api_key=_pekka_apikey)
         th.progress_signal.connect(lambda m: self._log(m.strip()))
+        if hasattr(th, "pct_signal"):
+            th.pct_signal.connect(self._on_dub_pct)
         self._dub_threads[video_path] = th
 
         def _one_done(ok, failed, _vp=video_path):
             # Gỡ thread vừa xong khỏi danh sách đang chạy
             self._dub_threads.pop(_vp, None)
+            self._dub_done_eps = getattr(self, "_dub_done_eps", 0) + 1
+            self._total_step(1, stage="Lồng tiếng")
+            done, total = self._dub_counts()
+            self.lbl_dub_prog.setText(f"③ Lồng tiếng · {done}/{total} tập")
             # Còn tập trong hàng -> khởi động tiếp cho đủ số song song
             if self._dub_queue:
                 self._pump_dub_queue()
@@ -1580,6 +1672,17 @@ class DubFeatureWidget(QWidget):
                     self._stop_card_poll()
                     if getattr(self, "_render_after_dub", False):
                         self._verify_before_render()
+                    elif getattr(self, "_total_on", False):
+                        # Không render tiếp → chốt thanh tổng ở đây
+                        try:
+                            if hasattr(self.host, "total_progress_end"):
+                                self.host.total_progress_end()
+                            if hasattr(self.host, "lbl_big_prog"):
+                                self.host.big_render_prog.setValue(100)
+                                self.host.lbl_big_prog.setText("Tiến độ tổng · XONG ✅")
+                        except Exception:
+                            pass
+                        self._total_on = False
 
         th.finished_signal.connect(_one_done)
         self._keep_alive(th)
@@ -1871,10 +1974,32 @@ class DubFeatureWidget(QWidget):
             self._render_after_dub = (self._auto_dub_on and self.chk_auto_render.isChecked())
         self._dub_queue = []
         self._dub_running = False
+        self._dub_done_eps = 0
+        self.bar_dub.setValue(0)
+        self.lbl_dub_prog.setText("③ Lồng tiếng")
 
         if self._auto_dub_on:
             for vp in ready_vi:
                 self._dub_queue.append(vp)
+
+        # ── Khởi động THANH TỔNG trên host (Tách→Dịch→Lồng→Render) ──
+        # Tổng "việc" = số lần STT + số lần dịch + (lồng mỗi tập) + (render mỗi tập)
+        n_all = len(files)
+        units = len(need_stt) + len(need_translate)
+        if self._auto_dub_on:
+            units += n_all                    # lồng: mỗi tập 1 việc
+        if self._render_after_dub:
+            units += n_all                    # render: mỗi tập 1 việc
+        self._host = self.host
+        try:
+            if hasattr(self.host, "total_progress_begin") and units > 0:
+                # n_steps=1 vì ta truyền thẳng tổng số 'việc' qua n_files=units
+                self.host.total_progress_begin(units, 1)
+                self._total_on = True
+            else:
+                self._total_on = False
+        except Exception:
+            self._total_on = False
 
         self._full_need_translate = list(need_translate)
         self._full_ready_vi = list(ready_vi)

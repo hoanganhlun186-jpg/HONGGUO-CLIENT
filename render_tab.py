@@ -1367,17 +1367,36 @@ _DEFAULT_THUMB_PROMPT = (
     "viền rõ, chữ lớn dễ đọc, không che mặt nhân vật.\n"
     "Giữ ĐÚNG chữ 'PHIM MỚI' và 'TRỌN BỘ', KHÔNG đổi thành PHIM HAY/PHIM HOT/FULL "
     "PHIM/XEM NGAY. KHÔNG bỏ 2 badge này.\n\n"
-    "TIÊU ĐỀ (nếu hợp): tự tạo 1 câu 2–7 từ, mạnh, ngắn, gây tò mò, liên quan trực "
-    "tiếp nội dung, IN HOA dễ đọc (kiểu 'HẮN ĐÃ TRỞ LẠI!', 'KẺ PHẢN BỘI LỘ DIỆN', "
-    "'CÔ ẤY ĐÃ TRẢ THÙ'). KHÔNG lấy nguyên câu thoại dài. Nếu hình đã đủ mạnh thì "
-    "không cần thêm chữ, tránh quá nhiều chữ. KHÔNG để chữ che mặt.\n\n"
+    "TIÊU ĐỀ GIẬT TÍT — BẮT BUỘC CÓ, KHÔNG ĐƯỢC BỎ, IN THẲNG LÊN ẢNH: Tự sáng tạo "
+    "1 câu tiêu đề giật tít kiểu drama Trung Quốc, IN HOA, chữ TO ĐẬM chiếm 2–3 "
+    "dòng ở phần dưới hoặc vùng trống lớn của ảnh (kiểu chữ hiệu ứng vàng gradient / "
+    "viền phát sáng / đổ bóng dày, nổi bật như poster phim, KHÔNG che mặt nhân vật). "
+    "Câu tiêu đề BẮT BUỘC áp dụng 1 trong 4 CÔNG THỨC sau, chọn công thức hợp nội "
+    "dung nhất:\n"
+    "• Công thức Vả mặt: [Kẻ phản diện] khinh thường [Nhân vật chính] và CÁI KẾT "
+    "rùng mình...\n"
+    "• Công thức Bí mật: Sự thật tàn nhẫn đằng sau [Hành động gây sốc / Vụ việc] của "
+    "[Nhân vật]...\n"
+    "• Công thức Giấu nghề: Chủ tịch giả vờ làm [Nghề bần hèn] thử lòng vợ và cú lật "
+    "kèo...\n"
+    "• Công thức Kích thích tò mò: Nhìn thì tưởng [Bình thường] nhưng sự thật lại "
+    "khiến tất cả câm nín...\n"
+    "Điền nội dung phim vào chỗ [...] cho khớp cao trào. Câu tiêu đề là THÀNH PHẦN "
+    "BẮT BUỘC ngang hàng 2 badge — thiếu coi như ảnh LỖI. Dùng tiếng Việt CÓ DẤU "
+    "đầy đủ, đúng chính tả.\n\n"
     "HIỆU ỨNG chỉ dùng khi hợp nội dung (khói/lửa/tia sáng/sấm sét/bụi/mưa/năng "
     "lượng/neon/lens flare/cinematic glow/depth of field), KHÔNG lạm dụng. Màu theo "
     "thể loại (hành động: tương phản mạnh; giang hồ: tối lạnh; thần bài: vàng/đỏ/"
     "neon; tình cảm: sáng mềm; fantasy: huyền ảo; trả thù: tối tương phản cao).\n\n"
     "MỤC TIÊU: nhìn là biết phim, thấy cao trào, muốn click, nhỏ vẫn rõ, nhận ra "
     "cùng 1 kênh. Kết quả NGẦU — ĐIỆN ẢNH — KỊCH TÍNH — SẮC NÉT — CHUYÊN NGHIỆP. "
-    "CHỈ tạo 1 ảnh duy nhất, tỉ lệ 16:9 ngang (1536x1024)."
+    "CHỈ tạo 1 ảnh duy nhất, tỉ lệ 16:9 ngang (1536x1024).\n\n"
+    "QUY TRÌNH XUẤT (BẮT BUỘC — KHÔNG HỎI LẠI, KHÔNG GIẢI THÍCH DÀI DÒNG, KHÔNG ĐƯA "
+    "NHIỀU LỰA CHỌN): Khi nhận SRT, in ra câu TIÊU ĐỀ GIẬT TÍT (theo 1 trong 4 công "
+    "thức) TRƯỚC, rồi lập tức vẽ 1 ảnh 16:9 duy nhất có đủ 3 cụm chữ: 'PHIM MỚI' "
+    "(góc trên trái + icon loa), 'TRỌN BỘ' (góc trên phải, ruy-băng 3D), và ĐÚNG câu "
+    "tiêu đề vừa tạo (in hoa, to đậm, hiệu ứng nổi bật, đặt phần dưới, không che "
+    "mặt). Bắt buộc có câu tiêu đề trong ảnh. Chỉ 1 ảnh duy nhất."
 )
 
 
@@ -1404,6 +1423,25 @@ class MergeRenderedThread(QThread):
             m = re.search(r"Stream.*Video.*?(\d{3,5})x(\d{3,5})", r.stderr)
             if m:
                 return int(m.group(1)), int(m.group(2))
+        except Exception:
+            pass
+        return None
+
+    def _probe_fps(self, ffmpeg, filepath):
+        """Trả về fps (float, làm tròn 3 số) của video, hoặc None nếu không đọc được.
+        FPS lệch giữa các tập (VD tập 25fps, tập 30fps) là nguyên nhân gây ĐỨNG
+        HÌNH ở tập giữa khi gộp bằng -c copy — phải phát hiện để ép re-encode."""
+        try:
+            si = subprocess.STARTUPINFO() if os.name == "nt" else None
+            if si: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            r = subprocess.run(
+                [ffmpeg, "-i", filepath],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                startupinfo=si, text=True, encoding="utf-8", errors="replace"
+            )
+            m = re.search(r"Stream.*Video.*?([\d.]+)\s*fps", r.stderr)
+            if m:
+                return round(float(m.group(1)), 3)
         except Exception:
             pass
         return None
@@ -1493,30 +1531,44 @@ class MergeRenderedThread(QThread):
         ffmpeg = get_ffmpeg_path()
         import tempfile, time, subprocess
 
-        # ── 1. Phát hiện resolution không đồng nhất ─────────────────────────
+        # ── 1. Phát hiện resolution VÀ fps không đồng nhất ──────────────────
         resolutions = []
+        fps_list = []
         for fp in self.file_list:
-            res = self._probe_resolution(ffmpeg, fp)
-            resolutions.append(res)
+            resolutions.append(self._probe_resolution(ffmpeg, fp))
+            fps_list.append(self._probe_fps(ffmpeg, fp))
 
         unique_res = set(r for r in resolutions if r is not None)
-        mixed = len(unique_res) > 1
+        unique_fps = set(f for f in fps_list if f is not None)
+        mixed_res = len(unique_res) > 1
+        mixed_fps = len(unique_fps) > 1
+        mixed = mixed_res or mixed_fps   # lệch 1 trong 2 -> buộc re-encode
+
+        # FPS đích: nếu lệch, lấy fps cao nhất làm chuẩn (mượt nhất, không mất frame)
+        target_fps = max(unique_fps) if unique_fps else None
 
         if mixed:
-            res_list = ", ".join(f"{w}×{h}" for w, h in resolutions if (w, h) in unique_res)
-            self.log.emit(
-                f"⚠️ Phát hiện resolution KHÔNG đồng nhất: {res_list}\n"
-                f"   → Bắt buộc re-encode để cố định kích thước và timestamp.\n"
-                f"   (Dùng -c copy sẽ gây Access Violation khi swscale gặp frame đổi kích thước)\n\n"
-            )
-            # Chọn resolution lớn nhất (theo diện tích) làm chuẩn
-            target_w, target_h = max(unique_res, key=lambda wh: wh[0] * wh[1])
-            # Đảm bảo chia hết cho 2 (yêu cầu của H.264)
+            if mixed_res:
+                res_list = ", ".join(f"{w}×{h}" for w, h in resolutions if (w, h) in unique_res)
+                self.log.emit(f"⚠️ Resolution KHÔNG đồng nhất: {res_list}\n")
+            if mixed_fps:
+                fps_txt = ", ".join(f"{f:g}fps" for f in sorted(unique_fps))
+                self.log.emit(
+                    f"⚠️ FPS KHÔNG đồng nhất giữa các tập: {fps_txt}\n"
+                    f"   (Đây là lý do gộp bằng -c copy bị ĐỨNG HÌNH ở tập giữa)\n"
+                )
+            self.log.emit("   → Bắt buộc re-encode để chuẩn hóa kích thước, fps và timestamp.\n\n")
+            # Resolution đích: lớn nhất theo diện tích (nếu chỉ lệch fps thì res đồng nhất)
+            if unique_res:
+                target_w, target_h = max(unique_res, key=lambda wh: wh[0] * wh[1])
+            else:
+                target_w, target_h = 1920, 1080
             target_w = (target_w // 2) * 2
             target_h = (target_h // 2) * 2
-            self.log.emit(f"   🎯 Resolution đích: {target_w}×{target_h}\n\n")
+            self.log.emit(f"   🎯 Đích: {target_w}×{target_h}"
+                          + (f" @ {target_fps:g}fps\n\n" if target_fps else "\n\n"))
         else:
-            self.log.emit(f"🔗 Bắt đầu gộp {len(self.file_list)} file (resolution đồng nhất, không đổi âm thanh)...\n")
+            self.log.emit(f"🔗 Bắt đầu gộp {len(self.file_list)} file (đồng nhất, không đổi âm thanh)...\n")
 
         list_txt = os.path.join(tempfile.gettempdir(), f"concat_list_{int(time.time())}.txt")
         try:
@@ -1535,8 +1587,10 @@ class MergeRenderedThread(QThread):
                 vf = (
                     f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                     f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
-                    f"setsar=1,fps=fps=source_fps"
+                    f"setsar=1"
                 )
+                if target_fps:
+                    vf += f",fps={target_fps:g}"   # CHUẨN HÓA fps chung -> hết đứng hình
                 merge_codec = get_optimal_ffmpeg_codec()
                 _fb = get_codec_fallback_reason()
                 if _fb:
@@ -1624,14 +1678,54 @@ class MergeRenderedThread(QThread):
                 try: os.remove(list_txt)
                 except: pass
 
+def _probe_duration_sec(video_path):
+    """Đọc tổng thời lượng (giây) của video bằng ffmpeg -i. Trả 0 nếu không đọc được."""
+    try:
+        ffmpeg_bin = get_ffmpeg_path()
+        p = subprocess.run([ffmpeg_bin, "-i", video_path], stderr=subprocess.PIPE,
+                           text=True, errors="ignore",
+                           creationflags=CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", p.stderr)
+        if m:
+            h, mi, s = m.group(1), m.group(2), m.group(3)
+            return float(h) * 3600 + float(mi) * 60 + float(s)
+    except Exception:
+        pass
+    return 0.0
+
+
 class SingleRenderThread(QThread):
     log = pyqtSignal(str); done = pyqtSignal(bool)
+    progress = pyqtSignal(int)   # % thật của tập đang render (0..100)
     def __init__(self, vp, vi_srt_path, tts_path, out_path, render_cfg):
         super().__init__(); self.vp = vp; self.sp = vi_srt_path; self.tts_path = tts_path; self.op = out_path; self.cfg = render_cfg; self._cancel = False
+        self._total_dur = 0.0
     def cancel(self): self._cancel = True
+
+    def _emit_progress_from_line(self, line, last_pct):
+        """Từ 1 dòng ffmpeg (out_time_ms=... hoặc time=HH:MM:SS), tính % và phát signal.
+        Trả về pct mới (để không phát trùng). Cần self._total_dur > 0."""
+        if self._total_dur <= 0:
+            return last_pct
+        cur = None
+        m = re.search(r"out_time_ms=(\d+)", line)
+        if m:
+            cur = int(m.group(1)) / 1_000_000.0
+        else:
+            m = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
+            if m:
+                cur = float(m.group(1)) * 3600 + float(m.group(2)) * 60 + float(m.group(3))
+        if cur is None:
+            return last_pct
+        pct = int(max(0, min(99, cur / self._total_dur * 100)))
+        if pct != last_pct:
+            self.progress.emit(pct)
+        return pct
     
     def run(self):
         start_t = time.time() 
+        self.progress.emit(0)
+        self._total_dur = _probe_duration_sec(self.vp)
         self.log.emit(f"🎬 Bắt đầu Render & Ép phụ đề...\n")
         quality_text = self.cfg.get("render_quality", "⭐ Tốt (CRF 20)")
         self.log.emit(f"   📊 Chất lượng: {quality_text} | Codec: {get_optimal_ffmpeg_codec()}\n")
@@ -1716,6 +1810,12 @@ class SingleRenderThread(QThread):
         if self.cfg.get("noise"): vid_filters.append("noise=alls=1:allf=t")
         
         vid_filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+
+        # Ép FPS đồng nhất (nếu người dùng chọn 24/25/30). Mọi tập ra cùng fps
+        # -> gộp trọn bộ nhanh (copy) & KHÔNG bị đứng hình ở tập lệch fps.
+        _tfps = self.cfg.get("target_fps")
+        if _tfps:
+            vid_filters.append(f"fps={_tfps:g}")
         
         if vid_filters: 
             filter_chains.append(f"[0:v] {','.join(vid_filters)} [v_base]")
@@ -1758,6 +1858,18 @@ class SingleRenderThread(QThread):
             filter_chains.append(f"{last_vid_out} setpts=PTS/1.05 [v_speed]")
             last_vid_out = "[v_speed]"
 
+        # Ép RESOLUTION đích (nếu chọn) — bước CUỐI, sau khi khắc sub. Giữ đúng
+        # tỷ lệ (scale + pad), nên sub co giãn theo khung, KHÔNG lệch/méo. Mọi
+        # tập ra cùng size -> gộp trọn bộ nhanh (copy), khỏi re-encode.
+        _tres = self.cfg.get("target_res")
+        if _tres:
+            tw, th = int(_tres[0]), int(_tres[1])
+            tw = (tw // 2) * 2; th = (th // 2) * 2
+            filter_chains.append(
+                f"{last_vid_out} scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+                f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1 [v_res]")
+            last_vid_out = "[v_res]"
+
         audio_map = ""
         if self.cfg.get("tts_en") and self.tts_path and os.path.exists(self.tts_path):
             tts_idx = inputs.count("-i")
@@ -1792,7 +1904,7 @@ class SingleRenderThread(QThread):
             filter_chains.append(f"{pad} {','.join(af_chain)} [aout]")
             audio_map = "[aout]"
             
-        cmd = ["ffmpeg", "-y"] + inputs; temp_filter = ""
+        cmd = ["ffmpeg", "-y", "-progress", "pipe:1"] + inputs; temp_filter = ""
         
         if filter_chains:
             basename = os.path.basename(self.vp)
@@ -1862,18 +1974,29 @@ class SingleRenderThread(QThread):
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", **kw)
             from collections import deque
             stderr_lines = deque(maxlen=40)
-            last_report = time.time()
-            for line in proc.stderr:
-                stderr_lines.append(line)
-                if "time=" in line and time.time() - last_report > 20:
-                    m = re.search(r"time=(\d+:\d+:\d+)", line)
-                    if m: self.log.emit(f"   ⏳ Render: {m.group(1)}\n")
-                    last_report = time.time()
+            def _drain_stderr(p=proc, buf=stderr_lines):
+                try:
+                    for ln in p.stderr:
+                        buf.append(ln)
+                except Exception:
+                    pass
+            _t_err = threading.Thread(target=_drain_stderr, daemon=True)
+            _t_err.start()
+            last_report = time.time(); last_pct = 0
+            for line in proc.stdout:  # -progress ghi ra stdout: out_time_ms=, progress=
+                if "out_time_ms=" in line or "time=" in line:
+                    last_pct = self._emit_progress_from_line(line, last_pct)
+                    if time.time() - last_report > 20:
+                        m = re.search(r"out_time_ms=(\d+)", line)
+                        if m:
+                            self.log.emit(f"   ⏳ Render: {format_time(int(m.group(1))/1_000_000)} ({last_pct}%)\n")
+                        last_report = time.time()
                 if self._cancel:
                     try: proc.terminate()
                     except Exception: pass
                     break
-            proc.wait() 
+            proc.wait()
+            _t_err.join(timeout=2) 
             elapsed = time.time() - start_t
             if self._cancel:
                 self.log.emit(f"⛔ Đã hủy render.\n")
@@ -1882,6 +2005,7 @@ class SingleRenderThread(QThread):
                 except Exception: pass
                 self.done.emit(False)
             elif proc.returncode == 0:
+                self.progress.emit(100)
                 self.log.emit(f"⏱️ Render hoàn thành trong: {format_time(elapsed)}\n")
                 self.done.emit(True)
             else:
@@ -1922,21 +2046,34 @@ class SingleRenderThread(QThread):
                     proc = subprocess.Popen(cmd_cpu, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                             text=True, encoding="utf-8", errors="replace", **kw)
                     stderr_lines2 = deque(maxlen=40)
-                    last_report = time.time()
-                    for line in proc.stderr:
-                        stderr_lines2.append(line)
-                        if "time=" in line and time.time() - last_report > 20:
-                            m = re.search(r"time=(\d+:\d+:\d+)", line)
-                            if m: self.log.emit(f"   ⏳ Render (CPU): {m.group(1)}\n")
-                            last_report = time.time()
+                    def _drain_stderr2(p=proc, buf=stderr_lines2):
+                        try:
+                            for ln in p.stderr:
+                                buf.append(ln)
+                        except Exception:
+                            pass
+                    _t_err2 = threading.Thread(target=_drain_stderr2, daemon=True)
+                    _t_err2.start()
+                    last_report = time.time(); last_pct = 0
+                    self.progress.emit(0)
+                    for line in proc.stdout:
+                        if "out_time_ms=" in line or "time=" in line:
+                            last_pct = self._emit_progress_from_line(line, last_pct)
+                            if time.time() - last_report > 20:
+                                m = re.search(r"out_time_ms=(\d+)", line)
+                                if m:
+                                    self.log.emit(f"   ⏳ Render (CPU): {format_time(int(m.group(1))/1_000_000)} ({last_pct}%)\n")
+                                last_report = time.time()
                         if self._cancel:
                             try: proc.terminate()
                             except Exception: pass
                             break
                     proc.wait()
+                    _t_err2.join(timeout=2)
                     if self._cancel:
                         self.log.emit("⛔ Đã hủy render.\n"); self.done.emit(False)
                     elif proc.returncode == 0:
+                        self.progress.emit(100)
                         self.log.emit(f"✅ Render thành công bằng CPU (libx264) trong: {format_time(time.time() - start_t)}\n")
                         self.done.emit(True)
                     else:
@@ -2185,14 +2322,30 @@ class ProgressStep(QWidget):
         self.lbl_status = QLabel("chờ"); self.lbl_status.setStyleSheet("color:#8A8D98; font-size:10px;")
         top.addWidget(self.dot); top.addWidget(self.lbl_name, stretch=1); top.addWidget(self.lbl_status)
         lay.addLayout(top)
-        self.bar = QProgressBar(); self.bar.setFixedHeight(3); self.bar.setTextVisible(False)
-        self.bar.setStyleSheet("QProgressBar { background:#2D303D; border:none; border-radius:1px; } QProgressBar::chunk { background:#10B981; border-radius:1px; }")
+        self.bar = QProgressBar(); self.bar.setFixedHeight(14); self.bar.setTextVisible(True)
+        self.bar.setRange(0, 100); self.bar.setFormat("%p%")
+        self.bar.setStyleSheet(
+            "QProgressBar { background:#2D303D; border:none; border-radius:3px; "
+            "color:#E5E7EB; font-size:9px; text-align:center; } "
+            "QProgressBar::chunk { background:#10B981; border-radius:3px; }")
         lay.addWidget(self.bar)
+        self._count_txt = ""   # ví dụ "Tập 3/10"
+
+    def set_count(self, done, total):
+        """Đặt bộ đếm tập, hiện kèm trạng thái (VD 'đang chạy · Tập 3/10')."""
+        self._count_txt = f"Tập {done}/{total}" if total else ""
+        cur = self.lbl_status.text().split(" · ")[0]
+        self.lbl_status.setText(f"{cur} · {self._count_txt}" if self._count_txt else cur)
+
+    def set_percent(self, pct):
+        """Chỉ cập nhật % thanh (không đổi trạng thái/màu) — dùng khi đang render 1 tập."""
+        self.bar.setValue(max(0, min(100, int(pct))))
 
     def set_status(self, status, progress=0):
         color = {"success": "#10B981", "processing": "#F37021"}.get(status, "#4B5563")
         self.dot.setStyleSheet(f"background:{color}; border-radius:4px;")
-        self.lbl_status.setText({"success": "xong", "processing": "đang chạy"}.get(status, "chờ"))
+        base = {"success": "xong", "processing": "đang chạy"}.get(status, "chờ")
+        self.lbl_status.setText(f"{base} · {self._count_txt}" if self._count_txt else base)
         self.bar.setValue(int(progress))
 
 # ============================================================
@@ -2216,6 +2369,10 @@ class RenderWidget(QWidget):
         self._render_running = False
         self._stopping = False
         self.render_thread = None
+        # ── Thanh TỔNG cho quy trình Tách→Dịch→Lồng→Render ──
+        self._total_units = 0     # = số tập × số bước
+        self._done_units = 0      # số "việc" đã xong (mỗi tập mỗi bước = 1)
+        self._total_active = False  # True khi đang chạy "Làm tất cả" trọn quy trình
 
         self.setStyleSheet("""
             QWidget { background:#11121A; color:#E5E6E8; font-family:'Segoe UI',Arial,sans-serif; }
@@ -2291,8 +2448,10 @@ class RenderWidget(QWidget):
         r2.addWidget(self.lbl_fix_s, stretch=1); r2.addWidget(bs); fl.addLayout(r2)
         ll.addWidget(fix)
 
+        # Thanh nhỏ cũ: GIỮ object để code cũ gọi không lỗi, nhưng KHÔNG hiện
+        # ra UI nữa (đã có thanh tiến trình bự bên cột phải, trên nút RENDER).
         self.step_render = ProgressStep("Tiến độ render")
-        ll.addWidget(self.step_render)
+        self.step_render.setVisible(False)
         self.txt_log = QTextEdit(); self.txt_log.setReadOnly(True); self.txt_log.document().setMaximumBlockCount(400)
         self.txt_log.setFixedHeight(90)
         self.txt_log.setStyleSheet("background:#0B0E14; color:#A7F3D0; font-family:Consolas; font-size:10px; padding:5px; border:1px solid #1F222D;")
@@ -2488,12 +2647,53 @@ class RenderWidget(QWidget):
         merge_row.addWidget(self.chk_merge_all)
         bot_lay.addLayout(merge_row)
 
+        # ── Hàng: số tập render song song + FPS đích ──
+        rp_row = QHBoxLayout()
+        rp_row.addWidget(QLabel("Render cùng lúc:", styleSheet="color:#8A8D98; font-size:11px; border:none;"))
+        self.spn_render_parallel = QSpinBox()
+        self.spn_render_parallel.setRange(1, 4)
+        self.spn_render_parallel.setValue(int(self.settings.value("render_parallel", 2)))
+        self.spn_render_parallel.setFixedWidth(48)
+        self.spn_render_parallel.setToolTip("Số tập render cùng lúc (CPU nhiều nhân nên để 2-3). GPU nên để 1-2 tùy card.")
+        self.spn_render_parallel.valueChanged.connect(
+            lambda v: self.settings.setValue("render_parallel", v))
+        rp_row.addWidget(self.spn_render_parallel)
+        rp_row.addSpacing(12)
+        rp_row.addWidget(QLabel("FPS:", styleSheet="color:#8A8D98; font-size:11px; border:none;"))
+        self.cmb_fps = QComboBox()
+        self.cmb_fps.addItems(["Giữ gốc", "24", "25", "30"])
+        _saved_fps = self.settings.value("render_target_fps", "25")
+        _idx = self.cmb_fps.findText(str(_saved_fps))
+        self.cmb_fps.setCurrentIndex(_idx if _idx >= 0 else 2)  # mặc định 25
+        self.cmb_fps.setFixedWidth(80)
+        self.cmb_fps.setToolTip("Ép mọi tập ra cùng FPS này để gộp trọn bộ nhanh & hết đứng hình. "
+                                "Drama Trung nên để 25.")
+        self.cmb_fps.currentTextChanged.connect(
+            lambda t: self.settings.setValue("render_target_fps", t))
+        rp_row.addWidget(self.cmb_fps)
+        rp_row.addStretch()
+        bot_lay.addLayout(rp_row)
+
         # Nút chạy trọn quy trình: tách → dịch → lồng → render. Dùng đúng cấu
         # hình đã set trong tab con "Sub → Dịch → Lồng".
         self.btn_full_pipeline = QPushButton("🚀 LÀM TẤT CẢ: Tách → Dịch → Lồng → Render")
         self.btn_full_pipeline.setStyleSheet("QPushButton { background:#7452FF; color:white; padding:11px; font-size:12px; font-weight:bold; border-radius:8px; border:none; } QPushButton:hover { background:#5b3fd6; } QPushButton:disabled { background:#3B3E4D; color:#8A8D98; }")
         self.btn_full_pipeline.clicked.connect(self._run_full_pipeline_external)
         bot_lay.addWidget(self.btn_full_pipeline)
+
+        # ── THANH TIẾN TRÌNH BỰ (dễ thấy) — ngay trên nút RENDER ──
+        self.lbl_big_prog = QLabel("Tiến độ render")
+        self.lbl_big_prog.setStyleSheet("color:#E5E6E8; font-size:12px; font-weight:bold; border:none;")
+        bot_lay.addWidget(self.lbl_big_prog)
+        self.big_render_prog = QProgressBar()
+        self.big_render_prog.setRange(0, 100); self.big_render_prog.setValue(0)
+        self.big_render_prog.setFixedHeight(28); self.big_render_prog.setTextVisible(True)
+        self.big_render_prog.setFormat("%p%")
+        self.big_render_prog.setStyleSheet(
+            "QProgressBar { background:#1F222D; border:1px solid #2D303D; border-radius:6px; "
+            "color:#FFFFFF; font-size:13px; font-weight:bold; text-align:center; } "
+            "QProgressBar::chunk { background:#F37021; border-radius:5px; }")
+        bot_lay.addWidget(self.big_render_prog)
 
         run_merge_lay = QHBoxLayout()
         
@@ -3237,8 +3437,59 @@ class RenderWidget(QWidget):
             "margin_l": 0, "margin_r": 0, "margin_v": margin_v,
             "hardsub_en": design["hardsub_en"],
             "render_quality": design["render_quality"],
+            "target_fps": self._get_target_fps(),
+            "target_res": getattr(self, "_target_res", None),
             # KHÔNG bật tts_en -> SingleRenderThread bỏ qua phần audio TTS
         }
+
+    def _get_target_fps(self):
+        """Trả về fps đích (float) do người dùng chọn, hoặc None nếu 'Giữ gốc'."""
+        try:
+            t = self.cmb_fps.currentText() if hasattr(self, "cmb_fps") else "25"
+            if t and t != "Giữ gốc":
+                return float(t)
+        except Exception:
+            pass
+        return None
+
+    def _get_target_res(self):
+        """TỰ ĐỘNG lấy resolution 'số đông' của các tập trong hàng đợi để ép mọi
+        tập về chung 1 size (gộp nhanh, hết re-encode). Quét header song song
+        cho nhanh. Trả về (w, h), hoặc None nếu không đọc được HOẶC mọi tập đã
+        đồng nhất sẵn (khỏi cần ép)."""
+        try:
+            from collections import Counter
+            from concurrent.futures import ThreadPoolExecutor
+            ffmpeg = get_ffmpeg_path()
+            vids = [getattr(c, "video_path", None) for c in self.cards]
+            vids = [v for v in vids if v and os.path.exists(v)]
+            if not vids:
+                return None
+
+            def _probe(vp):
+                try:
+                    r = subprocess.run([ffmpeg, "-i", vp], stderr=subprocess.PIPE,
+                                       text=True, errors="ignore",
+                                       creationflags=CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                    m = re.search(r"Stream.*Video.*?(\d{3,5})x(\d{3,5})", r.stderr)
+                    if m:
+                        return (int(m.group(1)), int(m.group(2)))
+                except Exception:
+                    pass
+                return None
+
+            counts = Counter()
+            with ThreadPoolExecutor(max_workers=8) as ex:  # quét song song, chỉ đọc header
+                for res in ex.map(_probe, vids):
+                    if res:
+                        counts[res] += 1
+            if not counts:
+                return None
+            if len(counts) == 1:   # mọi tập đã cùng size -> khỏi ép
+                return None
+            return counts.most_common(1)[0][0]
+        except Exception:
+            return None
 
     # ============ RENDER HÀNG LOẠT ============
     def _sync_design_all(self):
@@ -3356,21 +3607,115 @@ class RenderWidget(QWidget):
         # Ưu tiên cấu hình ĐÃ ĐỒNG BỘ (nếu bấm nút Đồng bộ trước đó); nếu chưa
         # đồng bộ thì lấy canh chỉnh hiện tại. Dù cách nào cũng áp CHUNG cho mọi tập.
         self._design = getattr(self, '_design_locked', None) or self._collect_design()
+        # Chỉ ép resolution đồng nhất KHI có tích 'Gộp trọn bộ sau Render' — vì
+        # chỉ lúc gộp mới cần các tập cùng size. Không gộp thì giữ size gốc,
+        # khỏi quét (đỡ khựng nút RENDER).
+        self._target_res = None
+        if hasattr(self, "chk_merge_all") and self.chk_merge_all.isChecked():
+            self._target_res = self._get_target_res()
+            if self._target_res:
+                self._log(f"📐 Có gộp trọn bộ → ép mọi tập về {self._target_res[0]}×{self._target_res[1]} cho đồng nhất.")
         # Sắp lại theo SỐ tập để gộp trọn bộ đúng thứ tự 1 -> cuối
         # (phòng khi thêm file thủ công bằng '+ File' không theo thứ tự).
         self.cards.sort(key=lambda c: _natural_key(os.path.basename(c.video_path)))
         self._relayout_grid()
         self._render_queue = list(self.cards)
+        self._render_total = len(self._render_queue)
+        self._render_done_count = 0
         self._rendered_files = [] # Lưu danh sách file xuất ra để gộp
         self._render_running = True
         self._stopping = False
+        self._render_threads = {}         # out_path -> SingleRenderThread đang chạy
+        self._render_pct = {}             # out_path -> % hiện tại (cho song song)
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
         if hasattr(self, 'btn_merge_now'):
             self.btn_merge_now.setEnabled(False)
         self.chk_merge_all.setEnabled(False)
-        self._log(f"🚀 Bắt đầu render {len(self._render_queue)} tập...")
-        self._render_next()
+        if not getattr(self, "_total_active", False):
+            self._big_set_percent(0)
+            self._big_set_count(0, self._render_total)
+        else:
+            if hasattr(self, "lbl_big_prog"):
+                self.lbl_big_prog.setText(
+                    f"Tiến độ tổng · Render {self._render_total} tập · "
+                    f"{self._done_units}/{self._total_units} việc")
+        _par = self.spn_render_parallel.value() if hasattr(self, "spn_render_parallel") else 1
+        self._log(f"🚀 Bắt đầu render {len(self._render_queue)} tập ({_par} tập/lượt)...")
+        self._pump_render_queue()
+
+    def _big_set_percent(self, pct):
+        if hasattr(self, "big_render_prog"):
+            self.big_render_prog.setValue(max(0, min(100, int(pct))))
+        # đồng bộ luôn thanh nhỏ cũ
+        if hasattr(self, "step_render"):
+            self.step_render.set_percent(pct)
+
+    # ═══════════ THANH TỔNG (Tách→Dịch→Lồng→Render) ═══════════
+    def total_progress_begin(self, n_files, n_steps):
+        """Bắt đầu 1 phiên 'Làm tất cả'. n_steps = số bước mỗi tập phải qua
+        (VD: tách+dịch+lồng+render = 4; nếu bỏ dịch/lồng thì ít hơn)."""
+        self._total_units = max(1, int(n_files) * max(1, int(n_steps)))
+        self._done_units = 0
+        self._total_active = True
+        self._total_nfiles = int(n_files)
+        self._total_nsteps = int(n_steps)
+        self._big_render_pct_within = 0
+        self._paint_total(0)
+        if hasattr(self, "lbl_big_prog"):
+            self.lbl_big_prog.setText(f"Tiến độ tổng · 0/{self._total_units} việc")
+
+    def total_progress_step(self, done_delta=1, stage=""):
+        """+done_delta 'việc' đã xong (1 tập xong 1 bước). Cập nhật thanh tổng."""
+        if not self._total_active:
+            return
+        self._done_units = min(self._total_units, self._done_units + int(done_delta))
+        self._paint_total()
+        if hasattr(self, "lbl_big_prog"):
+            tag = f" · {stage}" if stage else ""
+            self.lbl_big_prog.setText(
+                f"Tiến độ tổng{tag} · {self._done_units}/{self._total_units} việc")
+
+    def total_progress_render_within(self, pct_of_one_episode):
+        """Trong lúc RENDER 1 tập, cộng % mượt của tập đó vào thanh tổng
+        (mỗi tập render = 1 'việc', nên đóng góp = pct/100 của 1 unit)."""
+        if not self._total_active:
+            return
+        frac = max(0.0, min(1.0, pct_of_one_episode / 100.0))
+        base = self._done_units
+        self._paint_total(base + frac)
+
+    def total_progress_end(self):
+        self._total_active = False
+
+    def _paint_total(self, done_units_float=None):
+        if done_units_float is None:
+            done_units_float = self._done_units
+        pct = int(done_units_float / max(1, self._total_units) * 100)
+        pct = max(0, min(100, pct))
+        if hasattr(self, "big_render_prog"):
+            self.big_render_prog.setValue(pct)
+
+    def _big_set_count(self, done, total):
+        self._big_done = done; self._big_total = total
+        if hasattr(self, "lbl_big_prog"):
+            if total:
+                self.lbl_big_prog.setText(f"Tiến độ render · Tập {done}/{total}")
+            else:
+                self.lbl_big_prog.setText("Tiến độ render")
+
+    def _on_render_percent(self, pct):
+        """% thật của tập đang render."""
+        if getattr(self, "_total_active", False):
+            # Đang trong quy trình tổng → cộng mượt vào thanh tổng
+            self.total_progress_render_within(pct)
+            if hasattr(self, "step_render"):
+                self.step_render.set_percent(pct)
+            return
+        if hasattr(self, "big_render_prog"):
+            self.big_render_prog.setValue(max(0, min(100, int(pct))))
+        if hasattr(self, "step_render"):
+            self.step_render.set_percent(pct)
 
     def _start_merge_now(self):
         if self._render_running or (hasattr(self, 'merge_thread') and self.merge_thread.isRunning()):
@@ -3409,39 +3754,30 @@ class RenderWidget(QWidget):
         self._stopping = True
         self._render_queue = []          # xóa các tập chưa render
         self.btn_stop.setEnabled(False)
-        self._log("⛔ Đang dừng render... (đợi tập hiện tại thoát)")
-        if self.render_thread and self.render_thread.isRunning():
-            self.render_thread.cancel()  # hủy tập đang render (xóa file dở)
+        self._log("⛔ Đang dừng render... (đợi các tập đang chạy thoát)")
+        for th in list(getattr(self, "_render_threads", {}).values()):
+            try:
+                if th and th.isRunning():
+                    th.cancel()
+            except Exception:
+                pass
 
-    def _render_next(self):
-        if self._stopping or not self._render_queue:
-            stopped = self._stopping
-            self._render_running = False
-            self._stopping = False
-            self._render_queue = []
-            
-            self.btn_run.setEnabled(True)
-            self.btn_stop.setEnabled(False)
-            if hasattr(self, 'btn_merge_now'):
-                self.btn_merge_now.setEnabled(True)
-            self.chk_merge_all.setEnabled(True)
-            
-            if stopped:
-                self.step_render.set_status("error", 0)
-                self._log("⛔ Đã dừng render.")
-                QMessageBox.information(self, "Đã dừng", "Đã dừng render theo yêu cầu.")
-            else:
-                if self.chk_merge_all.isChecked() and len(self._rendered_files) > 1:
-                    self._start_merge(self._rendered_files)
-                else:
-                    self.step_render.set_status("success", 100)
-                    self._log("🎉 Đã render xong tất cả!")
-                    QMessageBox.information(self, "Xong", "Đã render xong tất cả các tập!")
+    def _pump_render_queue(self):
+        """Khởi động thêm tập cho tới khi đủ số song song hoặc hết hàng đợi."""
+        if self._stopping:
+            if not self._render_threads:
+                self._finish_render_all()
             return
-            
-        card = self._render_queue.pop(0)
+        par = self.spn_render_parallel.value() if hasattr(self, "spn_render_parallel") else 1
+        while self._render_queue and len(self._render_threads) < par:
+            card = self._render_queue.pop(0)
+            self._start_one_render(card)
+        # Hết hàng đợi và không còn thread nào chạy -> xong
+        if not self._render_queue and not self._render_threads:
+            self._finish_render_all()
+
+    def _start_one_render(self, card):
         card.set_status("đang render")
-        self.step_render.set_status("processing", 30)
         vp = card.video_path
         sp = card.srt_path
         out_dir = os.path.dirname(vp)
@@ -3451,23 +3787,98 @@ class RenderWidget(QWidget):
             stem = stem[:-len("_dubbed")]
         out_path = os.path.join(out_dir, f"{stem}_final.mp4")
         cfg = self._build_cfg(vp, self._design)
-        self._log(f"🎬 Render: {os.path.basename(vp)}...")
-        
-        self.render_thread = SingleRenderThread(vp, sp, None, out_path, cfg)
-        self.render_thread.log.connect(self._log)
-        self.render_thread.done.connect(lambda ok, c=card, op=out_path: self._on_one_done(ok, c, op))
-        self.render_thread.start()
+
+        done_so_far = getattr(self, "_render_done_count", 0)
+        total = getattr(self, "_render_total", 0)
+        running = len(self._render_threads) + 1
+        self._log(f"🎬 Render [{done_so_far + running}/{total}]: {os.path.basename(vp)}...")
+        self.step_render.set_status("processing", 0)
+        self.step_render.set_count(done_so_far, total)
+
+        th = SingleRenderThread(vp, sp, None, out_path, cfg)
+        th.log.connect(self._log)
+        th.progress.connect(lambda pct, op=out_path: self._on_render_percent_multi(op, pct))
+        th.done.connect(lambda ok, c=card, op=out_path: self._on_one_done(ok, c, op))
+        self._render_threads[out_path] = th
+        self._render_pct[out_path] = 0
+        th.start()
+
+    def _on_render_percent_multi(self, out_path, pct):
+        """% của 1 tập trong nhóm song song. Thanh hiển thị = trung bình các tập
+        đang chạy (đủ mượt & phản ánh cả nhóm)."""
+        self._render_pct[out_path] = pct
+        vals = list(self._render_pct.values())
+        avg = sum(vals) / len(vals) if vals else 0
+        if getattr(self, "_total_active", False):
+            # Trong quy trình tổng: mỗi tập render = 1 việc, cộng phần đang chạy
+            running_frac = sum(v / 100.0 for v in vals)
+            self._paint_total(self._done_units + running_frac)
+            if hasattr(self, "step_render"):
+                self.step_render.set_percent(avg)
+        else:
+            self._big_set_percent(avg)
+
+    def _finish_render_all(self):
+        stopped = self._stopping
+        self._render_running = False
+        self._stopping = False
+        self._render_queue = []
+        self._render_threads = {}
+        self._render_pct = {}
+
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        if hasattr(self, 'btn_merge_now'):
+            self.btn_merge_now.setEnabled(True)
+        self.chk_merge_all.setEnabled(True)
+
+        if stopped:
+            self.step_render.set_status("error", 0)
+            self.lbl_big_prog.setText("Tiến độ tổng · ĐÃ DỪNG" if getattr(self, "_total_active", False) else "Tiến độ render · ĐÃ DỪNG")
+            self.total_progress_end()
+            self._log("⛔ Đã dừng render.")
+            QMessageBox.information(self, "Đã dừng", "Đã dừng render theo yêu cầu.")
+        else:
+            if self.chk_merge_all.isChecked() and len(self._rendered_files) > 1:
+                self._start_merge(self._rendered_files)
+            else:
+                self.step_render.set_status("success", 100)
+                if getattr(self, "_total_active", False):
+                    self._done_units = self._total_units
+                    self._paint_total(self._total_units)
+                    self.lbl_big_prog.setText(
+                        f"Tiến độ tổng · XONG {self._total_units}/{self._total_units} việc ✅")
+                    self.total_progress_end()
+                else:
+                    self._big_set_percent(100)
+                    total = getattr(self, "_render_total", 0)
+                    self.lbl_big_prog.setText(f"Tiến độ render · XONG {total}/{total} tập ✅")
+                self._log("🎉 Đã render xong tất cả!")
+                QMessageBox.information(self, "Xong", "Đã render xong tất cả các tập!")
 
     def _on_one_done(self, ok, card, out_path):
+        # Gỡ thread vừa xong khỏi nhóm đang chạy
+        self._render_threads.pop(out_path, None)
+        self._render_pct.pop(out_path, None)
         if self._stopping and not ok:
             card.set_status("đã dừng")
         else:
             card.set_status("xong" if ok else "lỗi")
             if ok:
                 self._rendered_files.append(out_path)
-        self._render_next()
+        self._render_done_count = getattr(self, "_render_done_count", 0) + 1
+        self.step_render.set_count(self._render_done_count, getattr(self, "_render_total", 0))
+        if getattr(self, "_total_active", False):
+            self.total_progress_step(1, stage="Render")
+        else:
+            self._big_set_count(self._render_done_count, getattr(self, "_render_total", 0))
+        # Khởi động tập kế cho đủ số song song (hoặc kết thúc nếu hết)
+        self._pump_render_queue()
         
     def _start_merge(self, file_list):
+        # Render song song -> file xong KHÔNG theo thứ tự. Sắp lại theo số tập
+        # để gộp trọn bộ đúng 1 -> cuối.
+        file_list = sorted(file_list, key=lambda p: _natural_key(os.path.basename(p)))
         self._log(f"🔗 Đang chuẩn bị gộp {len(file_list)} file thành 1...")
         self.btn_run.setEnabled(False)
         self.btn_run.setText("⏳ ĐANG GỘP FILE...")

@@ -303,7 +303,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.62"
+APP_VERSION = "1.0.63"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -1488,6 +1488,7 @@ class DriveDownloadManager(QObject):
 # ==========================================
 class SttBatchThread(QThread):
     progress_signal = pyqtSignal(str)       
+    pct_signal = pyqtSignal(int)            # % tổng cả mẻ tách sub (done/total)
     finished_signal = pyqtSignal(int, int)  
 
     def __init__(self, file_paths, src_lang="zh-CN", out_lang="vi-VN", use_trans=True, stt_workers=3):
@@ -1601,6 +1602,8 @@ class SttBatchThread(QThread):
 
         ok = failed = 0
         self.progress_signal.emit(f"🚀 Tách sub song song {self.stt_workers} luồng ({len(self.file_paths)} tập)...")
+        self.pct_signal.emit(0)
+        _total = max(1, len(self.file_paths))
         with ThreadPoolExecutor(max_workers=self.stt_workers) as ex:
             futs = {ex.submit(_process_one, i, fp): i for i, fp in enumerate(self.file_paths)}
             for fut in as_completed(futs):
@@ -1612,6 +1615,7 @@ class SttBatchThread(QThread):
                 except Exception as e:
                     failed += 1
                     self.progress_signal.emit(f"⚠️ Lỗi luồng: {str(e)[:80]}")
+                self.pct_signal.emit(int((ok + failed) / _total * 100))
 
         self.finished_signal.emit(ok, failed)
 
@@ -1771,6 +1775,7 @@ class BgmStandaloneThread(QThread):
 # ==========================================
 class DubThread(QThread):
     progress_signal = pyqtSignal(str)
+    pct_signal = pyqtSignal(str, int)        # (video_path, % thật 0..100) của 1 tập
     finished_signal = pyqtSignal(int, int)   
 
     def __init__(self, tasks, voice_type="BV074_streaming", rate="1.0", pitch="+0Hz", mute_original=True, orig_volume=15, remove_bgm=False, use_gpu=False, tts_workers=4, pekka_api_key=""):
@@ -1878,6 +1883,7 @@ class DubThread(QThread):
 
             bname = os.path.basename(video_path)
             self.progress_signal.emit(f"[{idx+1}/{len(self.tasks)}] 🎙 Bắt đầu lồng tiếng: {bname}")
+            self.pct_signal.emit(video_path, 0)
 
             entries = self._parse_srt(srt_path)
             if not entries:
@@ -2025,6 +2031,8 @@ class DubThread(QThread):
                         if seg is not None:
                             segments_to_mix.append((start_ms, seg))
                         self.progress_signal.emit(f"[{idx+1}] 🔊 {done_cnt}/{len(entries)} dòng")
+                        if entries:
+                            self.pct_signal.emit(video_path, int(done_cnt / len(entries) * 70))
 
                 if self._stop:
                     return None
@@ -2048,6 +2056,7 @@ class DubThread(QThread):
 
                 dub_audio = os.path.join(temp_dir, "dub_final.mp3")
                 combined.export(dub_audio, format="mp3")
+                self.pct_signal.emit(video_path, 72)
                 self.progress_signal.emit(f"[{idx+1}] 🎬 Đang mix vào video bằng ffmpeg...")
 
                 out_video = os.path.splitext(video_path)[0] + "_dubbed.mp4"
@@ -2174,6 +2183,7 @@ class DubThread(QThread):
                 # ── MIX & GHÉP VÀO VIDEO ──────────────────────────────────────
                 if vocals_audio:
                     # Bước 1: Mix vocals.wav vào video gốc → video_vocals.mp4
+                    self.pct_signal.emit(video_path, 90)
                     ov = getattr(self, "orig_volume", 15) / 100.0
                     video_vocals = os.path.join(temp_dir, "video_vocals.mp4")
                     self.progress_signal.emit(f"[{idx+1}] 🎵 Đang ghép nhạc nền đã tách vào video...")
@@ -2230,6 +2240,7 @@ class DubThread(QThread):
                            out_video]
 
                 if not vocals_audio:
+                    self.pct_signal.emit(video_path, 90)
                     res = _sp.run(cmd, startupinfo=si, stdout=_sp.DEVNULL, stderr=_sp.PIPE)
                     if res.returncode != 0:
                         err = res.stderr.decode("utf-8", errors="ignore")[-200:]
@@ -2240,6 +2251,7 @@ class DubThread(QThread):
                         err = res.stderr.decode("utf-8", errors="ignore")[-200:]
                         raise RuntimeError(f"ffmpeg ghép lồng tiếng lỗi: {err}")
 
+                self.pct_signal.emit(video_path, 100)
                 self.progress_signal.emit(f"[{idx+1}] ✅ Xong! → {os.path.basename(out_video)}")
                 return True
 

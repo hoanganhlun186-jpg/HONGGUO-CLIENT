@@ -242,7 +242,7 @@ class GeminiTranslateThread(QThread):
     item_failed = pyqtSignal(int, str)
     all_done = pyqtSignal()
     
-    def __init__(self, queue_items, prompt_preset_key, model_key, chunk_size=100, translate_workers=1, show_browser=False, target_lang="vi"):
+    def __init__(self, queue_items, prompt_preset_key, model_key, chunk_size=100, translate_workers=1, show_browser=False, target_lang="vi", chunk_parallel=1):
         super().__init__()
         self.queue_items = list(queue_items)
         self.preset_text = PROMPT_PRESETS.get(prompt_preset_key, list(PROMPT_PRESETS.values())[0])
@@ -251,6 +251,9 @@ class GeminiTranslateThread(QThread):
         self.target_lang = (target_lang or "vi").lower()
         self.chunk_size = chunk_size
         self.translate_workers = max(1, min(4, int(translate_workers)))
+        # Số KHỐI (chunk) dịch song song trong 1 tập dài. Trần cứng 3 để giảm
+        # nguy cơ Google gắn cờ/khóa tài khoản khi bắn nhiều tab cùng lúc.
+        self.chunk_parallel = max(1, min(3, int(chunk_parallel)))
         # Hiện trình duyệt Chrome khi dịch (để soi Gemini chạy) hay chạy ẩn.
         self.show_browser = bool(show_browser)
         self._cancel = False
@@ -431,7 +434,7 @@ class GeminiTranslateThread(QThread):
                         # _translate_smart tự phát tín hiệu item_done/item_failed.
                         # Nếu Gemini đơ, nó sẽ ném lỗi (hoặc trả kết quả lỗi) ->
                         # nhảy xuống except/vòng lặp để restart browser.
-                        self._translate_smart(clean_ctx, page_w, idx, video_path, srt_path)
+                        self._translate_smart(clean_ctx, page_w, idx, video_path, srt_path, allow_chunk_parallel=False)
                         ok_this = True
                         break
                     except Exception as e:
@@ -563,7 +566,7 @@ class GeminiTranslateThread(QThread):
                 paths.append(sp)
         return paths
 
-    def _translate_smart(self, clean_ctx, page, idx, video_path, srt_path):
+    def _translate_smart(self, clean_ctx, page, idx, video_path, srt_path, allow_chunk_parallel=True):
         with open(srt_path, "r", encoding="utf-8-sig") as f: srt_content = f.read()
         blocks = self._parse_srt(srt_content)
         if not blocks:
@@ -574,9 +577,15 @@ class GeminiTranslateThread(QThread):
         chunks = [blocks[i:i + self.chunk_size] for i in range(0, len(blocks), self.chunk_size)]
         translated_results = {} 
         has_error = False
+        import threading as _threading
+        _res_lock = _threading.Lock()
 
-        for i, chunk in enumerate(chunks):
-            if self._cancel: break
+        def _work_chunk(page, i, chunk):
+            """Dịch 1 khối trên 1 tab (page) riêng. Giữ NGUYÊN logic retry/
+            chia nhỏ/ép dấu như bản cũ. Ghi kết quả vào translated_results theo
+            'stt' (số thứ tự câu) nên các khối xong lộn xộn vẫn ghép đúng."""
+            nonlocal has_error
+            if self._cancel: return
             
             chunk_to_translate = chunk.copy()
             translated_chunk_lines = []
@@ -833,14 +842,72 @@ class GeminiTranslateThread(QThread):
                     translated_chunk_lines.append(b["text"])
                     
             # FIX TẬN GỐC LỖI INDEX OUT OF RANGE: Lúc này số lượng translated_chunk_lines luôn = len(chunk)
-            for j, b in enumerate(chunk):
-                translated_results[b["stt"]] = translated_chunk_lines[j]
-            
-            self.chunk_done.emit(idx, translated_results)
+            with _res_lock:
+                for j, b in enumerate(chunk):
+                    translated_results[b["stt"]] = translated_chunk_lines[j]
+                self.chunk_done.emit(idx, dict(translated_results))
+        # ── hết _work_chunk ──
 
-            if i < len(chunks) - 1 and not self._cancel:
-                self.log.emit("⏸️ Đã nhận kết quả, nghỉ 1 giây trước khi gửi tiếp...\n")
-                page.wait_for_timeout(1000)
+        # ══ ĐIỀU PHỐI KHỐI ══
+        n_par = getattr(self, "chunk_parallel", 1) if allow_chunk_parallel else 1
+        if n_par <= 1 or len(chunks) <= 1:
+            # Tuần tự trên tab chính (1 Chrome). An toàn nhất.
+            for i, chunk in enumerate(chunks):
+                if self._cancel: break
+                _work_chunk(page, i, chunk)
+                if i < len(chunks) - 1 and not self._cancel:
+                    page.wait_for_timeout(800)
+        else:
+            # SONG SONG: chia các khối cho n_par Chrome riêng (Playwright sync
+            # buộc mỗi thread 1 browser riêng — không share tab được). Mỗi worker
+            # tự mở Chrome cùng tài khoản Google, bốc khối từ hàng đợi chung tới
+            # hết. Trần cứng 3 (đặt ở __init__) + stagger để giảm nguy cơ khóa.
+            import threading as _th
+            from playwright.sync_api import sync_playwright as _spw
+            n_use = min(n_par, len(chunks))
+            self.log.emit(f"🚀 Dịch {n_use} khối SONG SONG ({len(chunks)} khối trong tập này, "
+                          f"mỗi luồng 1 Chrome riêng)...\n")
+            job_lock = _th.Lock()
+            next_idx = [0]
+
+            def _chunk_worker(wid):
+                # Stagger khởi động để không bắn cùng lúc
+                time.sleep(wid * 2.0)
+                if self._cancel: return
+                pw_w = None; browser_w = None
+                try:
+                    pw_w = _spw().start()
+                    browser_w, ctx_w = self._launch_authenticated_context(pw_w)
+                    wp = ctx_w.new_page()
+                    while not self._cancel:
+                        with job_lock:
+                            if next_idx[0] >= len(chunks):
+                                break
+                            j = next_idx[0]; next_idx[0] += 1
+                        try:
+                            _work_chunk(wp, j, chunks[j])
+                        except Exception as e:
+                            self.log.emit(f"⚠️ Luồng {wid+1} lỗi khối {j+1}: {str(e)[:100]}\n")
+                        if not self._cancel:
+                            try: wp.wait_for_timeout(600)
+                            except Exception: pass
+                except Exception as e:
+                    self.log.emit(f"⚠️ Luồng dịch {wid+1} không mở được Chrome: {str(e)[:100]}\n")
+                finally:
+                    try:
+                        if browser_w: browser_w.close()
+                    except Exception: pass
+                    try:
+                        if pw_w: pw_w.stop()
+                    except Exception: pass
+
+            workers = []
+            for wid in range(n_use):
+                t = _th.Thread(target=_chunk_worker, args=(wid,), daemon=True)
+                t.start()
+                workers.append(t)
+            for t in workers:
+                t.join()
 
         if self._cancel: return
         
