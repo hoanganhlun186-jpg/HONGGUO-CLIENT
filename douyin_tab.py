@@ -433,7 +433,46 @@ class DouyinScanThread(QThread):
         
     def cancel(self):
         self._cancel = True
-        
+
+    # KHÔI PHỤC HÀM CLICK CHỮ ĐỎ
+    def _click_douyin_refresh(self, page):
+        """Bấm đúng nút '刷新' (重新刷新拉取数据) khi Douyin báo 服务异常."""
+        selectors = [
+            "span:has-text('刷新')",
+            "div:has-text('服务异常') span",
+            "text=刷新",
+        ]
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0:
+                    loc.scroll_into_view_if_needed(timeout=3000)
+                    loc.click(timeout=3000)
+                    self.log.emit(f"   ✅ Đã click nút 刷新 qua selector: {sel}\n")
+                    return True
+            except Exception:
+                continue
+        try:
+            box = page.evaluate("""() => {
+                const walk = document.querySelectorAll('span, a, button');
+                for (const el of walk) {
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (t === '刷新' || t === '重新刷新') {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0)
+                            return {x: r.x + r.width/2, y: r.y + r.height/2};
+                    }
+                }
+                return null;
+            }""")
+            if box:
+                page.mouse.click(box["x"], box["y"])
+                self.log.emit(f"   ✅ Đã click nút 刷新 qua toạ độ ({int(box['x'])},{int(box['y'])}).\n")
+                return True
+        except Exception:
+            pass
+        return False
+
     def _detect_single_video(self, url):
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(url)
@@ -488,10 +527,8 @@ class DouyinScanThread(QThread):
         if raw.startswith("http"):
             url = raw
         elif re.match(r'^[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(/|$)', raw):
-            # Trông giống 1 tên miền/link thiếu scheme (vd: douyin.com/video/123)
             url = "https://" + raw
         else:
-            # Không phải link -> coi là từ khóa, tự build link tìm kiếm Douyin
             url = (f"https://www.douyin.com/search/{urllib.parse.quote(raw)}"
                    f"?type=video&sort_type={self.sort_type}&publish_time={self.publish_time}")
             self.log.emit(f"🔤 Nhận diện là từ khóa, tự chuyển thành link tìm kiếm.\n")
@@ -514,10 +551,8 @@ class DouyinScanThread(QThread):
         self.user_log.emit(f"🔍 Đang quét kênh Douyin...\n")
         total_videos = 0
         is_search = "/search/" in url
-        # Khi cần tự giải captcha -> coi như phải hiện trình duyệt (như trang search)
-        show_browser = is_search or self._force_visible
-        # ƯU TIÊN phiên đăng nhập đã lưu qua nút Đăng nhập (douyin_auth.json).
-        # Chỉ khi CHƯA đăng nhập mới thử copy profile Chrome thật để né captcha.
+        _always_visible_scan = False
+        show_browser = is_search or self._force_visible or _always_visible_scan
         has_saved_login = _douyin_logged_in()
         real_profile_dir = None
         if show_browser and not has_saved_login:
@@ -526,8 +561,6 @@ class DouyinScanThread(QThread):
         try:
             with sync_playwright() as p:
                 if real_profile_dir:
-                    # Dùng bản sao profile Chrome thật (đã đăng nhập sẵn) -> giống hệt
-                    # trình duyệt thật của người dùng, hạn chế bị Douyin đòi xác minh lại.
                     self.log.emit(f"🧬 Dùng bản sao profile Chrome thật: {real_profile_dir}\n")
                     try:
                         ctx = p.chromium.launch_persistent_context(
@@ -542,12 +575,10 @@ class DouyinScanThread(QThread):
                         real_profile_dir = None
 
                 if not real_profile_dir:
-                    # Mở trình duyệt: ẩn khi quét thường, hiện khi cần giải captcha.
                     browser = p.chromium.launch(**browser_launch_kwargs(
                         headless=not show_browser,
                         args=["--disable-blink-features=AutomationControlled", "--disable-gpu", "--no-sandbox"]
                     ))
-                    # Dùng phiên đăng nhập đã lưu (douyin_auth.json) nếu có.
                     if has_saved_login:
                         self.log.emit("🔐 Dùng phiên đăng nhập Douyin đã lưu.\n")
                         ctx = browser.new_context(
@@ -560,8 +591,6 @@ class DouyinScanThread(QThread):
                 def route_intercept(route):
                     if route.request.resource_type in ["image", "media", "font", "stylesheet"]: route.abort()
                     else: route.continue_()
-                # Khi HIỂN THỊ trình duyệt cho người dùng (search hoặc giải
-                # captcha) thì KHÔNG chặn ảnh/media để họ thấy captcha bình thường.
                 if not show_browser:
                     page.route("**/*", route_intercept)
                 def _emit_aweme_item(it):
@@ -589,16 +618,13 @@ class DouyinScanThread(QThread):
                     try:
                         url_l = resp.url
                         if "aweme/v1/web/aweme/post" in url_l:
-                            # Trang cá nhân (channel/profile)
                             for it in resp.json().get("aweme_list", []):
                                 _emit_aweme_item(it)
                         elif ("aweme/v1/web/general/search/single" in url_l
                               or "aweme/v1/web/search/item" in url_l):
-                            # Trang tìm kiếm (dùng khi quét theo từ khóa thịnh hành)
                             for entry in resp.json().get("data", []):
                                 it = entry.get("aweme_info") or entry.get("aweme")
                                 if it: _emit_aweme_item(it)
-                        # --- DEBUG: ghi lại MỌI request liên quan aweme/search để chẩn đoán endpoint thật ---
                         if ("aweme" in url_l or "/search" in url_l) and "static" not in url_l:
                             try:
                                 body_preview = resp.text()[:200]
@@ -610,17 +636,37 @@ class DouyinScanThread(QThread):
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(2000)
 
+                # --- KHÔI PHỤC: XỬ LÝ LỖI "服务异常" NGAY KHI VỪA VÀO TRANG ---
+                for _reload in range(3):
+                    try:
+                        body_txt = page.evaluate("document.body.innerText") or ""
+                    except Exception:
+                        body_txt = ""
+                    if "服务异常" in body_txt or "重新刷新" in body_txt:
+                        self.user_log.emit(
+                            f"🔄 Douyin báo 'dịch vụ bất thường', bấm nút tải lại "
+                            f"dữ liệu (lần {_reload+1}/3)...\n")
+                        self.log.emit(f"🔄 Gặp 服务异常 -> click span '刷新' (lần {_reload+1}).\n")
+                        clicked = self._click_douyin_refresh(page)
+                        if not clicked:
+                            try:
+                                page.reload(wait_until="domcontentloaded", timeout=60000)
+                            except Exception:
+                                pass
+                        page.wait_for_timeout(4000)
+                    else:
+                        break
+
                 if show_browser:
-                    # Nếu Douyin yêu cầu xác minh -> đợi người dùng tự giải captcha trên cửa sổ vừa mở
                     try:
                         title = page.title()
                     except Exception:
                         title = ""
                     if "验证" in title or "验证码" in title:
-                        self.user_log.emit("🧩 Douyin yêu cầu xác minh! Hãy giải captcha trên cửa sổ trình duyệt vừa mở, tool sẽ tự quét tiếp sau khi bạn giải xong (tối đa 5 phút chờ)...\n")
+                        self.user_log.emit("🧩 Douyin yêu cầu xác minh! Hãy giải captcha trên cửa sổ trình duyệt vừa mở...\n")
                         self.log.emit(f"🧩 Gặp trang captcha: '{title}'. Đợi người dùng tự giải...\n")
                         waited = 0
-                        while waited < 300:  # tối đa 5 phút
+                        while waited < 300:
                             if self._cancel: break
                             page.wait_for_timeout(3000)
                             waited += 3
@@ -637,13 +683,47 @@ class DouyinScanThread(QThread):
                             self.user_log.emit("⏱️ Hết thời gian chờ giải captcha (5 phút).\n")
                             self.log.emit("⏱️ Timeout chờ captcha.\n")
 
+                # =========================================================
+                # CƠ CHẾ CUỘN ĐƠN GIẢN (CÓ KÈM XỬ LÝ CHỮ ĐỎ 服务异常)
+                # =========================================================
                 prev_len, retries = 0, 0
-                # Ở chế độ HIỆN trình duyệt (để tự giải captcha) thì kiên nhẫn
-                # hơn: chờ lâu hơn trước khi bỏ cuộc, và nhắc người dùng giải.
-                captcha_hinted = False
-                max_retries = 40 if show_browser else 20
+                svc_reload_used = 0   
+                
                 for _ in range(1500): 
                     if self._cancel: break
+                    
+                    try:
+                        if "modal_id=" in page.url:
+                            self.log.emit("↩️ Lỡ mở video lẻ -> nhấn Esc đóng lại, về danh sách kênh.\n")
+                            page.keyboard.press("Escape")
+                            page.wait_for_timeout(1200)
+                    except Exception:
+                        pass
+                        
+                    # --- KHÔI PHỤC: XỬ LÝ 服务异常 NGAY TRONG LÚC CUỘN ---
+                    if svc_reload_used < 4:
+                        try:
+                            body_txt = page.evaluate("document.body.innerText") or ""
+                        except Exception:
+                            body_txt = ""
+                        if "服务异常" in body_txt or "重新刷新" in body_txt:
+                            svc_reload_used += 1
+                            self.user_log.emit(
+                                f"🔄 Douyin báo 'dịch vụ bất thường', bấm nút tải lại "
+                                f"dữ liệu (lần {svc_reload_used}/4)...\n")
+                            self.log.emit(f"🔄 Gặp 服务异常 -> click span '刷新' (lần {svc_reload_used}).\n")
+                            clicked = self._click_douyin_refresh(page)
+                            if not clicked:
+                                self.log.emit("   ↪️ Không thấy nút '刷新', fallback reload cả trang.\n")
+                                try:
+                                    page.reload(wait_until="domcontentloaded", timeout=60000)
+                                except Exception:
+                                    pass
+                            page.wait_for_timeout(4000)
+                            retries = 0   
+                            continue
+                            
+                    # Cuộn cửa sổ đơn giản
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
                     page.wait_for_timeout(2500) 
                     
@@ -652,19 +732,15 @@ class DouyinScanThread(QThread):
                         if retries >= 10: 
                             page.mouse.click(500, 500)
                             page.wait_for_timeout(1500)
-                        # Ở chế độ hiện: nếu vẫn 0 video sau 1 lúc -> nhắc giải captcha
-                        if show_browser and total_videos == 0 and retries == 6 and not captcha_hinted:
-                            captcha_hinted = True
-                            self.user_log.emit(
-                                "🧩 Nếu thấy trang xác minh/captcha trên cửa sổ trình duyệt, "
-                                "hãy giải xong — tool sẽ tự quét tiếp (chờ tối đa ~1.5 phút).\n")
-                        if retries >= max_retries: 
+                        if retries >= 20: 
                             self.user_log.emit(f"⚠️ Đã chạm đáy trang hoặc bị Douyin chặn đăng nhập...\n")
-                            self.log.emit("⚠️ Dừng do chạm đáy trang hoặc block.\n")
+                            self.log.emit("⚠️ Dừng do không có video mới sau 20 lần thử.\n")
                             break
                     else:
                         retries = 0
                         prev_len = total_videos
+                # =========================================================
+
                 if used_persistent:
                     ctx.close()
                 else:
@@ -675,17 +751,14 @@ class DouyinScanThread(QThread):
             
         self.log.emit(f"🏁 TỔNG KẾT: {total_videos} video.\n")
 
-        # Quét ẩn ra 0 video + CHƯA thử hiện trình duyệt + chưa bị hủy
-        # -> nhiều khả năng dính captcha/chặn đăng nhập. Tự MỞ trình duyệt
-        # hiện lên để người dùng tự giải, rồi quét lại 1 lần.
         if (total_videos == 0 and not self._force_visible and not self._cancel):
             self.user_log.emit(
                 "🧩 Không lấy được video (có thể dính captcha). "
                 "Đang mở trình duyệt để bạn tự xác minh...\n")
             self.log.emit("🧩 0 video ở chế độ ẩn -> thử lại ở chế độ HIỆN trình duyệt.\n")
             self._force_visible = True
-            self.seen_ids = set()   # quét lại từ đầu
-            return self.run()       # chạy lại 1 lần ở chế độ hiện
+            self.seen_ids = set()   
+            return self.run()       
 
         self.user_log.emit(f"🏁 Hoàn tất — Tổng cộng {total_videos} video\n")
         self.finished_signal.emit(total_videos)
@@ -694,7 +767,7 @@ class DouyinScanThread(QThread):
 # DOWNLOAD THREAD 
 # ============================================================
 class DouyinDownloadThread(QThread):
-    log = pyqtSignal(str) # Bổ sung thêm tín hiệu log kỹ thuật
+    log = pyqtSignal(str) 
     user_log = pyqtSignal(str)
     total_progress = pyqtSignal(int, int)
     card_progress = pyqtSignal(str, int) 
@@ -1089,7 +1162,6 @@ class DouyinWidget(QWidget):
     # CÁC HÀM XỬ LÝ
     # ============================================================
     def _write_hidden_log(self, msg):
-        """Bắt tín hiệu Log kỹ thuật từ Thread và chuyển ngầm vào AppData"""
         if msg and msg.strip():
             self.hidden_logger.info(msg.strip())
 
@@ -1176,14 +1248,13 @@ class DouyinWidget(QWidget):
         self.btn_scan.setEnabled(False)
         self.btn_scan.setText("Đang quét...")
         
-        # Banner đang xử lý (Màu Theme)
         self.status_banner.setText("⏳ Đang phân tích dữ liệu, vui lòng đợi...")
         self.status_banner.setStyleSheet("background-color: rgba(254, 44, 85, 0.1); border: 1px solid #fe2c55; border-radius: 8px; padding: 15px; font-size: 14px; font-weight: bold; color: #fe2c55;")
         
         sort_type = self.cbo_sort.currentData()
         publish_time = self.cbo_time.currentData()
         self._scan_thread = DouyinScanThread(url, get_cookie_file("douyin"), sort_type, publish_time)
-        self._scan_thread.log.connect(self._write_hidden_log) # Bắt log kỹ thuật ẩn
+        self._scan_thread.log.connect(self._write_hidden_log) 
         self._scan_thread.user_log.connect(self._user_log)
         self._scan_thread.video_found.connect(self._add_video_card)
         self._scan_thread.finished_signal.connect(self._on_scan_finished)
@@ -1275,7 +1346,7 @@ class DouyinWidget(QWidget):
         self.user_log.clear()
         
         self._dl_thread = DouyinDownloadThread(vids, self.dir_input.text().strip(), get_cookie_file("douyin"), self.spin_threads.value())
-        self._dl_thread.log.connect(self._write_hidden_log) # Bắt log kỹ thuật ẩn
+        self._dl_thread.log.connect(self._write_hidden_log) 
         self._dl_thread.user_log.connect(self._user_log)
         self._dl_thread.card_progress.connect(self._update_card_progress)
         self._dl_thread.total_progress.connect(lambda d, t: (self.t_bar.setMaximum(t), self.t_bar.setValue(d)))

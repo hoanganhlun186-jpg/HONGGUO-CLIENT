@@ -263,15 +263,28 @@ class YouTubeDownloadThread(QThread):
         self.user_log.emit(f"🎉 Hoàn tất: {self.success_count}/{total} tải thành công\n")
 
     def _format_for_res(self):
-        # Ánh xạ chế độ độ phân giải -> chuỗi format của yt-dlp
+        # Ánh xạ chế độ độ phân giải -> chuỗi format của yt-dlp.
+        # QUAN TRỌNG: ưu tiên codec H.264 (avc1) + AAC (m4a) để file mp4
+        # xem trước / render / import vào editor được ở MỌI nơi.
+        # YouTube 'bestvideo' thường là VP9/AV1 + Opus -> nhét vào .mp4 sẽ
+        # tạo file mp4 "giả", Windows và nhiều editor không đọc được.
+        # Chuỗi format: ưu tiên avc1+m4a; nếu không có mới lùi về best thường.
+        def _f(h):
+            return (
+                f"bestvideo[height<={h}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+                f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"best[height<={h}][ext=mp4]/"
+                f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
+            )
         m = {
-            "4K":    "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
-            "2K":    "bestvideo[height<=1440]+bestaudio/best[height<=1440]/best",
-            "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-            "720p":  "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-            "480p":  "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+            "4K":    _f(2160),
+            "2K":    _f(1440),
+            "1080p": _f(1080),
+            "720p":  _f(720),
+            "480p":  _f(480),
         }
-        return m.get(self.resolution_mode, "bestvideo+bestaudio/best")
+        return m.get(self.resolution_mode,
+                     "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo+bestaudio/best")
 
     def _dl_worker(self, vid, idx, tot):
         self.pause_event.wait()
@@ -294,6 +307,10 @@ class YouTubeDownloadThread(QThread):
             get_ytdlp_path(),
             "-f", self._format_for_res(),
             "--merge-output-format", "mp4",
+            # Ép MỌI video về H.264 + AAC (mp4 chuẩn) để xem trước / render /
+            # import editor được 100%, kể cả video gốc là VP9/AV1/Opus.
+            "--recode-video", "mp4",
+            "--postprocessor-args", "VideoConvertor:-c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 192k -movflags +faststart",
             "-o", outtmpl,
             "--no-warnings", "--no-playlist",
             "--newline",
