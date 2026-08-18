@@ -174,7 +174,8 @@ class YouTubeScanThread(QThread):
         self.log.emit(f"🚀 QUÉT YOUTUBE: {url}\n")
         self.user_log.emit(f"🔍 Đang quét YouTube...\n")
         res = []
-        cmd = [get_ytdlp_path(), "--flat-playlist", "--dump-json", "--no-warnings"]
+        cmd = [get_ytdlp_path(), "--flat-playlist", "--dump-json", "--no-warnings",
+               "--extractor-args", "youtube:player_client=android,web"]
         
         if self.cookie_file and os.path.exists(self.cookie_file):
             cmd.extend(["--cookies", self.cookie_file])
@@ -311,6 +312,8 @@ class YouTubeDownloadThread(QThread):
             # import editor được 100%, kể cả video gốc là VP9/AV1/Opus.
             "--recode-video", "mp4",
             "--postprocessor-args", "VideoConvertor:-c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 192k -movflags +faststart",
+            "--no-mtime",           # Không ghi đè ngày giờ file
+            "--no-write-info-json", # Không tạo file .info.json / .txt rác
             "-o", outtmpl,
             "--no-warnings", "--no-playlist",
             "--newline",
@@ -318,6 +321,7 @@ class YouTubeDownloadThread(QThread):
         ]
         if self.cookie_file and os.path.exists(self.cookie_file):
             cmd += ["--cookies", self.cookie_file]
+        cmd += ["--extractor-args", "youtube:player_client=android,web"]
         cmd.append(vid["url"])
 
         success = False

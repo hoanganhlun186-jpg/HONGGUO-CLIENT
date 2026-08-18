@@ -1,3 +1,4 @@
+import random
 import os, sys, re, threading, subprocess, concurrent.futures, time
 import logging
 import urllib.request, urllib.parse
@@ -551,7 +552,7 @@ class DouyinScanThread(QThread):
         self.user_log.emit(f"🔍 Đang quét kênh Douyin...\n")
         total_videos = 0
         is_search = "/search/" in url
-        _always_visible_scan = False
+        _always_visible_scan = False  # <--- Đổi False thành True ở đây
         show_browser = is_search or self._force_visible or _always_visible_scan
         has_saved_login = _douyin_logged_in()
         real_profile_dir = None
@@ -588,11 +589,11 @@ class DouyinScanThread(QThread):
                         self.log.emit("⚠️ Chưa đăng nhập Douyin — hãy vào tab Cookie bấm 'Đăng nhập' để quét ổn định hơn.\n")
                         ctx = browser.new_context(viewport={"width": 1280, "height": 720}, user_agent=UA)
                 page = ctx.new_page()
-                def route_intercept(route):
-                    if route.request.resource_type in ["image", "media", "font", "stylesheet"]: route.abort()
-                    else: route.continue_()
-                if not show_browser:
-                    page.route("**/*", route_intercept)
+                #def route_intercept(route):
+                #    if route.request.resource_type in ["image", "media", "font", "stylesheet"]: route.abort()
+                #    else: route.continue_()
+                # if not show_browser:
+                #    page.route("**/*", route_intercept)
                 def _emit_aweme_item(it):
                     nonlocal total_videos
                     vid_id = str(it.get("aweme_id") or "")
@@ -724,8 +725,28 @@ class DouyinScanThread(QThread):
                             continue
                             
                     # Cuộn cửa sổ đơn giản
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-                    page.wait_for_timeout(2500) 
+                   # 1. XỬ LÝ POPUP: Chỉ dùng phím Esc
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(500)
+                    
+                    # 2. LẤY LẠI TIÊU ĐIỂM BẰNG CÁCH CLICK VÀ RÊ CHUỘT (Như bạn suy luận)
+                    page.mouse.click(640, 150)  # Click nhẹ vào vùng thông tin kênh (an toàn)
+                    page.mouse.move(640, 400)   # Đưa con trỏ chuột ra giữa danh sách video
+                    page.wait_for_timeout(300)
+                    
+                    # 3. CUỘN TRANG BẰNG NHIỀU CÁCH KẾT HỢP:
+                    try:
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+                    except Exception:
+                        pass
+                        
+                    page.keyboard.press("PageDown")
+                    page.keyboard.press("PageDown")
+                    page.mouse.wheel(delta_x=0, delta_y=3000) # Lăn con lăn chuột xuống
+                    
+                    # 4. Tăng thời gian chờ ngẫu nhiên
+                    import random
+                    page.wait_for_timeout(random.randint(3000, 4500)) 
                     
                     if total_videos == prev_len:
                         retries += 1
