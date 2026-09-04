@@ -303,7 +303,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.66"
+APP_VERSION = "1.0.67"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -1336,7 +1336,7 @@ class StreamDownloadThread(QThread):
             url = f"{SERVER_URL}/api/client/stream_download_links"
             headers = {"Authorization": f"Bearer {self.auth_token}", "Content-Type": "application/json"}
             
-            with requests.post(url, json=self.payload, headers=headers, timeout=180, stream=True) as resp:
+            with requests.post(url, json=self.payload, headers=headers, timeout=(15, 300), stream=True) as resp:
                 if resp.status_code != 200:
                     try: 
                         err_data = resp.json()
