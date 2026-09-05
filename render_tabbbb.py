@@ -12,7 +12,7 @@
     • [MỚI] Tự động gộp trọn bộ video sau khi render xong
 ═══════════════════════════════════════════════════════════
 """
-import os, sys, subprocess, re, shutil, time, tempfile, base64, threading
+import os, sys, subprocess, re, shutil, time, tempfile, base64, threading, copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QGraphicsPixmapItem, QGraphicsItem, QStyle, QApplication
 )
 from PyQt6.QtGui import QIcon
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QUrl, QPointF, QRectF, QTimer, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QUrl, QPointF, QPoint, QRectF, QTimer, QSize, QFileSystemWatcher
 from PyQt6.QtGui import QCursor, QTextCursor, QFont, QPixmap, QPen, QBrush, QColor, QPainter
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -2214,53 +2214,338 @@ class PreviewGraphicsView(QGraphicsView):
 # ============================================================
 #  CARD MỖI TẬP TRONG GRID + THANH TIẾN ĐỘ
 # ============================================================
+_VIDEO_THUMB_CACHE = {}
+_VIDEO_THUMB_POOL = ThreadPoolExecutor(max_workers=1)
+
+
+def _video_thumb_path(video_path):
+    """Tạo/cached thumbnail 16:9 thật từ video để card nhìn như editor chuyên nghiệp.
+    Lỗi ffmpeg thì trả None và card dùng placeholder, không ảnh hưởng render."""
+    try:
+        if not video_path or not os.path.exists(video_path):
+            return None
+        mtime = int(os.path.getmtime(video_path))
+        key = (os.path.abspath(video_path), mtime)
+        cached = _VIDEO_THUMB_CACHE.get(key)
+        if cached and os.path.exists(cached):
+            return cached
+        out_dir = os.path.join(tempfile.gettempdir(), "boom_render_thumbs")
+        os.makedirs(out_dir, exist_ok=True)
+        # Dùng hash ổn định để cache thumbnail còn dùng lại được sau khi mở app lần sau.
+        import hashlib
+        cache_id = hashlib.sha1(f"{key[0]}|{key[1]}".encode("utf-8", "ignore")).hexdigest()[:20]
+        out = os.path.join(out_dir, f"thumb_{cache_id}.jpg")
+        if not os.path.exists(out) or os.path.getsize(out) < 2500:
+            ff = get_ffmpeg_path()
+            # Thumbnail chỉ dùng để xem trong card nên 360px là đủ. Ép 1 thread để
+            # không giành CPU với UI/render chính khi thư mục có 50-200 video.
+            cmd = [ff, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                   "-ss", "0.6", "-i", video_path, "-frames:v", "1",
+                   "-threads", "1", "-filter_threads", "1",
+                   "-vf", "scale=360:-2", "-q:v", "5", out]
+            kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+            if os.name == "nt":
+                kwargs["creationflags"] = CREATE_NO_WINDOW
+            subprocess.run(cmd, **kwargs)
+        if os.path.exists(out) and os.path.getsize(out) > 3000:
+            _VIDEO_THUMB_CACHE[key] = out
+            return out
+    except Exception:
+        pass
+    return None
+
+
 class EpisodeCard(QFrame):
-    """1 ô trong lưới: hiển thị 1 tập đã ghép cặp video + srt.
-    Cho phép đổi lại video/srt nếu ghép sai, và bấm chọn để preview."""
-    clicked = pyqtSignal(object)      # phát chính card khi được bấm
+    """Card kiểu Video Editor: checkbox + badge nguồn + thumbnail 16:9 + timeline.
+    Giữ nguyên API cũ (lbl_name/lbl_srt/lbl_badge/video_path/srt_path) để backend
+    render, dịch, lồng tiếng không phải thay đổi theo giao diện mới."""
+    clicked = pyqtSignal(object)
+    play_requested = pyqtSignal(object)
+    seek_requested = pyqtSignal(object, int)
+    selection_changed = pyqtSignal()
+    thumb_ready = pyqtSignal(str, str)   # source_video, thumb_path
 
     def __init__(self, video_path, srt_path, parent=None):
         super().__init__(parent)
         self.video_path = video_path
         self.srt_path = srt_path
         self.selected = False
-        self.setFixedHeight(96)
+        # Mỗi card giữ cấu hình chỉnh sửa RIÊNG. Chỉ khi bấm "Đồng bộ" mới
+        # sao chép cấu hình của card đang chọn sang các card khác.
+        self.design_config = None
+        self._thumb_pix = QPixmap()
+        self._thumb_loaded = False
+        self._thumb_loading = False
+        self._thumb_source = ""
+        self._thumb_last_size = QSize()
+        self.setMinimumWidth(245)
+        self.setFixedHeight(276)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setObjectName("EpisodeCard")
+        self.thumb_ready.connect(self._apply_thumbnail_path)
         self._build()
+        # KHÔNG tạo thumbnail cho toàn bộ 55/100 card ngay lúc mở. RenderWidget
+        # sẽ chỉ gọi ensure_thumbnail() cho những card đang nằm gần vùng nhìn thấy.
+        self.lbl_thumb.setText("🎬\nSẵn sàng xem trước")
+        self._thumb_resize_timer = QTimer(self)
+        self._thumb_resize_timer.setSingleShot(True)
+        self._thumb_resize_timer.setInterval(90)
+        self._thumb_resize_timer.timeout.connect(self._refresh_thumb_pixmap)
+        self._update_source_badges()
         self._apply_style()
 
+    def _badge(self, text, fg, bg):
+        w = QLabel(text)
+        w.setStyleSheet(
+            f"QLabel {{ color:{fg}; background:{bg}; border:1px solid {fg}; "
+            "border-radius:4px; padding:1px 5px; font-size:9px; font-weight:700; }}")
+        return w
+
     def _build(self):
-        lay = QVBoxLayout(self); lay.setContentsMargins(8, 6, 8, 6); lay.setSpacing(2)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(7, 7, 7, 7)
+        lay.setSpacing(5)
+
+        # Dòng đầu: chọn tập + tên + trạng thái
+        top = QHBoxLayout(); top.setSpacing(5)
+        self.chk_select = QCheckBox()
+        self.chk_select.setChecked(True)
+        self.chk_select.setToolTip("Chọn/bỏ chọn tập này khi Xuất hoặc Gộp")
+        self.chk_select.toggled.connect(lambda _v: self.selection_changed.emit())
+        top.addWidget(self.chk_select)
         self.lbl_name = QLabel(os.path.basename(self.video_path))
-        self.lbl_name.setStyleSheet("color:#E5E6E8; font-weight:bold; font-size:11px; border:none;")
-        self.lbl_name.setWordWrap(True)
-        srt_txt = os.path.basename(self.srt_path) if self.srt_path else "⚠️ CHƯA CÓ SUB"
-        srt_col = "#8A8D98" if self.srt_path else "#F87171"
-        self.lbl_srt = QLabel("📄 " + srt_txt)
-        self.lbl_srt.setStyleSheet(f"color:{srt_col}; font-size:10px; border:none;")
+        self.lbl_name.setToolTip(self.video_path)
+        self.lbl_name.setStyleSheet("color:#E8EAED; font-weight:700; font-size:10px; border:none;")
+        self.lbl_name.setWordWrap(False)
+        top.addWidget(self.lbl_name, 1)
         self.lbl_badge = QLabel("chờ")
-        self.lbl_badge.setStyleSheet("background:#2D303D; color:#8A8D98; font-size:9px; padding:1px 6px; border-radius:4px; border:none;")
-        top = QHBoxLayout(); top.addWidget(self.lbl_name, stretch=1); top.addWidget(self.lbl_badge)
-        lay.addLayout(top); lay.addWidget(self.lbl_srt)
+        self.lbl_badge.setStyleSheet(
+            "background:#30343B; color:#AEB4BE; font-size:9px; padding:2px 6px; "
+            "border-radius:4px; border:none; font-weight:700;")
+        top.addWidget(self.lbl_badge)
+        lay.addLayout(top)
+
+        # Badge Gốc / Dịch / Giọng như ảnh mẫu
+        badges = QHBoxLayout(); badges.setSpacing(4)
+        self.badge_original = self._badge("Gốc", "#7DB7FF", "#172A42")
+        self.badge_translate = self._badge("Dịch", "#FFB15C", "#3A2815")
+        self.badge_voice = self._badge("Giọng", "#63D79A", "#163326")
+        badges.addWidget(self.badge_original)
+        badges.addWidget(self.badge_translate)
+        badges.addWidget(self.badge_voice)
+        badges.addStretch()
+        lay.addLayout(badges)
+
+        # Khung xem trước 16:9 ngay TRÊN TỪNG CARD. Bình thường hiện thumbnail;
+        # card đang chọn sẽ nhận shared PreviewGraphicsView từ RenderWidget để
+        # phát video thật và kéo trực tiếp sub/logo/vùng mờ ngay tại đây.
+        self.preview_host = QFrame()
+        self.preview_host.setMinimumHeight(150)
+        self.preview_host.setStyleSheet(
+            "QFrame { background:#08111F; border:1px solid #233B5C; border-radius:7px; }")
+        self.preview_lay = QVBoxLayout(self.preview_host)
+        self.preview_lay.setContentsMargins(0, 0, 0, 0)
+        self.preview_lay.setSpacing(0)
+        self.lbl_thumb = QLabel("🎬\nĐang lấy khung hình...")
+        self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_thumb.setStyleSheet(
+            "QLabel { background:#0B0D10; color:#737983; border:none; "
+            "border-radius:5px; font-size:11px; }")
+        self.preview_lay.addWidget(self.lbl_thumb)
+        self._preview_attached = False
+        lay.addWidget(self.preview_host, 1)
+
+        # Phụ đề đi kèm, giữ object cũ để các hàm khác cập nhật được
+        srt_txt = os.path.basename(self.srt_path) if self.srt_path else "CHƯA CÓ SUB"
+        srt_col = "#9AA0A6" if self.srt_path else "#FF7373"
+        self.lbl_srt = QLabel("S1  " + srt_txt)
+        self.lbl_srt.setToolTip(self.srt_path or "Chưa có phụ đề")
+        self.lbl_srt.setStyleSheet(f"color:{srt_col}; font-size:9px; border:none;")
+        lay.addWidget(self.lbl_srt)
+
+        # Timeline mini + play + track
+        bottom = QHBoxLayout(); bottom.setSpacing(5)
+        self.cmb_track = QComboBox()
+        self.cmb_track.addItems(["Gốc", "Lồng tiếng"])
+        self.cmb_track.setFixedWidth(86)
+        self.cmb_track.setStyleSheet(
+            "QComboBox { background:#171A1F; color:#C9CDD3; border:1px solid #30343B; "
+            "border-radius:4px; padding:3px 5px; font-size:9px; }")
+        bottom.addWidget(self.cmb_track)
+        self.btn_card_play = QPushButton("▶")
+        self.btn_card_play.setFixedSize(27, 24)
+        self.btn_card_play.setStyleSheet(
+            "QPushButton { background:#20242A; color:#E8EAED; border:1px solid #343A42; "
+            "border-radius:4px; padding:0; } QPushButton:hover { background:#2B3138; border-color:#39C7D8; }")
+        self.btn_card_play.clicked.connect(lambda: self.play_requested.emit(self))
+        bottom.addWidget(self.btn_card_play)
+        self.play_slider = QSlider(Qt.Orientation.Horizontal)
+        self.play_slider.setRange(0, 0)
+        self.play_slider.setSingleStep(250)
+        self.play_slider.setStyleSheet(
+            "QSlider::groove:horizontal { background:#2A2F36; height:4px; border-radius:2px; } "
+            "QSlider::sub-page:horizontal { background:#30BFD0; border-radius:2px; } "
+            "QSlider::handle:horizontal { background:#E8EAED; width:10px; margin:-3px 0; border-radius:5px; }")
+        self.play_slider.sliderMoved.connect(lambda v: self.seek_requested.emit(self, int(v)))
+        bottom.addWidget(self.play_slider, 1)
+        self.lbl_time_card = QLabel("00:00 / 00:00")
+        self.lbl_time_card.setStyleSheet("color:#8D949E; font-size:9px; border:none;")
+        bottom.addWidget(self.lbl_time_card)
+        lay.addLayout(bottom)
+
+        # Thanh mảnh riêng cho tiến độ render, không chiếm timeline phát video.
+        self.mini_progress = QProgressBar()
+        self.mini_progress.setRange(0, 100); self.mini_progress.setValue(0)
+        self.mini_progress.setTextVisible(False); self.mini_progress.setFixedHeight(3)
+        self.mini_progress.setStyleSheet(
+            "QProgressBar { background:#24292F; border:none; border-radius:1px; } "
+            "QProgressBar::chunk { background:#63D79A; border-radius:1px; }")
+        lay.addWidget(self.mini_progress)
+
+    def ensure_thumbnail(self):
+        """Chỉ nạp thumbnail khi card sắp/đang xuất hiện trên màn hình."""
+        src = self.video_path
+        try:
+            same = self._thumb_source and os.path.abspath(self._thumb_source) == os.path.abspath(src)
+        except Exception:
+            same = (self._thumb_source == src)
+        if same and (self._thumb_loaded or self._thumb_loading):
+            return
+        self._load_thumbnail()
+
+    def _load_thumbnail(self):
+        """Thumbnail nền nhẹ: tối đa 1 ffmpeg và chỉ chạy cho card đang nhìn thấy."""
+        src = self.video_path
+        self._thumb_source = src
+        self._thumb_loaded = False
+        self._thumb_loading = True
+        self._thumb_last_size = QSize()
+        self._thumb_pix = QPixmap()
+        self.lbl_thumb.setPixmap(QPixmap())
+        self.lbl_thumb.setText("🎬\nĐang lấy khung hình...")
+
+        # Nếu đã cache trong RAM thì hiển thị ngay. Cache trên đĩa sẽ được
+        # _video_thumb_path bắt lại bằng tên hash ổn định mà không decode video.
+        try:
+            key = (os.path.abspath(src), int(os.path.getmtime(src)))
+            cached = _VIDEO_THUMB_CACHE.get(key)
+        except Exception:
+            cached = None
+        if cached and os.path.exists(cached):
+            self._apply_thumbnail_path(src, cached)
+            return
+
+        fut = _VIDEO_THUMB_POOL.submit(_video_thumb_path, src)
+        def _done(f, source=src):
+            try:
+                result = f.result() or ""
+                self.thumb_ready.emit(source, result)
+            except Exception:
+                try:
+                    self.thumb_ready.emit(source, "")
+                except Exception:
+                    pass
+        fut.add_done_callback(_done)
+
+    def _apply_thumbnail_path(self, source_video, path):
+        # Card có thể đã đổi video trong lúc thumbnail cũ đang chạy.
+        if os.path.abspath(source_video) != os.path.abspath(self.video_path):
+            return
+        self._thumb_loading = False
+        self._thumb_loaded = True
+        if path:
+            pix = QPixmap(path)
+            if not pix.isNull():
+                self._thumb_pix = pix
+                self._thumb_last_size = QSize()
+                self.lbl_thumb.setText("")
+                self._refresh_thumb_pixmap()
+                return
+        self._thumb_pix = QPixmap()
+        self.lbl_thumb.setPixmap(QPixmap())
+        self.lbl_thumb.setText("🎬  Không lấy được thumbnail")
+
+    def _refresh_thumb_pixmap(self):
+        if self._thumb_pix.isNull() or self._preview_attached:
+            return
+        size = self.lbl_thumb.size()
+        if size.width() < 20 or size.height() < 20:
+            size = QSize(360, 150)
+        # Không scale lại nếu kích thước thực tế không đổi. Đây là điểm giảm lag
+        # rất nhiều khi cuộn/resize grid có 50-200 card.
+        if self._thumb_last_size == size:
+            return
+        self._thumb_last_size = QSize(size)
+        pix = self._thumb_pix.scaled(
+            size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        self.lbl_thumb.setPixmap(pix)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Debounce: Qt có thể phát hàng chục resizeEvent trong một lần relayout.
+        if hasattr(self, "_thumb_resize_timer"):
+            self._thumb_resize_timer.start()
+
+    def _update_source_badges(self):
+        has_vi = bool(self.srt_path and self.srt_path.lower().endswith("_vi.srt"))
+        stem, ext = os.path.splitext(self.video_path)
+        is_dub = stem.lower().endswith("_dubbed") or os.path.exists(stem + "_dubbed" + ext)
+        self.badge_translate.setVisible(has_vi)
+        self.badge_voice.setVisible(is_dub)
+        self.cmb_track.setCurrentIndex(1 if is_dub else 0)
+
+    def is_checked(self):
+        return self.chk_select.isChecked()
+
+    def set_play_progress(self, pct, seconds=None):
+        # Hàm này vẫn dành cho % render để giữ tương thích backend cũ.
+        self.mini_progress.setValue(max(0, min(100, int(pct))))
+
+    def set_media_position(self, pos_ms, dur_ms):
+        dur_ms = max(0, int(dur_ms or 0))
+        pos_ms = max(0, min(int(pos_ms or 0), dur_ms if dur_ms else int(pos_ms or 0)))
+        self.play_slider.blockSignals(True)
+        self.play_slider.setRange(0, dur_ms)
+        self.play_slider.setValue(pos_ms)
+        self.play_slider.blockSignals(False)
+        self.lbl_time_card.setText(
+            f"{format_time(pos_ms/1000)} / {format_time(dur_ms/1000)}")
+
+    def attach_preview_widget(self, widget):
+        if widget is None:
+            return
+        self.lbl_thumb.hide()
+        self.preview_lay.addWidget(widget)
+        widget.show()
+        self._preview_attached = True
+
+    def detach_preview_widget(self, widget=None):
+        if widget is not None and self.preview_lay.indexOf(widget) >= 0:
+            self.preview_lay.removeWidget(widget)
+            widget.hide()
+        self._preview_attached = False
+        self.lbl_thumb.show()
+        self.ensure_thumbnail()
+        self._refresh_thumb_pixmap()
 
     def _apply_style(self):
         if self.selected:
-            self.setStyleSheet("QFrame { background:#232533; border:2px solid #10B981; border-radius:8px; }")
+            self.setStyleSheet(
+                "QFrame#EpisodeCard { background:#20252B; border:2px solid #35C3D4; border-radius:7px; }"
+                "QFrame#EpisodeCard:hover { background:#232A31; }")
         else:
-            self.setStyleSheet("QFrame { background:#1C1D27; border:1px solid #2D303D; border-radius:8px; } QFrame:hover { border:1px solid #7452FF; }")
+            self.setStyleSheet(
+                "QFrame#EpisodeCard { background:#181B20; border:1px solid #30353C; border-radius:7px; }"
+                "QFrame#EpisodeCard:hover { background:#1E2329; border:1px solid #59616C; }")
 
     def set_selected(self, val):
-        self.selected = val; self._apply_style()
+        self.selected = val
+        self._apply_style()
 
     def refresh_srt_from_disk(self):
-        """Tự dò lại sub + video đã lồng tiếng cạnh video trên đĩa và cập
-        nhật nhãn. Ưu tiên bản tiếng Việt (*_vi.srt), không có thì lấy .srt
-        gốc (vừa tách xong). Nếu tìm thấy *_dubbed.mp4 cạnh video gốc thì
-        chuyển video_path sang bản đã lồng để RENDER DÙNG ĐÚNG TIẾNG ĐÃ LỒNG
-        (trước đây render vẫn lấy video gốc vì không ai cập nhật video_path).
-        Trả về True nếu vừa tìm thấy sub mới hoặc video mới."""
-        # Xác định stem gốc (bỏ hậu tố _dubbed nếu video_path đang trỏ
-        # tới bản gốc chưa lồng)
+        """Tự dò lại sub + video lồng tiếng như logic cũ, sau đó cập nhật badge/card."""
         stem, ext = os.path.splitext(self.video_path)
         if stem.endswith("_dubbed"):
             orig_stem = stem[:-len("_dubbed")]
@@ -2271,40 +2556,48 @@ class EpisodeCard(QFrame):
         if os.path.exists(dubbed_video) and self.video_path != dubbed_video:
             self.video_path = dubbed_video
             video_changed = True
-            if hasattr(self, "lbl_name"):
-                self.lbl_name.setText(os.path.basename(self.video_path))
+            self.lbl_name.setText(os.path.basename(self.video_path))
+            self.lbl_name.setToolTip(self.video_path)
+            self._thumb_loaded = False
+            self._thumb_loading = False
+            self._thumb_source = ""
+            self.ensure_thumbnail()
 
-        base = orig_stem
-        vi = base + "_vi.srt"
-        raw = base + ".srt"
-        found = None
-        if os.path.exists(vi):
-            found = vi
-        elif os.path.exists(raw):
-            found = raw
+        vi = orig_stem + "_vi.srt"
+        raw = orig_stem + ".srt"
+        found = vi if os.path.exists(vi) else (raw if os.path.exists(raw) else None)
         if not found:
+            self._update_source_badges()
             return video_changed
         changed = (self.srt_path != found) or video_changed
         self.srt_path = found
-        # Nhãn: bản Việt -> xanh, sub gốc (chưa dịch) -> vàng nhắc nhở
+        self.lbl_srt.setToolTip(found)
         if found.endswith("_vi.srt"):
-            self.lbl_srt.setText("📄 " + os.path.basename(found))
-            self.lbl_srt.setStyleSheet("color:#10B981; font-size:10px; border:none;")
+            self.lbl_srt.setText("S1  " + os.path.basename(found))
+            self.lbl_srt.setStyleSheet("color:#63D79A; font-size:9px; border:none;")
         else:
-            self.lbl_srt.setText("📄 " + os.path.basename(found) + " (sub gốc)")
-            self.lbl_srt.setStyleSheet("color:#FBBF24; font-size:10px; border:none;")
+            self.lbl_srt.setText("S0  " + os.path.basename(found) + " (sub gốc)")
+            self.lbl_srt.setStyleSheet("color:#F5C26B; font-size:9px; border:none;")
+        self._update_source_badges()
         return changed
 
     def set_status(self, status):
         colors = {
-            "chờ": ("#2D303D", "#8A8D98"),
-            "đang render": ("#3B2A1A", "#F37021"),
-            "xong": ("#1B3320", "#10B981"),
-            "lỗi": ("#3B1A1A", "#F87171"),
+            "chờ": ("#30343B", "#AEB4BE"),
+            "đang render": ("#3A2B18", "#FFB15C"),
+            "xong": ("#173629", "#63D79A"),
+            "lỗi": ("#3C1E21", "#FF7373"),
+            "đã dừng": ("#353238", "#C6A7E8"),
         }
-        bg, fg = colors.get(status, ("#2D303D", "#8A8D98"))
+        bg, fg = colors.get(status, ("#30343B", "#AEB4BE"))
         self.lbl_badge.setText(status)
-        self.lbl_badge.setStyleSheet(f"background:{bg}; color:{fg}; font-size:9px; padding:1px 6px; border-radius:4px; border:none;")
+        self.lbl_badge.setStyleSheet(
+            f"background:{bg}; color:{fg}; font-size:9px; padding:2px 6px; "
+            "border-radius:4px; border:none; font-weight:700;")
+        if status == "xong":
+            self.mini_progress.setValue(100)
+        elif status in ("chờ", "lỗi", "đã dừng"):
+            self.mini_progress.setValue(0)
 
     def mousePressEvent(self, e):
         self.clicked.emit(self)
@@ -2357,6 +2650,12 @@ class RenderWidget(QWidget):
         super().__init__(parent)
         self.settings = QSettings("HongguoDownloader", "RenderTab")
         self.cards = []                 # danh sách EpisodeCard trong grid
+        self._card_path_set = set()      # tra trùng O(1), tránh quét lại hàng trăm card
+        self._bulk_loading = False       # True khi đang nạp thư mục lớn theo từng lô
+        self._bulk_pairs = []
+        self._bulk_index = 0
+        self._bulk_batch_size = 8        # mỗi nhịp chỉ tạo vài card để UI luôn phản hồi
+        self._bulk_source_label = ""
         self.selected_card = None
         self._thumb_src_path = None     # ảnh gốc cho thumbnail AI
         self._thumb_srt_path = None     # SRT tập phim (không bắt buộc)
@@ -2364,7 +2663,8 @@ class RenderWidget(QWidget):
         self.blur_boxes = []
         self.sample_sub = None
         self.logo_item = None
-        self._design_locked = None
+        self._design_locked = None  # giữ tương thích code cũ; render mới dùng config từng card
+        self._loading_card_design = False
         self._render_queue = []         # hàng đợi render (các card)
         self._render_running = False
         self._stopping = False
@@ -2373,23 +2673,55 @@ class RenderWidget(QWidget):
         self._total_units = 0     # = số tập × số bước
         self._done_units = 0      # số "việc" đã xong (mỗi tập mỗi bước = 1)
         self._total_active = False  # True khi đang chạy "Làm tất cả" trọn quy trình
+        # BOOM Studio V2: trạng thái thư viện / bộ lọc. Chỉ ảnh hưởng giao diện,
+        # backend vẫn luôn giữ self.cards đầy đủ để render đúng.
+        self._library_filter = "all"
+        self._search_text = ""
+        self._filter_buttons = {}
+        self._sidebar_counts = {}
 
+        # ── REALTIME COUNTERS ──────────────────────────────────────────
+        # Theo dõi THƯ MỤC bằng QFileSystemWatcher (event-driven), không quét
+        # 200-500 file liên tục bằng timer. Khi pipeline tạo .srt/_vi.srt/
+        # _dubbed.mp4/_final.mp4, Qt báo directoryChanged -> debounce -> chỉ
+        # cập nhật những card có trạng thái thay đổi.
+        self._rt_state_cache = {}
+        self._rt_watch_dirs = set()
+        self._rt_refresh_timer = QTimer(self)
+        self._rt_refresh_timer.setSingleShot(True)
+        self._rt_refresh_timer.setInterval(140)
+        self._rt_refresh_timer.timeout.connect(self._realtime_refresh_states)
+        self._rt_fs_watcher = QFileSystemWatcher(self)
+        self._rt_fs_watcher.directoryChanged.connect(self._on_realtime_dir_changed)
+
+        # Theme Video Editor chuyên nghiệp, gần bố cục ảnh tham chiếu:
+        # nền charcoal, card tối, nhấn cyan, panel phải gọn và thanh thao tác cố định.
         self.setStyleSheet("""
-            QWidget { background:#11121A; color:#E5E6E8; font-family:'Segoe UI',Arial,sans-serif; }
+            QWidget { background:#121416; color:#E8EAED; font-family:'Segoe UI',Arial,sans-serif; }
             QScrollArea { border:none; background:transparent; }
-            QScrollBar:vertical { background:#11121A; width:8px; }
-            QScrollBar::handle:vertical { background:#3B3E4D; border-radius:4px; }
-            QPushButton { background:#2D303D; color:#E5E6E8; border-radius:6px; padding:7px; font-weight:bold; border:1px solid #3B3E4D; }
-            QPushButton:hover { background:#3B3E4D; border:1px solid #7452FF; color:white; }
-            QLineEdit, QSpinBox, QComboBox, QDoubleSpinBox { background:#11121A; border:1px solid #2D303D; padding:7px; color:white; border-radius:4px; font-weight:bold; }
-            QComboBox QAbstractItemView { background:#1C1D27; border:1px solid #7452FF; selection-background-color:#2D303D; }
-            QCheckBox { font-weight:bold; padding:3px; }
-            QCheckBox::indicator { width:18px; height:18px; border-radius:4px; border:1px solid #3B3E4D; background:#11121A; }
-            QCheckBox::indicator:checked { background:#10B981; border:1px solid #10B981; }
+            QScrollBar:vertical { background:#15181B; width:9px; margin:1px; }
+            QScrollBar::handle:vertical { background:#3A4048; border-radius:4px; min-height:34px; }
+            QScrollBar::handle:vertical:hover { background:#4B535D; }
+            QPushButton { background:#252A30; color:#DDE1E6; border-radius:5px; padding:6px 9px;
+                          font-weight:600; border:1px solid #363D45; }
+            QPushButton:hover { background:#30363D; border:1px solid #3BC2D2; color:white; }
+            QPushButton:pressed { background:#1D2227; }
+            QPushButton:disabled { background:#1C2024; color:#666D75; border-color:#282D33; }
+            QLineEdit, QSpinBox, QComboBox, QDoubleSpinBox {
+                background:#171A1E; border:1px solid #343A42; padding:6px; color:#F1F3F4;
+                border-radius:4px; font-weight:600; }
+            QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QDoubleSpinBox:focus { border:1px solid #32BECE; }
+            QComboBox QAbstractItemView { background:#20242A; border:1px solid #3E454E; selection-background-color:#2A5058; }
+            QCheckBox { font-weight:600; padding:2px; color:#D7DBE0; }
+            QCheckBox::indicator { width:16px; height:16px; border-radius:3px; border:1px solid #4A515A; background:#15181B; }
+            QCheckBox::indicator:checked { background:#31BFD0; border:1px solid #31BFD0; }
+            QSlider::groove:horizontal { height:4px; background:#30353B; border-radius:2px; }
+            QSlider::sub-page:horizontal { background:#31BFD0; border-radius:2px; }
+            QSlider::handle:horizontal { width:11px; margin:-4px 0; border-radius:5px; background:#E8EAED; }
+            QToolTip { background:#262B31; color:#F1F3F4; border:1px solid #464E57; padding:4px; }
         """)
 
-        # Helper: bọc 1 widget vào vùng cuộn dọc — để màn hình NHỎ / scale 125%
-        # không bị tràn, các mục đè lên nhau. Nội dung dài tự có thanh cuộn.
+        # Helper: bọc widget dài vào vùng cuộn dọc.
         def _wrap_scroll(inner):
             sc = QScrollArea()
             sc.setWidgetResizable(True)
@@ -2400,220 +2732,369 @@ class RenderWidget(QWidget):
             return sc
         self._wrap_scroll = _wrap_scroll
 
-        main = QHBoxLayout(self); main.setContentsMargins(10, 10, 10, 10); main.setSpacing(10)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(7, 7, 7, 7)
+        root.setSpacing(6)
 
-        # ---------- CỘT TRÁI: GRID GHÉP CẶP ----------
-        left = QFrame(); left.setMinimumWidth(240); left.setMaximumWidth(340)
-        left.setStyleSheet("background:#151821; border-radius:8px; border:1px solid #1F222D;")
-        ll = QVBoxLayout(left); ll.setContentsMargins(10, 10, 10, 10)
-        head_q = QHBoxLayout()
-        head_q.addWidget(QLabel("🎞️ Hàng đợi Render", styleSheet="font-size:14px; font-weight:bold; color:#F37021; border:none;"))
-        head_q.addStretch()
-        self.btn_open_folder = QPushButton("📂 Mở thư mục")
-        self.btn_open_folder.setStyleSheet("QPushButton { background:#2D303D; color:#E5E6E8; padding:6px 10px; font-size:11px; border-radius:6px; border:1px solid #3B3E4D; } QPushButton:hover { background:#3B3E4D; border:1px solid #7452FF; color:white; }")
+        # ── Header riêng của BOOM Studio Render V2 ───────────────────────
+        topbar = QFrame()
+        topbar.setObjectName("BoomV2TopBar")
+        topbar.setFixedHeight(58)
+        topbar.setStyleSheet(
+            "QFrame#BoomV2TopBar { background:#0E1A2D; border:1px solid #17355E; border-radius:10px; }")
+        top_lay = QHBoxLayout(topbar); top_lay.setContentsMargins(13, 7, 10, 7); top_lay.setSpacing(8)
+
+        brand_box = QVBoxLayout(); brand_box.setSpacing(0)
+        title = QLabel("▶  BOOM STUDIO")
+        title.setStyleSheet("color:#F6F8FF; font-size:16px; font-weight:900; letter-spacing:.8px; border:none;")
+        subtitle = QLabel("Tạo video dễ hơn bao giờ hết")
+        subtitle.setStyleSheet("color:#88A4C8; font-size:8px; border:none;")
+        brand_box.addWidget(title); brand_box.addWidget(subtitle)
+        top_lay.addLayout(brand_box)
+        top_lay.addSpacing(18)
+
+        self.btn_nav_edit = QPushButton("▣  Tải & Chỉnh sửa")
+        self.btn_nav_edit.setCheckable(True); self.btn_nav_edit.setChecked(True)
+        self.btn_nav_dub = QPushButton("◉  Dịch & Lồng tiếng")
+        self.btn_nav_render = QPushButton("▤  Render & Xuất")
+        self.btn_nav_project = QPushButton("▣  Quản lý dự án")
+        for _b in (self.btn_nav_edit, self.btn_nav_dub, self.btn_nav_render, self.btn_nav_project):
+            _b.setFixedHeight(36)
+            _b.setStyleSheet(
+                "QPushButton { background:#132743; color:#AFC3DE; border:1px solid #1D3C65; "
+                "border-radius:8px; padding:7px 14px; font-size:9px; font-weight:800; } "
+                "QPushButton:hover { background:#17355A; color:white; border-color:#2F8CFF; } "
+                "QPushButton:checked { background:#154A8B; color:#FFFFFF; border:1px solid #2B8DFF; }")
+        self.btn_nav_dub.clicked.connect(self._open_pipeline_tab)
+        self.btn_nav_render.clicked.connect(lambda: self.btn_run.setFocus() if hasattr(self, "btn_run") else None)
+        self.btn_nav_project.clicked.connect(lambda: QMessageBox.information(self, "Quản lý dự án", "Phần quản lý dự án sẽ dùng Auto Save của BOOM Studio."))
+        top_lay.addWidget(self.btn_nav_edit); top_lay.addWidget(self.btn_nav_dub)
+        top_lay.addWidget(self.btn_nav_render); top_lay.addWidget(self.btn_nav_project)
+        top_lay.addStretch()
+
+        self.lbl_editor_count = QLabel("0 video")
+        self.lbl_editor_count.setStyleSheet(
+            "color:#86E7FF; background:#102E45; border:1px solid #1B607C; border-radius:11px; "
+            "padding:3px 9px; font-size:9px; font-weight:800;")
+        top_lay.addWidget(self.lbl_editor_count)
+        self.btn_open_folder = QPushButton("📂  Mở thư mục")
+        self.btn_open_folder.setFixedHeight(32)
         self.btn_open_folder.clicked.connect(self._open_render_folder)
-        head_q.addWidget(self.btn_open_folder)
+        top_lay.addWidget(self.btn_open_folder)
+        root.addWidget(topbar)
+
+        # ── Khu làm việc chính: Grid lớn + Inspector phải ─────────────
+        body = QHBoxLayout(); body.setSpacing(8)
+        root.addLayout(body, 1)
+
+        # SIDEBAR — khác hẳn tool tham chiếu: thư viện + bộ lọc nhanh riêng của BOOM.
+        sidebar = QFrame(); sidebar.setObjectName("BoomLibrarySidebar")
+        sidebar.setFixedWidth(190)
+        sidebar.setStyleSheet(
+            "QFrame#BoomLibrarySidebar { background:#101D31; border:1px solid #183758; border-radius:9px; }")
+        sl = QVBoxLayout(sidebar); sl.setContentsMargins(9, 10, 9, 10); sl.setSpacing(6)
+
+        btn_side_add = QPushButton("＋  Thêm video\n    Chọn từng file video")
+        btn_side_add.setFixedHeight(52)
+        btn_side_add.setStyleSheet(
+            "QPushButton { text-align:left; background:#106B66; color:#F4FFFF; border:1px solid #168E86; "
+            "border-radius:9px; padding:7px 10px; font-size:9px; font-weight:900; } "
+            "QPushButton:hover { background:#138278; }")
+        btn_side_add.clicked.connect(self._pick_files)
+        sl.addWidget(btn_side_add)
+
+        btn_side_folder = QPushButton("📁  Thêm thư mục\n    Quét toàn bộ video")
+        btn_side_folder.setFixedHeight(52)
+        btn_side_folder.setStyleSheet(
+            "QPushButton { text-align:left; background:#176CE5; color:white; border:1px solid #2B8CFF; "
+            "border-radius:9px; padding:7px 10px; font-size:9px; font-weight:900; } "
+            "QPushButton:hover { background:#237CF2; }")
+        btn_side_folder.clicked.connect(self._pick_folder)
+        sl.addWidget(btn_side_folder)
+        sl.addSpacing(8)
+
+        sl.addWidget(QLabel("THƯ VIỆN", styleSheet="color:#6E91BC; font-size:8px; font-weight:900; border:none;"))
+
+        def _make_sidebar_filter(key, label, icon="•"):
+            btn = QPushButton(f"{icon}   {label}")
+            btn.setCheckable(True)
+            btn.setFixedHeight(30)
+            btn.setStyleSheet(
+                "QPushButton { text-align:left; background:transparent; color:#C7D4E7; border:none; "
+                "border-radius:7px; padding:5px 8px; font-size:9px; font-weight:700; } "
+                "QPushButton:hover { background:#172E4C; color:white; } "
+                "QPushButton:checked { background:#1B4D86; color:white; border:1px solid #2A70BC; }")
+            btn.clicked.connect(lambda _checked=False, k=key: self._set_library_filter(k))
+            self._filter_buttons[key] = btn
+            row = QHBoxLayout(); row.setSpacing(3); row.addWidget(btn, 1)
+            count = QLabel("0")
+            count.setFixedWidth(34); count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            count.setStyleSheet("color:#CDE4FF; background:#213A60; border-radius:9px; padding:2px; font-size:8px; font-weight:800;")
+            row.addWidget(count)
+            self._sidebar_counts[key] = count
+            sl.addLayout(row)
+            return btn
+
+        _make_sidebar_filter("all", "Tất cả", "▣").setChecked(True)
+        _make_sidebar_filter("edited", "Đã chỉnh sửa", "✎")
+        _make_sidebar_filter("exported", "Đã xuất", "⬇")
+        _make_sidebar_filter("error", "Lỗi / Cần xử lý", "⚠")
+
+        sl.addSpacing(7)
+        sl.addWidget(QLabel("BỘ LỌC NHANH", styleSheet="color:#6E91BC; font-size:8px; font-weight:900; border:none;"))
+        _make_sidebar_filter("nosub", "Chưa sub", "◫")
+        _make_sidebar_filter("notrans", "Chưa dịch", "文")
+        _make_sidebar_filter("nodub", "Chưa lồng tiếng", "◉")
+        _make_sidebar_filter("done", "Đã hoàn tất", "✓")
+
+        sl.addStretch()
+        self.btn_clean_junk_side = QPushButton("🧹  Dọn file trung gian")
+        self.btn_clean_junk_side.setFixedHeight(30)
+        self.btn_clean_junk_side.setStyleSheet(
+            "QPushButton { background:#312719; color:#F5C96A; border:1px solid #5B4724; border-radius:7px; font-size:8px; } "
+            "QPushButton:hover { background:#42331C; }")
+        self.btn_clean_junk_side.clicked.connect(self._clean_junk_files)
+        sl.addWidget(self.btn_clean_junk_side)
+        body.addWidget(sidebar)
+
+        # WORKSPACE / GRID — vùng chính lớn, card nằm ngay tại nơi preview/chỉnh sửa.
+        left = QFrame(); left.setMinimumWidth(640)
+        left.setStyleSheet("QFrame { background:#171A1D; border-radius:6px; border:1px solid #2D3238; }")
+        ll = QVBoxLayout(left); ll.setContentsMargins(7, 7, 7, 7); ll.setSpacing(6)
+
+        # Tìm kiếm + chip lọc ngang giống app quản lý media chuyên nghiệp.
+        search_row = QHBoxLayout(); search_row.setSpacing(5)
+        self.txt_video_search = QLineEdit()
+        self.txt_video_search.setPlaceholderText("⌕  Tìm kiếm video...")
+        self.txt_video_search.setClearButtonEnabled(True)
+        self.txt_video_search.setFixedHeight(31)
+        self.txt_video_search.textChanged.connect(self._set_search_text)
+        search_row.addWidget(self.txt_video_search, 1)
+        for _key, _label in (("all", "Tất cả"), ("portrait", "Video dọc"), ("landscape", "Video ngang"),
+                             ("nosub", "Chưa sub"), ("translated", "Đã dịch"), ("dubbed", "Đã lồng"),
+                             ("exported", "Đã xuất"), ("error", "Lỗi")):
+            _btn = QPushButton(_label)
+            _btn.setCheckable(True); _btn.setFixedHeight(29)
+            _btn.setStyleSheet(
+                "QPushButton { background:#162238; color:#AFC0D7; border:1px solid #243A5B; border-radius:7px; "
+                "padding:4px 8px; font-size:8px; font-weight:700; } "
+                "QPushButton:hover { background:#1D3453; color:white; } "
+                "QPushButton:checked { background:#1677E8; color:white; border-color:#2F91FF; }")
+            _btn.clicked.connect(lambda _checked=False, k=_key: self._set_library_filter(k))
+            self._filter_buttons[f"top_{_key}"] = _btn
+            search_row.addWidget(_btn)
+        ll.addLayout(search_row)
+
+        head_q = QHBoxLayout(); head_q.setSpacing(6)
+        lbl_queue = QLabel("Danh sách video")
+        lbl_queue.setStyleSheet("font-size:12px; font-weight:800; color:#DDE1E6; border:none;")
+        head_q.addWidget(lbl_queue)
+        self.lbl_selected_count = QLabel("Đã chọn 0/0")
+        self.lbl_selected_count.setStyleSheet("color:#8E969F; font-size:9px; border:none;")
+        head_q.addWidget(self.lbl_selected_count)
+        self.chk_select_all = QCheckBox("Chọn tất cả")
+        self.chk_select_all.setChecked(True)
+        self.chk_select_all.setStyleSheet("color:#9FB4CF; font-size:8px;")
+        self.chk_select_all.toggled.connect(self._toggle_select_all_visible)
+        head_q.addWidget(self.chk_select_all)
+        head_q.addStretch()
+        b_folder = QPushButton("📁 Thêm thư mục"); b_folder.clicked.connect(self._pick_folder)
+        b_folder.setFixedHeight(28)
+        b_files = QPushButton("＋ Thêm video"); b_files.clicked.connect(self._pick_files)
+        b_files.setFixedHeight(28)
+        b_clear = QPushButton("🗑"); b_clear.setFixedSize(34, 28); b_clear.clicked.connect(self._clear_all)
+        b_clear.setStyleSheet("QPushButton { background:#2B2022; color:#F28A8A; border:1px solid #553238; border-radius:5px; } QPushButton:hover { background:#3A2528; }")
+        head_q.addWidget(b_folder); head_q.addWidget(b_files); head_q.addWidget(b_clear)
         ll.addLayout(head_q)
 
-        btnrow = QHBoxLayout()
-        b_folder = QPushButton("📁 Chọn thư mục"); b_folder.clicked.connect(self._pick_folder)
-        b_files = QPushButton("+ File"); b_files.clicked.connect(self._pick_files)
-        b_clear = QPushButton("🗑️"); b_clear.setFixedWidth(40); b_clear.clicked.connect(self._clear_all)
-        b_clear.setStyleSheet("background:#2D303D; color:#F87171; border:1px dashed #EF4444;")
-        btnrow.addWidget(b_folder); btnrow.addWidget(b_files); btnrow.addWidget(b_clear)
-        ll.addLayout(btnrow)
-
-        # Nút dọn file rác: sau khi render xong, xóa hết file trung gian, chỉ
-        # giữ lại bản render cuối (*_final.mp4) và bản gộp trọn bộ.
-        self.btn_clean_junk = QPushButton("🧹 Dọn file rác (chỉ giữ bản render)")
-        self.btn_clean_junk.setStyleSheet("QPushButton { background:#3B2A12; color:#FBBF24; border:1px solid #92610a; border-radius:6px; padding:6px; font-size:11px; font-weight:bold; } QPushButton:hover { background:#4a350f; }")
-        self.btn_clean_junk.clicked.connect(self._clean_junk_files)
-        ll.addWidget(self.btn_clean_junk)
-
         self.scroll_grid = QScrollArea(); self.scroll_grid.setWidgetResizable(True)
-        self.grid_host = QWidget(); self.grid_lay = QGridLayout(self.grid_host)
-        self.grid_lay.setAlignment(Qt.AlignmentFlag.AlignTop); self.grid_lay.setSpacing(6)
+        self.scroll_grid.setStyleSheet("QScrollArea { background:#141719; border:none; border-radius:4px; }")
+        self.grid_host = QWidget(); self.grid_host.setStyleSheet("background:#141719;")
+        self.grid_lay = QGridLayout(self.grid_host)
+        self.grid_lay.setContentsMargins(6, 6, 6, 6)
+        self.grid_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.grid_lay.setHorizontalSpacing(7); self.grid_lay.setVerticalSpacing(7)
         self.scroll_grid.setWidget(self.grid_host)
-        ll.addWidget(self.scroll_grid, stretch=5)
+        ll.addWidget(self.scroll_grid, 1)
 
-        # sửa cặp khi chọn 1 card
-        fix = QFrame(); fix.setStyleSheet("background:#0F1117; border-radius:6px; border:1px solid #1F222D;")
-        fl = QVBoxLayout(fix); fl.setContentsMargins(8, 8, 8, 8); fl.setSpacing(4)
-        fl.addWidget(QLabel("Sửa cặp đang chọn:", styleSheet="color:#8A8D98; font-size:10px; border:none;"))
-        r1 = QHBoxLayout(); self.lbl_fix_v = QLabel("—"); self.lbl_fix_v.setStyleSheet("color:#E5E6E8; font-size:10px; border:none;")
-        bv = QPushButton("Đổi video"); bv.setFixedWidth(80); bv.clicked.connect(self._change_video)
-        r1.addWidget(self.lbl_fix_v, stretch=1); r1.addWidget(bv); fl.addLayout(r1)
-        r2 = QHBoxLayout(); self.lbl_fix_s = QLabel("—"); self.lbl_fix_s.setStyleSheet("color:#8A8D98; font-size:10px; border:none;")
-        bs = QPushButton("Đổi sub"); bs.setFixedWidth(80); bs.clicked.connect(self._change_srt)
-        r2.addWidget(self.lbl_fix_s, stretch=1); r2.addWidget(bs); fl.addLayout(r2)
-        ll.addWidget(fix)
+        # Thumbnail LAZY: chỉ xử lý những card trong/giáp vùng đang nhìn thấy.
+        # Không còn mở 55 tiến trình decode nối đuôi ngay khi thêm thư mục.
+        self._thumb_view_timer = QTimer(self)
+        self._thumb_view_timer.setSingleShot(True)
+        self._thumb_view_timer.setInterval(120)
+        self._thumb_view_timer.timeout.connect(self._load_visible_thumbnails)
+        self.scroll_grid.verticalScrollBar().valueChanged.connect(
+            lambda _v: self._schedule_visible_thumbnails())
+        self.scroll_grid.verticalScrollBar().rangeChanged.connect(
+            lambda _a, _b: self._schedule_visible_thumbnails())
 
-        # Thanh nhỏ cũ: GIỮ object để code cũ gọi không lỗi, nhưng KHÔNG hiện
-        # ra UI nữa (đã có thanh tiến trình bự bên cột phải, trên nút RENDER).
+        # Giữ attribute cũ để code ngoài không lỗi; nút thật đã chuyển sang sidebar.
+        self.btn_clean_junk = self.btn_clean_junk_side
+        body.addWidget(left, 1)
+
+        # PANEL THÔNG TIN FILE ĐANG CHỌN — KHÔNG có preview bên phải.
+        fix = QFrame(); fix.setObjectName("SelectedInfoCard")
+        fix.setStyleSheet("QFrame#SelectedInfoCard { background:#12233A; border-radius:8px; border:1px solid #24466E; }")
+        fl = QVBoxLayout(fix); fl.setContentsMargins(9, 8, 9, 8); fl.setSpacing(5)
+        info_head = QHBoxLayout()
+        self.lbl_selected_title = QLabel("🔧  Chỉnh sửa: Chưa chọn video")
+        self.lbl_selected_title.setStyleSheet("color:#F1F7FF; font-size:10px; font-weight:900; border:none;")
+        info_head.addWidget(self.lbl_selected_title, 1)
+        self.btn_reset_current = QPushButton("Đặt lại")
+        self.btn_reset_current.setFixedSize(58, 24)
+        self.btn_reset_current.clicked.connect(self._reset_current_design)
+        info_head.addWidget(self.btn_reset_current)
+        fl.addLayout(info_head)
+        fl.addWidget(QLabel("THÔNG TIN TỆP", styleSheet="color:#6E91BC; font-size:8px; font-weight:900; border:none; margin-top:2px;"))
+
+        self.lbl_fix_v = QLabel("—")
+        self.lbl_fix_v.setStyleSheet("color:#DDEBFF; font-size:9px; font-weight:800; border:none;")
+        fl.addWidget(self.lbl_fix_v)
+        info_grid = QGridLayout(); info_grid.setHorizontalSpacing(8); info_grid.setVerticalSpacing(3)
+        for _r, (_k, _txt) in enumerate((("res", "Độ phân giải"), ("dur", "Thời lượng"), ("size", "Dung lượng"), ("sub", "Phụ đề"))):
+            _lab = QLabel(_txt); _lab.setStyleSheet("color:#7D96B7; font-size:8px; border:none;")
+            _val = QLabel("—"); _val.setStyleSheet("color:#D8E4F5; font-size:8px; border:none;")
+            info_grid.addWidget(_lab, _r, 0); info_grid.addWidget(_val, _r, 1)
+            setattr(self, f"lbl_info_{_k}", _val)
+        fl.addLayout(info_grid)
+
+        # lbl_fix_s vẫn giữ để backend/đổi sub dùng như cũ.
+        self.lbl_fix_s = QLabel("—"); self.lbl_fix_s.hide()
+        action_row = QHBoxLayout(); action_row.setSpacing(5)
+        bv = QPushButton("Đổi video"); bv.setFixedHeight(25); bv.clicked.connect(self._change_video)
+        bs = QPushButton("Đổi sub"); bs.setFixedHeight(25); bs.clicked.connect(self._change_srt)
+        action_row.addWidget(bv); action_row.addWidget(bs)
+        fl.addLayout(action_row)
+
         self.step_render = ProgressStep("Tiến độ render")
         self.step_render.setVisible(False)
         self.txt_log = QTextEdit(); self.txt_log.setReadOnly(True); self.txt_log.document().setMaximumBlockCount(400)
-        self.txt_log.setFixedHeight(90)
-        self.txt_log.setStyleSheet("background:#0B0E14; color:#A7F3D0; font-family:Consolas; font-size:10px; padding:5px; border:1px solid #1F222D;")
-        ll.addWidget(self.txt_log)
-        main.addWidget(left)
+        self.txt_log.setFixedHeight(72)
+        self.txt_log.setStyleSheet(
+            "QTextEdit { background:#0E1113; color:#8FE0B6; font-family:Consolas; font-size:8px; "
+            "padding:4px; border:1px solid #2A3036; border-radius:4px; }")
+        self.txt_log.hide()  # V2: log kỹ thuật ẩn khỏi giao diện chính để người mới không bị rối.
 
-        # ---------- CỘT GIỮA: PREVIEW ----------
-        center = QFrame(); center.setStyleSheet("background:transparent; border:none;")
-        cl = QVBoxLayout(center); cl.setContentsMargins(0, 0, 0, 0)
-        head = QHBoxLayout()
-        head.addWidget(QLabel("🎬 Xem trước (bấm 1 tập bên trái · kéo chữ/logo · lăn chuột để zoom vật thể)",
-                              styleSheet="color:#8A8D98; font-weight:bold; font-size:11px;"))
-        head.addStretch()
-        self.btn_reset = QPushButton("Reset vị trí"); self.btn_reset.setStyleSheet("background:#31265C; color:#7452FF; padding:4px;")
-        self.btn_reset.clicked.connect(self._reset_pos); head.addWidget(self.btn_reset)
-        cl.addLayout(head)
-
+        # Shared preview engine: KHÔNG còn ô Xem trước bên phải.
+        # Chỉ dùng 1 QMediaPlayer/QGraphicsScene để nhẹ máy; khi chọn card nào,
+        # PreviewGraphicsView được chuyển thẳng vào card đó. Vì scene cũ vẫn dùng
+        # nên sub/logo/vùng mờ vẫn kéo trực tiếp trên chính video đang xem.
         self.scene = QGraphicsScene(self)
         self.video_item = QGraphicsVideoItem(); self.scene.addItem(self.video_item)
         self.media_player = QMediaPlayer(); self.audio_output = QAudioOutput()
         self.media_player.setAudioOutput(self.audio_output); self.media_player.setVideoOutput(self.video_item)
         self.video_item.nativeSizeChanged.connect(self._on_native_size)
-        self.preview = PreviewGraphicsView(self.scene); cl.addWidget(self.preview, stretch=1)
-
-        ctr = QHBoxLayout()
-        self.btn_play = QPushButton("▶"); self.btn_play.setFixedWidth(70); self.btn_play.clicked.connect(self._toggle_play)
-        self.lbl_time = QLabel("00:00 / 00:00"); self.lbl_time.setStyleSheet("color:#8A8D98; font-size:11px; padding:0 5px;")
-        self.slider = QSlider(Qt.Orientation.Horizontal); self.slider.sliderMoved.connect(self.media_player.setPosition)
+        self.preview = PreviewGraphicsView(self.scene)
+        self.preview.setMinimumHeight(145)
+        self.preview.setStyleSheet("background:#050607; border:none;")
+        self.preview.hide()
+        self._preview_card = None
         self.media_player.positionChanged.connect(self._on_pos)
         self.media_player.durationChanged.connect(self._on_dur)
-        ctr.addWidget(self.btn_play); ctr.addWidget(self.slider); ctr.addWidget(self.lbl_time)
-        cl.addLayout(ctr)
-        main.addWidget(center, stretch=6)
 
-        # ---------- CỘT PHẢI: DESIGN ----------
-        right = QFrame(); right.setMinimumWidth(280); right.setMaximumWidth(380)
-        right.setStyleSheet("background:#151821; border-radius:8px; border:1px solid #1F222D;")
-        rl = QVBoxLayout(right); rl.setContentsMargins(5, 5, 5, 5)
+        # INSPECTOR PHẢI
+        right = QFrame(); right.setMinimumWidth(315); right.setMaximumWidth(390)
+        right.setStyleSheet("QFrame { background:#1B1E22; border-radius:6px; border:1px solid #2D3238; }")
+        rl = QVBoxLayout(right); rl.setContentsMargins(6, 6, 6, 6); rl.setSpacing(6)
+        rl.addWidget(fix)
 
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(
-            "QTabWidget::pane { border: 1px solid #2D303D; border-radius: 4px; background: #151821; }"
-            "QTabBar::tab { background: #1C1D27; color: #8A8D98; padding: 7px 4px; border: 1px solid #2D303D; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; font-weight: bold; font-size: 10px; }"
-            "QTabBar::tab:selected { background: #2D303D; color: #10B981; }"
-            "QTabBar::tab:hover:!selected { background: #232533; }"
-        )
-        # Cho 3 tab chia đều bề ngang, không dùng nút cuộn ‹ › gây phải bấm qua lại
+            "QTabWidget::pane { border:1px solid #243E62; border-radius:7px; background:#101D31; }"
+            "QTabBar::tab { background:#142642; color:#91A8C8; padding:7px 5px; border:1px solid #243E62; "
+            "border-bottom:none; font-weight:800; font-size:8px; min-width:55px; }"
+            "QTabBar::tab:selected { background:#147DF0; color:white; border-color:#3093FF; }"
+            "QTabBar::tab:hover:!selected { background:#1A3559; color:#EAF4FF; }")
         self.tabs.tabBar().setExpanding(True)
-        self.tabs.setUsesScrollButtons(False)
-        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
-        self.tab_design = QWidget()
-        self.tab_thumb = QWidget()
-        # Bọc trong vùng cuộn: màn nhỏ không còn tràn/đè các mục lên nhau.
-        self.tabs.addTab(self._wrap_scroll(self.tab_design), "🎨 Thiết kế")
-        self.tabs.addTab(self._wrap_scroll(self.tab_thumb), "🖼️ Thumbnail")
-        # Tab con: Tách sub → Dịch → Lồng tiếng (tái dùng thread từ honggou_tab).
-        # Import an toàn: thiếu module thì bỏ qua, không làm hỏng tab Render.
-        try:
-            from render_dub_feature import attach_dub_tab
-            attach_dub_tab(self)
-        except Exception as _dub_err:
-            print(f"[WARN] Không nạp được tab Sub→Dịch→Lồng: {_dub_err}")
-        rl.addWidget(self.tabs)
+        self.tabs.setUsesScrollButtons(True)
 
-        design_lay = QVBoxLayout(self.tab_design); design_lay.setContentsMargins(5, 10, 5, 5)
+        self.tab_sub = QWidget(); self.tab_logo = QWidget(); self.tab_blur = QWidget()
+        self.tab_cover = QWidget(); self.tab_fx = QWidget(); self.tab_thumb = QWidget()
+        self.tab_design = self.tab_sub  # tương thích code cũ nếu module ngoài tham chiếu.
+        self.tab_layers = self.tab_sub
+        self.tabs.addTab(self._wrap_scroll(self.tab_sub), "Phụ đề")
+        self.tabs.addTab(self._wrap_scroll(self.tab_logo), "Logo")
+        self.tabs.addTab(self._wrap_scroll(self.tab_blur), "Che chữ")
+        self.tabs.addTab(self._wrap_scroll(self.tab_cover), "Cover")
+        self.tabs.addTab(self._wrap_scroll(self.tab_fx), "Hiệu ứng")
 
-        self.chk_hardsub = QCheckBox("Khắc Sub vào Video")
+        # --- PHỤ ĐỀ ---
+        sub_lay = QVBoxLayout(self.tab_sub); sub_lay.setContentsMargins(9, 9, 9, 9); sub_lay.setSpacing(7)
+        self.chk_hardsub = QCheckBox("Hiển thị phụ đề")
         self.chk_hardsub.setChecked(self.settings.value("hardsub_en", True, type=bool))
-        self.chk_hardsub.setStyleSheet("color:#FBBF24; font-weight:bold;")
-        design_lay.addWidget(self.chk_hardsub)
+        self.chk_hardsub.setStyleSheet("color:#EAF4FF; font-size:9px; font-weight:900;")
+        sub_lay.addWidget(self.chk_hardsub)
+        hint_sub = QLabel("Kéo trực tiếp chữ mẫu trên video đang chọn để đặt vị trí.")
+        hint_sub.setWordWrap(True); hint_sub.setStyleSheet("color:#6F8DB4; font-size:8px; border:none;")
+        sub_lay.addWidget(hint_sub)
 
-        # ── Nhúng Ảnh Bìa (đưa lên đầu tab thiết kế cho dễ thao tác) ──
-        intro_row = QHBoxLayout()
-        self.chk_intro = QCheckBox("Nhúng Ảnh Bìa (Cover)")
-        self.chk_intro.setChecked(self.settings.value("intro_en", False, type=bool))
-        self.chk_intro.setStyleSheet("color:#F37021; font-weight:bold; font-size:11px;")
-        self.intro_input = QLineEdit(self.settings.value("intro_path", ""))
-        self.intro_input.setPlaceholderText("File Ảnh Bìa...")
-        btn_intro_pick = QPushButton("Chọn")
-        btn_intro_pick.setFixedWidth(50)
-        btn_intro_pick.clicked.connect(self._select_intro)
-        intro_row.addWidget(self.chk_intro); intro_row.addWidget(self.intro_input); intro_row.addWidget(btn_intro_pick)
-        design_lay.addLayout(intro_row)
-        self.chk_intro.stateChanged.connect(lambda: self.settings.setValue("intro_en", self.chk_intro.isChecked()))
-        self.intro_input.textChanged.connect(lambda: self.settings.setValue("intro_path", self.intro_input.text().strip()))
-
-        ql = QHBoxLayout(); ql.addWidget(QLabel("Chất lượng:"))
-        self.cb_quality = QComboBox()
-        self.cb_quality.addItems([
-            "🏆 Cao nhất (CRF 16 - Gần lossless)",
-            "⭐ Tốt (CRF 20 - Đề xuất)",
-            "👍 Vừa (CRF 26 - Cân bằng)",
-            "⚡ Nhanh (1 Mbps - File nhỏ)",
-        ])
-        self.cb_quality.setCurrentText(self.settings.value("render_quality", "⭐ Tốt (CRF 20 - Đề xuất)"))
-        ql.addWidget(self.cb_quality); design_lay.addLayout(ql)
-
-        fb = QHBoxLayout(); fb.addWidget(QLabel("Font:"))
+        fb = QHBoxLayout(); fb.addWidget(QLabel("Font chữ:"))
         self.cb_font = QComboBox(); self.cb_font.addItems(FONTS_LIST)
         self.cb_font.setCurrentText(self.settings.value("font_name", "Arial"))
-        fb.addWidget(QLabel("Cỡ:")); self.spin_size = QSpinBox(); self.spin_size.setRange(10, 150)
-        self.spin_size.setValue(int(self.settings.value("font_size", 24)))
-        fb.addWidget(self.cb_font); fb.addWidget(self.spin_size); design_lay.addLayout(fb)
+        fb.addWidget(self.cb_font, 1); sub_lay.addLayout(fb)
+        sz = QHBoxLayout(); sz.addWidget(QLabel("Cỡ chữ:")); self.spin_size = QSpinBox(); self.spin_size.setRange(10, 150)
+        self.spin_size.setValue(int(self.settings.value("font_size", 24))); self.spin_size.setFixedWidth(72)
+        sz.addWidget(self.spin_size); sz.addStretch(); sub_lay.addLayout(sz)
+        cb = QHBoxLayout(); cb.addWidget(QLabel("Màu chữ:")); self.cb_color = QComboBox(); self.cb_color.addItems(list(COLOR_PRESETS.keys()))
+        self.cb_color.setCurrentText(self.settings.value("font_color_name", "Trắng (White)")); cb.addWidget(self.cb_color, 1); sub_lay.addLayout(cb)
 
-        cb = QHBoxLayout(); cb.addWidget(QLabel("Màu Sub:"))
-        self.cb_color = QComboBox(); self.cb_color.addItems(list(COLOR_PRESETS.keys()))
-        self.cb_color.setCurrentText(self.settings.value("font_color_name", "Trắng (White)"))
-        cb.addWidget(self.cb_color); design_lay.addLayout(cb)
-
-        box_row = QHBoxLayout()
-        self.chk_subbox = QCheckBox("Nền ô chữ")
-        self.chk_subbox.setChecked(self.settings.value("subbox_en", False, type=bool))
-        self.chk_subbox.setStyleSheet("color:#93c5fd; font-weight:bold;")
-        box_row.addWidget(self.chk_subbox)
-        box_row.addWidget(QLabel("Màu nền:"))
-        self.cb_subbox_color = QComboBox()
+        self.chk_subbox = QCheckBox("Nền chữ")
+        self.chk_subbox.setChecked(self.settings.value("subbox_en", False, type=bool)); sub_lay.addWidget(self.chk_subbox)
+        boxrow = QHBoxLayout(); boxrow.addWidget(QLabel("Màu nền:")); self.cb_subbox_color = QComboBox()
         self.cb_subbox_color.addItems(["Đen", "Xám đậm", "Xanh đen", "Trắng"])
-        self.cb_subbox_color.setCurrentText(self.settings.value("subbox_color_name", "Đen"))
-        box_row.addWidget(self.cb_subbox_color)
-        design_lay.addLayout(box_row)
-
-        op_row = QHBoxLayout()
-        op_row.addWidget(QLabel("Độ mờ nền:"))
-        self.spn_subbox_opacity = QSpinBox()
-        self.spn_subbox_opacity.setRange(0, 100)
-        self.spn_subbox_opacity.setValue(int(self.settings.value("subbox_opacity", 60)))
-        self.spn_subbox_opacity.setSuffix(" %")
-        op_row.addWidget(self.spn_subbox_opacity); op_row.addStretch()
-        design_lay.addLayout(op_row)
-
+        self.cb_subbox_color.setCurrentText(self.settings.value("subbox_color_name", "Đen")); boxrow.addWidget(self.cb_subbox_color, 1); sub_lay.addLayout(boxrow)
+        op = QHBoxLayout(); op.addWidget(QLabel("Độ mờ:")); self.spn_subbox_opacity = QSpinBox(); self.spn_subbox_opacity.setRange(0,100)
+        self.spn_subbox_opacity.setValue(int(self.settings.value("subbox_opacity", 60))); self.spn_subbox_opacity.setSuffix(" %")
+        op.addWidget(self.spn_subbox_opacity); op.addStretch(); sub_lay.addLayout(op)
         self.cb_font.currentTextChanged.connect(lambda *_: self._restyle_sample_sub())
         self.spin_size.valueChanged.connect(lambda *_: self._restyle_sample_sub())
         self.cb_color.currentTextChanged.connect(lambda *_: self._restyle_sample_sub())
+        sub_lay.addStretch()
 
-        bl = QHBoxLayout()
-        self.chk_blur = QCheckBox("Bật Khung Mờ"); self.chk_blur.setChecked(self.settings.value("bp_blur_en", False, type=bool))
-        self.chk_blur.setStyleSheet("color:#F37021; font-weight:bold;")
-        b_add = QPushButton("[+] Vùng che"); b_add.setStyleSheet("background:#2D303D; color:#10B981; padding:4px; font-size:10px;")
-        b_add.clicked.connect(lambda: self._add_blur_box())
-        b_clr = QPushButton("[-] Xóa"); b_clr.setStyleSheet("background:#2D303D; color:#EF4444; padding:4px; font-size:10px;")
-        b_clr.clicked.connect(self._clear_blur_boxes)
-        bl.addWidget(self.chk_blur); bl.addWidget(b_add); bl.addWidget(b_clr); design_lay.addLayout(bl)
-
-        frl = QHBoxLayout()
-        self.chk_frame = QCheckBox("Overlay PNG"); self.chk_frame.setChecked(self.settings.value("bp_frame_en", False, type=bool))
-        self.chk_frame.setStyleSheet("color:#7452FF; font-weight:bold;")
-        self.frame_input = QLineEdit(self.settings.value("frame_path", "")); self.frame_input.setPlaceholderText("Ảnh PNG...")
-        bf = QPushButton("Chọn"); bf.setFixedWidth(55); bf.clicked.connect(self._select_frame)
-        frl.addWidget(self.chk_frame); frl.addWidget(self.frame_input); frl.addWidget(bf); design_lay.addLayout(frl)
-
-        lgl = QHBoxLayout()
-        self.chk_logo = QCheckBox("Logo"); self.chk_logo.setChecked(self.settings.value("bp_logo_en", False, type=bool))
-        self.logo_input = QLineEdit(self.settings.value("logo_path", ""))
-        bg2 = QPushButton("Chọn"); bg2.setFixedWidth(55); bg2.clicked.connect(self._select_logo)
-        lgl.addWidget(self.chk_logo); lgl.addWidget(self.logo_input); lgl.addWidget(bg2); design_lay.addLayout(lgl)
-
+        # --- LOGO ---
+        logo_lay = QVBoxLayout(self.tab_logo); logo_lay.setContentsMargins(9,9,9,9); logo_lay.setSpacing(7)
+        self.chk_logo = QCheckBox("Bật Logo / Tiêu đề"); self.chk_logo.setChecked(self.settings.value("bp_logo_en", False, type=bool))
+        logo_lay.addWidget(self.chk_logo)
+        lgrow = QHBoxLayout(); self.logo_input = QLineEdit(self.settings.value("logo_path", "")); self.logo_input.setPlaceholderText("Chọn ảnh logo PNG...")
+        bg2 = QPushButton("Chọn"); bg2.setFixedWidth(58); bg2.clicked.connect(self._select_logo)
+        lgrow.addWidget(self.logo_input,1); lgrow.addWidget(bg2); logo_lay.addLayout(lgrow)
+        logo_lay.addWidget(QLabel("Bật logo rồi kéo trực tiếp trên video để đặt vị trí và kích thước.", styleSheet="color:#6F8DB4; font-size:8px; border:none;"))
         self.chk_logo.stateChanged.connect(lambda: self._update_logo_preview())
         self.logo_input.textChanged.connect(lambda: self._update_logo_preview())
         self.chk_logo.stateChanged.connect(lambda: setattr(self, "_design_locked", None))
         self.logo_input.textChanged.connect(lambda: setattr(self, "_design_locked", None))
+        logo_lay.addStretch()
 
-        design_lay.addWidget(QLabel("🎛️ Bộ lọc Bypass FX:", styleSheet="font-weight:bold; margin-top:5px; color:#8A8D98;"))
+        # --- CHE CHỮ / VÙNG MỜ ---
+        blur_lay = QVBoxLayout(self.tab_blur); blur_lay.setContentsMargins(9,9,9,9); blur_lay.setSpacing(7)
+        self.chk_blur = QCheckBox("Bật vùng che / làm mờ"); self.chk_blur.setChecked(self.settings.value("bp_blur_en", False, type=bool))
+        blur_lay.addWidget(self.chk_blur)
+        br = QHBoxLayout(); b_add = QPushButton("＋ Thêm vùng che"); b_add.clicked.connect(lambda: self._add_blur_box())
+        b_clr = QPushButton("Xóa tất cả"); b_clr.clicked.connect(self._clear_blur_boxes)
+        br.addWidget(b_add); br.addWidget(b_clr); blur_lay.addLayout(br)
+        blur_lay.addWidget(QLabel("Vùng che xuất hiện ngay trên video đang chọn. Kéo/resize trực tiếp bằng chuột.", styleSheet="color:#6F8DB4; font-size:8px; border:none;"))
+        blur_lay.addStretch()
+
+        # --- COVER / OVERLAY ---
+        cover_lay = QVBoxLayout(self.tab_cover); cover_lay.setContentsMargins(9,9,9,9); cover_lay.setSpacing(7)
+        self.chk_intro = QCheckBox("Nhúng Ảnh Bìa (Cover)")
+        self.chk_intro.setChecked(self.settings.value("intro_en", False, type=bool)); cover_lay.addWidget(self.chk_intro)
+        ir = QHBoxLayout(); self.intro_input = QLineEdit(self.settings.value("intro_path", "")); self.intro_input.setPlaceholderText("File ảnh bìa...")
+        btn_intro_pick = QPushButton("Chọn"); btn_intro_pick.setFixedWidth(58); btn_intro_pick.clicked.connect(self._select_intro)
+        ir.addWidget(self.intro_input,1); ir.addWidget(btn_intro_pick); cover_lay.addLayout(ir)
+        self.chk_intro.stateChanged.connect(lambda: self.settings.setValue("intro_en", self.chk_intro.isChecked()))
+        self.intro_input.textChanged.connect(lambda: self.settings.setValue("intro_path", self.intro_input.text().strip()))
+        self.chk_frame = QCheckBox("Overlay PNG"); self.chk_frame.setChecked(self.settings.value("bp_frame_en", False, type=bool)); cover_lay.addWidget(self.chk_frame)
+        fr = QHBoxLayout(); self.frame_input = QLineEdit(self.settings.value("frame_path", "")); self.frame_input.setPlaceholderText("Ảnh PNG overlay...")
+        bf = QPushButton("Chọn"); bf.setFixedWidth(58); bf.clicked.connect(self._select_frame)
+        fr.addWidget(self.frame_input,1); fr.addWidget(bf); cover_lay.addLayout(fr); cover_lay.addStretch()
+
+        # --- HIỆU ỨNG / CHẤT LƯỢNG ---
+        fx_lay = QVBoxLayout(self.tab_fx); fx_lay.setContentsMargins(9,9,9,9); fx_lay.setSpacing(7)
+        ql = QHBoxLayout(); ql.addWidget(QLabel("Chất lượng:")); self.cb_quality = QComboBox()
+        self.cb_quality.addItems(["🏆 Cao nhất (CRF 16 - Gần lossless)", "⭐ Tốt (CRF 20 - Đề xuất)", "👍 Vừa (CRF 26 - Cân bằng)", "⚡ Nhanh (1 Mbps - File nhỏ)"])
+        self.cb_quality.setCurrentText(self.settings.value("render_quality", "⭐ Tốt (CRF 20 - Đề xuất)")); ql.addWidget(self.cb_quality,1); fx_lay.addLayout(ql)
+        fx_lay.addWidget(QLabel("Hiệu ứng nhanh", styleSheet="color:#6F8DB4; font-size:8px; font-weight:800; border:none;"))
         self.chk_flip = QCheckBox("Lật ngang"); self.chk_zoom = QCheckBox("Phóng to 4%")
         self.chk_color = QCheckBox("Kích màu sáng"); self.chk_noise = QCheckBox("Nhiễu hạt")
         self.chk_speed = QCheckBox("Tốc độ 1.05x"); self.chk_pitch = QCheckBox("Đổi Tone")
@@ -2622,101 +3103,149 @@ class RenderWidget(QWidget):
                        ("bp_noise", self.chk_noise), ("bp_speed", self.chk_speed), ("bp_pitch", self.chk_pitch),
                        ("bp_rotate", self.chk_rotate)):
             chk.setChecked(self.settings.value(k, False, type=bool))
-        gb = QGridLayout()
-        gb.addWidget(self.chk_flip, 0, 0); gb.addWidget(self.chk_zoom, 0, 1)
-        gb.addWidget(self.chk_color, 1, 0); gb.addWidget(self.chk_noise, 1, 1)
-        gb.addWidget(self.chk_speed, 2, 0); gb.addWidget(self.chk_pitch, 2, 1)
-        gb.addWidget(self.chk_rotate, 3, 0)
-        design_lay.addLayout(gb)
-        design_lay.addStretch()
+        gb = QGridLayout(); gb.addWidget(self.chk_flip,0,0); gb.addWidget(self.chk_zoom,0,1)
+        gb.addWidget(self.chk_color,1,0); gb.addWidget(self.chk_noise,1,1)
+        gb.addWidget(self.chk_speed,2,0); gb.addWidget(self.chk_pitch,2,1); gb.addWidget(self.chk_rotate,3,0)
+        fx_lay.addLayout(gb); fx_lay.addStretch()
 
-        # ── Khu Thumbnail AI (Gemini) ──
+        # Thumbnail AI vẫn giữ nguyên tính năng cũ, nhưng để ở tab cuối cùng.
+        self.tabs.addTab(self._wrap_scroll(self.tab_thumb), "Thumbnail")
         self._build_thumbnail_ui(self.tab_thumb)
 
-        bot_lay = QVBoxLayout(); bot_lay.setContentsMargins(5, 5, 5, 5)
-        self.btn_sync_design = QPushButton("🔄 Đồng bộ canh chỉnh cho tất cả file")
-        self.btn_sync_design.setStyleSheet("QPushButton { background:#0891b2; color:white; padding:8px; font-size:12px; border-radius:8px; border:none; } QPushButton:hover { background:#0e7490; }")
-        self.btn_sync_design.clicked.connect(self._sync_design_all)
-        bot_lay.addWidget(self.btn_sync_design)
+        # Tab Sub→Dịch→Lồng của module cũ vẫn được cắm vào cùng inspector.
+        try:
+            from render_dub_feature import attach_dub_tab
+            attach_dub_tab(self)
+        except Exception as _dub_err:
+            print(f"[WARN] Không nạp được tab Sub→Dịch→Lồng: {_dub_err}")
 
+        rl.addWidget(self.tabs, 1)
+        rl.addWidget(self.txt_log)
+        body.addWidget(right)
+
+        # ── Inspector bottom: cấu hình xuất + tiến trình ───────────────
+        bot_lay = QVBoxLayout(); bot_lay.setContentsMargins(0, 0, 0, 0); bot_lay.setSpacing(5)
+        apply_row = QHBoxLayout(); apply_row.setSpacing(5)
+        self.cmb_apply_scope = QComboBox()
+        self.cmb_apply_scope.addItems(["Các video đã chọn", "Từ video này trở đi", "Tất cả video"])
+        self.cmb_apply_scope.setToolTip("Chỉ khi bấm Áp dụng, thiết lập của video hiện tại mới được sao chép sang video khác.")
+        apply_row.addWidget(self.cmb_apply_scope, 1)
+        self.btn_sync_design = QPushButton("Áp dụng")
+        self.btn_sync_design.setFixedHeight(29)
+        self.btn_sync_design.setStyleSheet(
+            "QPushButton { background:#155C8D; color:#E9F7FF; border:1px solid #2A86BC; "
+            "border-radius:6px; padding:5px 10px; font-size:9px; font-weight:900; } "
+            "QPushButton:hover { background:#1A72AA; }")
+        self.btn_sync_design.clicked.connect(self._apply_design_scope)
+        apply_row.addWidget(self.btn_sync_design)
+        bot_lay.addLayout(apply_row)
+
+        export_cfg = QFrame(); export_cfg.setStyleSheet(
+            "QFrame { background:#171A1E; border:1px solid #2F353C; border-radius:5px; }")
+        ec = QVBoxLayout(export_cfg); ec.setContentsMargins(7, 5, 7, 5); ec.setSpacing(4)
         merge_row = QHBoxLayout()
-        self.chk_merge_all = QCheckBox("🔗 Gộp trọn bộ sau Render")
+        self.chk_merge_all = QCheckBox("Gộp trọn bộ sau Xuất")
         self.chk_merge_all.setChecked(self.settings.value("merge_after_render", False, type=bool))
-        self.chk_merge_all.setStyleSheet("color:#10B981; font-weight:bold; font-size:12px;")
+        self.chk_merge_all.setStyleSheet("color:#70D6A2; font-weight:700; font-size:9px;")
         self.chk_merge_all.stateChanged.connect(lambda: self.settings.setValue("merge_after_render", self.chk_merge_all.isChecked()))
-        merge_row.addWidget(self.chk_merge_all)
-        bot_lay.addLayout(merge_row)
+        merge_row.addWidget(self.chk_merge_all); merge_row.addStretch()
+        ec.addLayout(merge_row)
 
-        # ── Hàng: số tập render song song + FPS đích ──
-        rp_row = QHBoxLayout()
-        rp_row.addWidget(QLabel("Render cùng lúc:", styleSheet="color:#8A8D98; font-size:11px; border:none;"))
-        self.spn_render_parallel = QSpinBox()
-        self.spn_render_parallel.setRange(1, 4)
+        rp_row = QHBoxLayout(); rp_row.setSpacing(5)
+        rp_row.addWidget(QLabel("Song song", styleSheet="color:#858D96; font-size:8px; border:none;"))
+        self.spn_render_parallel = QSpinBox(); self.spn_render_parallel.setRange(1, 4)
         self.spn_render_parallel.setValue(int(self.settings.value("render_parallel", 2)))
-        self.spn_render_parallel.setFixedWidth(48)
-        self.spn_render_parallel.setToolTip("Số tập render cùng lúc (CPU nhiều nhân nên để 2-3). GPU nên để 1-2 tùy card.")
-        self.spn_render_parallel.valueChanged.connect(
-            lambda v: self.settings.setValue("render_parallel", v))
+        self.spn_render_parallel.setFixedWidth(43)
+        self.spn_render_parallel.valueChanged.connect(lambda v: self.settings.setValue("render_parallel", v))
         rp_row.addWidget(self.spn_render_parallel)
-        rp_row.addSpacing(12)
-        rp_row.addWidget(QLabel("FPS:", styleSheet="color:#8A8D98; font-size:11px; border:none;"))
-        self.cmb_fps = QComboBox()
-        self.cmb_fps.addItems(["Giữ gốc", "24", "25", "30"])
+        rp_row.addSpacing(7)
+        rp_row.addWidget(QLabel("FPS", styleSheet="color:#858D96; font-size:8px; border:none;"))
+        self.cmb_fps = QComboBox(); self.cmb_fps.addItems(["Giữ gốc", "24", "25", "30"])
         _saved_fps = self.settings.value("render_target_fps", "25")
-        _idx = self.cmb_fps.findText(str(_saved_fps))
-        self.cmb_fps.setCurrentIndex(_idx if _idx >= 0 else 2)  # mặc định 25
-        self.cmb_fps.setFixedWidth(80)
-        self.cmb_fps.setToolTip("Ép mọi tập ra cùng FPS này để gộp trọn bộ nhanh & hết đứng hình. "
-                                "Drama Trung nên để 25.")
-        self.cmb_fps.currentTextChanged.connect(
-            lambda t: self.settings.setValue("render_target_fps", t))
-        rp_row.addWidget(self.cmb_fps)
-        rp_row.addStretch()
-        bot_lay.addLayout(rp_row)
+        _idx = self.cmb_fps.findText(str(_saved_fps)); self.cmb_fps.setCurrentIndex(_idx if _idx >= 0 else 2)
+        self.cmb_fps.setFixedWidth(78)
+        self.cmb_fps.currentTextChanged.connect(lambda t: self.settings.setValue("render_target_fps", t))
+        rp_row.addWidget(self.cmb_fps); rp_row.addStretch()
+        ec.addLayout(rp_row)
+        bot_lay.addWidget(export_cfg)
 
-        # Nút chạy trọn quy trình: tách → dịch → lồng → render. Dùng đúng cấu
-        # hình đã set trong tab con "Sub → Dịch → Lồng".
-        self.btn_full_pipeline = QPushButton("🚀 LÀM TẤT CẢ: Tách → Dịch → Lồng → Render")
-        self.btn_full_pipeline.setStyleSheet("QPushButton { background:#7452FF; color:white; padding:11px; font-size:12px; font-weight:bold; border-radius:8px; border:none; } QPushButton:hover { background:#5b3fd6; } QPushButton:disabled { background:#3B3E4D; color:#8A8D98; }")
-        self.btn_full_pipeline.clicked.connect(self._run_full_pipeline_external)
-        bot_lay.addWidget(self.btn_full_pipeline)
-
-        # ── THANH TIẾN TRÌNH BỰ (dễ thấy) — ngay trên nút RENDER ──
-        self.lbl_big_prog = QLabel("Tiến độ render")
-        self.lbl_big_prog.setStyleSheet("color:#E5E6E8; font-size:12px; font-weight:bold; border:none;")
+        self.lbl_big_prog = QLabel("Tiến độ xuất")
+        self.lbl_big_prog.setStyleSheet("color:#AAB0B7; font-size:8px; font-weight:700; border:none;")
         bot_lay.addWidget(self.lbl_big_prog)
         self.big_render_prog = QProgressBar()
         self.big_render_prog.setRange(0, 100); self.big_render_prog.setValue(0)
-        self.big_render_prog.setFixedHeight(28); self.big_render_prog.setTextVisible(True)
-        self.big_render_prog.setFormat("%p%")
+        self.big_render_prog.setFixedHeight(16); self.big_render_prog.setTextVisible(True); self.big_render_prog.setFormat("%p%")
         self.big_render_prog.setStyleSheet(
-            "QProgressBar { background:#1F222D; border:1px solid #2D303D; border-radius:6px; "
-            "color:#FFFFFF; font-size:13px; font-weight:bold; text-align:center; } "
-            "QProgressBar::chunk { background:#F37021; border-radius:5px; }")
+            "QProgressBar { background:#262B31; border:1px solid #343A42; border-radius:4px; "
+            "color:#DDE1E6; font-size:8px; font-weight:700; text-align:center; } "
+            "QProgressBar::chunk { background:#31BFD0; border-radius:3px; }")
         bot_lay.addWidget(self.big_render_prog)
 
-        run_merge_lay = QHBoxLayout()
-        
-        self.btn_run = QPushButton("🔥 RENDER TẤT CẢ (0)")
-        self.btn_run.setStyleSheet("QPushButton { background:#F37021; color:white; padding:12px; font-size:14px; border-radius:8px; border:none; font-weight:bold; } QPushButton:hover { background:#e05f10; }")
-        self.btn_run.clicked.connect(self._start_render_all)
-        run_merge_lay.addWidget(self.btn_run)
-        
-        self.btn_merge_now = QPushButton("🔗 GỘP NGAY (0)")
-        self.btn_merge_now.setStyleSheet("QPushButton { background:#10B981; color:white; padding:12px; font-size:14px; border-radius:8px; border:none; font-weight:bold; } QPushButton:hover { background:#059669; }")
+        self.btn_merge_now = QPushButton("🔗  Gộp nhanh các video đã chọn")
+        self.btn_merge_now.setFixedHeight(28)
+        self.btn_merge_now.setStyleSheet(
+            "QPushButton { background:#183127; color:#74D6A4; border:1px solid #2D5D48; border-radius:5px; font-size:9px; } "
+            "QPushButton:hover { background:#214335; }")
         self.btn_merge_now.clicked.connect(self._start_merge_now)
-        run_merge_lay.addWidget(self.btn_merge_now)
-        
-        bot_lay.addLayout(run_merge_lay)
-
-        self.btn_stop = QPushButton("⛔ DỪNG RENDER")
-        self.btn_stop.setStyleSheet("QPushButton { background:#7F1D1D; color:white; padding:10px; font-size:13px; border-radius:8px; border:none; } QPushButton:hover { background:#991B1B; } QPushButton:disabled { background:#3B2020; color:#8A8D98; }")
-        self.btn_stop.clicked.connect(self._stop_render)
-        self.btn_stop.setEnabled(False)
-        bot_lay.addWidget(self.btn_stop)
-        
+        bot_lay.addWidget(self.btn_merge_now)
         rl.addLayout(bot_lay)
-        main.addWidget(right)    
+
+        # ── Pipeline dưới cùng: nhìn là hiểu luồng, người mới chỉ cần 1 nút.
+        bottombar = QFrame(); bottombar.setObjectName("BoomPipelineBar"); bottombar.setFixedHeight(66)
+        bottombar.setStyleSheet(
+            "QFrame#BoomPipelineBar { background:#0F1D31; border:1px solid #1D3A5E; border-radius:9px; }")
+        bb = QHBoxLayout(bottombar); bb.setContentsMargins(8, 7, 8, 7); bb.setSpacing(6)
+
+        def _pipe_button(text, subtext):
+            b = QPushButton(f"{text}\n{subtext}")
+            b.setFixedHeight(48)
+            b.setStyleSheet(
+                "QPushButton { text-align:left; background:#142A48; color:#ECF5FF; border:1px solid #25517F; "
+                "border-radius:9px; padding:5px 11px; font-size:8px; font-weight:900; } "
+                "QPushButton:hover { background:#193B64; border-color:#2D8DFF; }")
+            return b
+
+        btn_extract = _pipe_button("①  Tách phụ đề", "Tự động nhận diện giọng nói")
+        btn_extract.clicked.connect(self._open_pipeline_extract); bb.addWidget(btn_extract, 1)
+        btn_translate = _pipe_button("②  Dịch phụ đề", "Dịch đa ngôn ngữ")
+        btn_translate.clicked.connect(self._open_pipeline_translate); bb.addWidget(btn_translate, 1)
+        btn_dub = _pipe_button("③  Lồng tiếng", "Giọng nói tự nhiên")
+        btn_dub.clicked.connect(self._open_pipeline_dub); bb.addWidget(btn_dub, 1)
+
+        self.btn_run = _pipe_button("④  Render & Xuất", "Tạo video hoàn chỉnh")
+        self.btn_run.clicked.connect(self._start_render_all); bb.addWidget(self.btn_run, 1)
+
+        quick = QFrame(); quick.setStyleSheet("QFrame { background:#12243D; border:1px solid #23486F; border-radius:9px; }")
+        ql2 = QVBoxLayout(quick); ql2.setContentsMargins(8,4,8,4); ql2.setSpacing(2)
+        ql2.addWidget(QLabel("⚙  Cài đặt nhanh", styleSheet="color:#DDEBFF; font-size:8px; font-weight:900; border:none;"))
+        qr = QHBoxLayout(); qr.addWidget(QLabel("Layout", styleSheet="color:#7897BC; font-size:7px; border:none;"))
+        self.cmb_layout = QComboBox(); self.cmb_layout.addItems(["2", "3", "4"])
+        self.cmb_layout.setCurrentText(str(self.settings.value("editor_grid_columns", "3")))
+        if self.cmb_layout.currentText() not in ("2", "3", "4"): self.cmb_layout.setCurrentText("3")
+        self.cmb_layout.setFixedWidth(45); self.cmb_layout.currentTextChanged.connect(self._on_layout_columns_changed)
+        qr.addWidget(self.cmb_layout); qr.addWidget(QLabel("FPS", styleSheet="color:#7897BC; font-size:7px; border:none;"))
+        # cmb_fps đã tạo ở panel phải; chỉ hiển thị nhãn ở đây để tránh widget bị re-parent.
+        self.lbl_bottom_count = QLabel("0 tập"); self.lbl_bottom_count.setStyleSheet("color:#8AA4C7; font-size:8px; border:none;")
+        qr.addWidget(self.lbl_bottom_count); ql2.addLayout(qr)
+        bb.addWidget(quick)
+
+        self.btn_stop = QPushButton("■")
+        self.btn_stop.setFixedSize(38, 48); self.btn_stop.setToolTip("Dừng xử lý")
+        self.btn_stop.setStyleSheet("QPushButton { background:#3A2028; color:#FF9BAA; border:1px solid #6D3442; border-radius:9px; font-size:11px; }")
+        self.btn_stop.clicked.connect(self._stop_render); self.btn_stop.setEnabled(False); bb.addWidget(self.btn_stop)
+
+        self.btn_full_pipeline = QPushButton("🚀  LÀM TẤT CẢ\nXử lý toàn bộ video · Chỉ 1 lần bấm")
+        self.btn_full_pipeline.setMinimumWidth(205); self.btn_full_pipeline.setFixedHeight(48)
+        self.btn_full_pipeline.setStyleSheet(
+            "QPushButton { color:white; border:1px solid #7A8CFF; border-radius:10px; font-size:9px; font-weight:900; "
+            "background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #168BFF, stop:.48 #7658FF, stop:1 #FF5E9A); } "
+            "QPushButton:hover { border:2px solid #D3DBFF; }")
+        self.btn_full_pipeline.clicked.connect(self._run_full_pipeline_external)
+        bb.addWidget(self.btn_full_pipeline)
+        root.addWidget(bottombar)
+
+        # Mẫu mặc định dành cho video chưa từng chỉnh.
+        self._default_design_template = copy.deepcopy(self._collect_design(persist=False))
 
     # ============ THUMBNAIL AI ============
     def _build_thumbnail_ui(self, parent_widget):
@@ -3025,6 +3554,280 @@ class RenderWidget(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "Lỗi", f"Không mở được thư mục:\n{e}")
 
+    # ============ BOOM STUDIO V2: THƯ VIỆN / BỘ LỌC / INSPECTOR ============
+    def _fmt_ms(self, ms):
+        try:
+            sec = max(0, int(ms) // 1000)
+            h, rem = divmod(sec, 3600); m, s = divmod(rem, 60)
+            return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        except Exception:
+            return "—"
+
+    def _card_state(self, card):
+        """Trạng thái thật của 1 tập, đọc trực tiếp từ file đầu ra trên đĩa.
+
+        Điểm quan trọng cho realtime: KHÔNG chỉ dựa vào card.srt_path hiện tại.
+        Pipeline có thể vừa tạo *_vi.srt / *_dubbed.mp4 nhưng card chưa kịp đổi
+        đường dẫn. Hàm này vẫn nhận ra ngay file mới xuất hiện.
+        """
+        vp = getattr(card, "video_path", "") or ""
+        sp = getattr(card, "srt_path", None)
+        stem, ext = os.path.splitext(vp)
+
+        # Quy về stem GỐC để dò các output cạnh video.
+        low_stem = stem.lower()
+        base = stem
+        for suffix in ("_dubbed", "_final"):
+            if low_stem.endswith(suffix):
+                base = stem[:-len(suffix)]
+                break
+
+        vi_path = base + "_vi.srt"
+        raw_path = base + ".srt"
+        dubbed_path = base + "_dubbed" + ext
+        final_path = base + "_final.mp4"
+
+        has_sp = bool(sp and os.path.exists(sp))
+        has_vi_disk = os.path.exists(vi_path)
+        has_raw_disk = os.path.exists(raw_path)
+        has_sub = bool(has_sp or has_vi_disk or has_raw_disk)
+        translated = bool(has_vi_disk or (has_sp and str(sp).lower().endswith("_vi.srt")))
+        dubbed = bool(stem.lower().endswith("_dubbed") or os.path.exists(dubbed_path))
+        exported = bool(os.path.exists(final_path) or str(vp).lower().endswith("_final.mp4"))
+
+        status_text = ""
+        try:
+            status_text = card.lbl_badge.text().strip().lower()
+        except Exception:
+            pass
+        error = ("lỗi" in status_text) or ("error" in status_text)
+        edited = bool(getattr(card, "design_config", None))
+
+        # orientation: không probe tất cả file. Dùng thumbnail nếu có; nếu chưa có
+        # thì coi là chưa xác định để tránh lag lúc thêm hàng trăm video.
+        portrait = landscape = False
+        pix = getattr(card, "_thumb_pix", None)
+        try:
+            if pix is not None and not pix.isNull() and pix.height() > 0:
+                portrait = pix.height() > pix.width()
+                landscape = not portrait
+        except Exception:
+            pass
+
+        done = exported or (has_sub and translated and dubbed)
+        return {"has_sub": has_sub, "translated": translated, "dubbed": dubbed,
+                "exported": exported, "error": error, "edited": edited,
+                "portrait": portrait, "landscape": landscape, "done": done}
+
+    @staticmethod
+    def _rt_state_signature(st):
+        """Chỉ các trạng thái ảnh hưởng bộ lọc/counter; bỏ orientation để tránh
+        relayout khi thumbnail vừa load."""
+        return (bool(st.get("has_sub")), bool(st.get("translated")),
+                bool(st.get("dubbed")), bool(st.get("exported")),
+                bool(st.get("error")), bool(st.get("edited")),
+                bool(st.get("done")))
+
+    def _ensure_realtime_watch_dir(self, folder):
+        """Đăng ký 1 thư mục đúng 1 lần với QFileSystemWatcher."""
+        try:
+            if not folder or not os.path.isdir(folder):
+                return
+            full = os.path.abspath(folder)
+            key = os.path.normcase(full)
+            if key in self._rt_watch_dirs:
+                return
+            ok = self._rt_fs_watcher.addPath(full)
+            if ok:
+                self._rt_watch_dirs.add(key)
+        except Exception:
+            pass
+
+    def _on_realtime_dir_changed(self, _path):
+        # Pipeline thường tạo nhiều file tạm trong vài chục ms. Debounce để 20
+        # sự kiện liên tiếp chỉ biến thành 1 lần refresh rất nhẹ.
+        self._schedule_realtime_refresh(140)
+
+    def _schedule_realtime_refresh(self, delay_ms=80):
+        try:
+            self._rt_refresh_timer.start(max(0, int(delay_ms)))
+        except Exception:
+            pass
+
+    def _realtime_refresh_states(self):
+        """Đồng bộ card + counter theo file vừa xuất hiện trên ổ đĩa.
+
+        Đây là realtime theo SỰ KIỆN, không polling liên tục. Mỗi lần chạy chỉ
+        so signature cũ/mới; card không đổi trạng thái thì không đụng UI.
+        """
+        if getattr(self, "_bulk_loading", False):
+            # Đợi load thư mục xong rồi cập nhật một lần, tránh tranh main thread.
+            self._schedule_realtime_refresh(220)
+            return
+        if not getattr(self, "cards", None):
+            return
+
+        changed_cards = []
+        for card in list(self.cards):
+            key = id(card)
+            try:
+                st_before_sync = self._card_state(card)
+                sig_now = self._rt_state_signature(st_before_sync)
+                old_sig = self._rt_state_cache.get(key)
+
+                # Lần đầu chỉ lưu cache; các lần sau chỉ xử lý card thật sự đổi.
+                if old_sig is None:
+                    self._rt_state_cache[key] = sig_now
+                    continue
+                if sig_now == old_sig:
+                    continue
+
+                # Nếu SRT Việt/dubbed vừa xuất hiện, cập nhật luôn path/badge trên card.
+                try:
+                    card.refresh_srt_from_disk()
+                except Exception:
+                    pass
+                try:
+                    card._update_source_badges()
+                except Exception:
+                    pass
+
+                st_after = self._card_state(card)
+                self._rt_state_cache[key] = self._rt_state_signature(st_after)
+                changed_cards.append(card)
+            except Exception:
+                continue
+
+        if not changed_cards:
+            # Cache có thể chưa có ở lần đầu sau khi load; counter hiện tại vẫn đúng.
+            return
+
+        # Counter đổi NGAY sau khi 1 tập hoàn thành Tách/Dịch/Lồng/Render.
+        self._update_sidebar_counts()
+
+        # Nếu đang lọc "Chưa dịch/Chưa lồng/...", tập vừa hoàn thành phải biến
+        # khỏi danh sách ngay. Chỉ relayout khi filter phụ thuộc trạng thái.
+        if (self._library_filter or "all") != "all":
+            self._relayout_grid()
+
+        # Inspector của tập đang chọn cũng cập nhật theo thời gian thực.
+        if self.selected_card in changed_cards:
+            self._refresh_selected_file_info(self.selected_card)
+
+        # Log gọn, không spam từng event file tạm.
+        if len(changed_cards) == 1:
+            self._log(f"⚡ Realtime: đã cập nhật {os.path.basename(changed_cards[0].video_path)}")
+        else:
+            self._log(f"⚡ Realtime: đã cập nhật trạng thái {len(changed_cards)} tập")
+
+    def _card_matches_filter(self, card):
+        q = (self._search_text or "").strip().lower()
+        if q:
+            hay = f"{os.path.basename(getattr(card,'video_path',''))} {os.path.basename(getattr(card,'srt_path','') or '')}".lower()
+            if q not in hay:
+                return False
+        mode = self._library_filter or "all"
+        if mode == "all": return True
+        st = self._card_state(card)
+        if mode == "nosub": return not st["has_sub"]
+        if mode == "notrans": return not st["translated"]
+        if mode == "nodub": return not st["dubbed"]
+        if mode == "translated": return st["translated"]
+        if mode == "dubbed": return st["dubbed"]
+        if mode == "exported": return st["exported"]
+        if mode == "error": return st["error"]
+        if mode == "edited": return st["edited"]
+        if mode == "done": return st["done"]
+        if mode == "portrait": return st["portrait"]
+        if mode == "landscape": return st["landscape"]
+        return True
+
+    def _visible_cards_for_grid(self):
+        return [c for c in self.cards if self._card_matches_filter(c)]
+
+    def _toggle_select_all_visible(self, checked):
+        for c in self._visible_cards_for_grid():
+            try:
+                c.chk_select.blockSignals(True); c.chk_select.setChecked(bool(checked)); c.chk_select.blockSignals(False)
+            except Exception:
+                pass
+        self._update_run_label()
+
+    def _set_search_text(self, text):
+        self._search_text = (text or "").strip()
+        if not self._bulk_loading:
+            self._relayout_grid()
+
+    def _set_library_filter(self, mode):
+        self._library_filter = mode or "all"
+        for key, btn in getattr(self, "_filter_buttons", {}).items():
+            canonical = key[4:] if key.startswith("top_") else key
+            btn.blockSignals(True); btn.setChecked(canonical == self._library_filter); btn.blockSignals(False)
+        if not self._bulk_loading:
+            self._relayout_grid()
+        self._update_sidebar_counts()
+
+    def _update_sidebar_counts(self):
+        if not hasattr(self, "_sidebar_counts"):
+            return
+        stats = {k: 0 for k in ("all", "edited", "exported", "error", "nosub", "notrans", "nodub", "done")}
+        stats["all"] = len(self.cards)
+        for c in self.cards:
+            st = self._card_state(c)
+            stats["edited"] += int(st["edited"])
+            stats["exported"] += int(st["exported"])
+            stats["error"] += int(st["error"])
+            stats["nosub"] += int(not st["has_sub"])
+            stats["notrans"] += int(not st["translated"])
+            stats["nodub"] += int(not st["dubbed"])
+            stats["done"] += int(st["done"])
+        for k, w in self._sidebar_counts.items():
+            w.setText(str(stats.get(k, 0)))
+
+    def _refresh_selected_file_info(self, card):
+        if card is None: return
+        try:
+            name = os.path.basename(card.video_path)
+            self.lbl_selected_title.setText(f"🔧  Chỉnh sửa: {name}")
+            self.lbl_fix_v.setText(name); self.lbl_fix_v.setToolTip(card.video_path)
+            self.lbl_info_size.setText(f"{os.path.getsize(card.video_path)/(1024*1024):.1f} MB" if os.path.exists(card.video_path) else "—")
+            self.lbl_info_sub.setText(os.path.basename(card.srt_path) if card.srt_path else "Chưa có sub")
+            ns = self.video_item.nativeSize()
+            if ns.width() > 0 and ns.height() > 0:
+                self.lbl_info_res.setText(f"{int(ns.width())} × {int(ns.height())}")
+            else:
+                self.lbl_info_res.setText("Đang đọc…")
+            self.lbl_info_dur.setText(self._fmt_ms(self.media_player.duration()) if self.media_player.duration() else "Đang đọc…")
+        except Exception:
+            pass
+
+    def _reset_current_design(self):
+        if self.selected_card is None:
+            return
+        self.selected_card.design_config = copy.deepcopy(self._default_design_template)
+        self._restore_design_from_card(self.selected_card)
+        self._log(f"↩ Đã đặt lại thiết kế: {os.path.basename(self.selected_card.video_path)}")
+
+    def _apply_design_scope(self):
+        if self.selected_card is None:
+            QMessageBox.information(self, "Chưa chọn video", "Hãy chọn một video làm mẫu trước.")
+            return
+        self._save_design_to_card(self.selected_card)
+        master = copy.deepcopy(self.selected_card.design_config or self._default_design())
+        scope = self.cmb_apply_scope.currentText() if hasattr(self, "cmb_apply_scope") else "Tất cả video"
+        if scope == "Các video đã chọn":
+            targets = self._selected_cards()
+        elif scope == "Từ video này trở đi":
+            try: targets = self.cards[self.cards.index(self.selected_card):]
+            except Exception: targets = [self.selected_card]
+        else:
+            targets = list(self.cards)
+        for c in targets:
+            if c is not self.selected_card:
+                c.design_config = copy.deepcopy(master)
+        self._log(f"✓ Đã áp dụng thiết kế cho {len(targets)} video ({scope}).")
+        QMessageBox.information(self, "Đã áp dụng", f"Đã áp dụng thiết lập hiện tại cho {len(targets)} video.\nCác video khác không bị thay đổi.")
+
     # ============ GHÉP CẶP VIDEO + SRT ============
     def _pick_folder(self):
         d = QFileDialog.getExistingDirectory(self, "Chọn thư mục chứa các tập")
@@ -3034,18 +3837,113 @@ class RenderWidget(QWidget):
         if not pairs:
             QMessageBox.information(self, "Không thấy video", "Thư mục này không có file video (.mp4) nào.")
             return
-        for vp, sp in pairs:
-            self._add_card(vp, sp)
-        self._relayout_grid()
-        self._update_run_label()
+        self._start_bulk_card_import(pairs, os.path.basename(d) or d)
 
     def _pick_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Chọn video", "", "Video (*.mp4 *.mkv *.mov *.avi)")
-        for vp in files:
-            sp = self._guess_srt_for(vp)
-            self._add_card(vp, sp)
-        if files:
-            self._relayout_grid(); self._update_run_label()
+        if not files:
+            return
+        pairs = [(vp, self._guess_srt_for(vp)) for vp in files]
+        self._start_bulk_card_import(pairs, "video đã chọn")
+
+    def _start_bulk_card_import(self, pairs, source_label="thư mục"):
+        """Nạp hàng trăm video theo lô nhỏ thay vì tạo toàn bộ QWidget trong một
+        vòng for trên main-thread. Windows sẽ không còn báo Not Responding khi thư
+        mục có 100-500 tập. Thumbnail cũng tạm hoãn tới khi nạp card xong."""
+        if self._bulk_loading:
+            QMessageBox.information(self, "Đang nạp video",
+                                    "Tool đang nạp danh sách hiện tại. Vui lòng chờ vài giây.")
+            return
+
+        # Lọc trùng trước bằng set O(1), tránh _add_card phải quét 1..N card lặp lại.
+        pending = []
+        known = set(getattr(self, "_card_path_set", set()))
+        for vp, sp in pairs:
+            try:
+                key = os.path.normcase(os.path.abspath(vp))
+            except Exception:
+                key = str(vp)
+            if key in known:
+                continue
+            known.add(key)
+            pending.append((vp, sp))
+
+        if not pending:
+            QMessageBox.information(self, "Không có video mới",
+                                    "Các video trong lựa chọn này đã có trong danh sách.")
+            return
+
+        self._bulk_loading = True
+        self._bulk_pairs = pending
+        self._bulk_index = 0
+        self._bulk_source_label = source_label
+        self._bulk_started_at = time.time()
+
+        # Dừng thumbnail trong lúc dựng hàng trăm card để CPU/ổ đĩa chỉ tập trung cho UI.
+        try:
+            self._thumb_view_timer.stop()
+        except Exception:
+            pass
+
+        total = len(pending)
+        if hasattr(self, "lbl_editor_count"):
+            self.lbl_editor_count.setText(f"Đang nạp 0/{total}")
+        if hasattr(self, "lbl_selected_count"):
+            self.lbl_selected_count.setText(f"Đang đọc {total} video…")
+        self.setCursor(Qt.CursorShape.WaitCursor)
+
+        # Cho Qt vẽ lại giao diện trước, rồi mới bắt đầu tạo card.
+        QTimer.singleShot(0, self._import_next_card_batch)
+
+    def _import_next_card_batch(self):
+        if not self._bulk_loading:
+            return
+        total = len(self._bulk_pairs)
+        start = self._bulk_index
+        end = min(total, start + max(1, int(self._bulk_batch_size)))
+
+        try:
+            cols = int(self.cmb_layout.currentText()) if hasattr(self, "cmb_layout") else 3
+        except Exception:
+            cols = 3
+        cols = max(2, min(4, cols))
+
+        # Tạo một lô nhỏ. Không gọi _relayout_grid() sau mỗi card vì đó là phần
+        # gây lag lớn nhất khi có 200-500 video. Card mới được đặt thẳng đúng ô.
+        for i in range(start, end):
+            vp, sp = self._bulk_pairs[i]
+            card = self._add_card(vp, sp)
+            if card is not None:
+                if self._library_filter == "all" and not self._search_text:
+                    idx = self.cards.index(card)
+                    self.grid_lay.addWidget(card, idx // cols, idx % cols)
+
+        self._bulk_index = end
+        if hasattr(self, "lbl_editor_count"):
+            self.lbl_editor_count.setText(f"Đang nạp {end}/{total}")
+        if hasattr(self, "lbl_selected_count"):
+            self.lbl_selected_count.setText(f"Đang nạp video… {end}/{total}")
+
+        if end < total:
+            # Nhả event loop sau mỗi lô: cửa sổ vẫn kéo/di chuyển/bấm được,
+            # Windows không đánh dấu ứng dụng Not Responding.
+            QTimer.singleShot(0, self._import_next_card_batch)
+            return
+
+        # Hoàn tất. Lúc này mới chọn tập đầu + nạp thumbnail của vùng đang thấy.
+        self._bulk_loading = False
+        self._bulk_pairs = []
+        self._bulk_index = 0
+        self.unsetCursor()
+        self._update_run_label()
+        if self._library_filter != "all" or self._search_text:
+            self._relayout_grid()
+        if self.selected_card is None and self.cards:
+            QTimer.singleShot(0, lambda c=self.cards[0]: self._on_card_clicked(c))
+        self._schedule_visible_thumbnails()
+        self._schedule_realtime_refresh(0)
+        elapsed = max(0.0, time.time() - getattr(self, "_bulk_started_at", time.time()))
+        self._log(f"📂 Đã nạp {total} video từ {self._bulk_source_label} trong {elapsed:.1f}s (không khóa giao diện).")
 
     def _auto_pair(self, folder):
         """Quét folder, ghép cặp video+srt. Ưu tiên *_dubbed.mp4 + *_vi.srt;
@@ -3095,48 +3993,345 @@ class RenderWidget(QWidget):
                 return cand
         return None
 
+    def _selected_cards(self):
+        """Các tập đang được tick trong grid. Card cũ/ngoài editor vẫn fallback chọn."""
+        return [c for c in self.cards if not hasattr(c, "is_checked") or c.is_checked()]
+
+    def _find_pipeline_page_index(self):
+        """Tìm đúng PAGE của QTabWidget đang chứa dub_feature_tab.
+
+        render_dub_feature.attach_dub_tab() có thể thêm trực tiếp widget pipeline,
+        hoặc bọc nó trong QScrollArea/QWidget. Bản V2 cũ gọi setCurrentWidget()
+        bằng widget con nên Qt không báo exception nhưng cũng không đổi tab -> bấm
+        Dịch/Lồng tưởng như "không hiện gì".
+        """
+        tab = getattr(self, "dub_feature_tab", None)
+        if tab is None:
+            return -1
+
+        try:
+            direct = self.tabs.indexOf(tab)
+            if direct >= 0:
+                return direct
+        except Exception:
+            pass
+
+        # Pipeline thường được bọc trong QScrollArea/viewport. Tìm page cha.
+        try:
+            for i in range(self.tabs.count()):
+                page = self.tabs.widget(i)
+                if page is tab:
+                    return i
+                try:
+                    if page.isAncestorOf(tab):
+                        return i
+                except Exception:
+                    pass
+                try:
+                    if tab in page.findChildren(QWidget):
+                        return i
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Fallback theo tên tab do module ngoài tạo.
+        try:
+            for i in range(self.tabs.count()):
+                txt = (self.tabs.tabText(i) or "").lower()
+                if any(k in txt for k in ("sub", "dịch", "dich", "lồng", "long", "tts")):
+                    # Tránh chọn nhầm tab Phụ đề chính của editor.
+                    if txt.strip() not in ("phụ đề", "phu de"):
+                        return i
+        except Exception:
+            pass
+        return -1
+
+    def _focus_pipeline_stage(self, stage=None):
+        """Sau khi mở pipeline, cố chuyển đến mục Tách/Dịch/Lồng tương ứng.
+        Không phụ thuộc chặt vào implementation của render_dub_feature.py.
+        """
+        idx = self._find_pipeline_page_index()
+        if idx < 0:
+            QMessageBox.information(
+                self, "Pipeline",
+                "Không tìm thấy giao diện Sub → Dịch → Lồng.\n"
+                "Hãy kiểm tra render_dub_feature.py có nằm cạnh app và được nạp thành công.")
+            return False
+
+        self.tabs.setCurrentIndex(idx)
+        page = self.tabs.widget(idx)
+
+        # Đảm bảo inspector phải nhìn thấy page vừa chọn.
+        try:
+            self.tabs.setFocus()
+        except Exception:
+            pass
+
+        if not stage:
+            return True
+
+        targets = {
+            "extract": ("tách", "tach", "stt", "sub"),
+            "translate": ("dịch", "dich", "translate"),
+            "dub": ("lồng", "long", "tts", "voice", "giọng", "giong"),
+        }.get(stage, ())
+
+        # Nếu module pipeline có QTabWidget con, chọn tab đúng theo text.
+        try:
+            for child_tabs in page.findChildren(QTabWidget):
+                if child_tabs is self.tabs:
+                    continue
+                for j in range(child_tabs.count()):
+                    txt = (child_tabs.tabText(j) or "").lower()
+                    if targets and any(k in txt for k in targets):
+                        child_tabs.setCurrentIndex(j)
+                        return True
+        except Exception:
+            pass
+
+        # Một số bản render_dub_feature lưu widget nội bộ trực tiếp trên tab.
+        pipeline = getattr(self, "dub_feature_tab", None)
+        for attr in {
+            "extract": ("tab_extract", "tab_stt", "page_extract"),
+            "translate": ("tab_translate", "page_translate", "translate_tab"),
+            "dub": ("tab_dub", "tab_tts", "page_dub", "tts_tab"),
+        }.get(stage, ()):
+            try:
+                target = getattr(pipeline, attr, None)
+                if target is None:
+                    continue
+                for child_tabs in page.findChildren(QTabWidget):
+                    k = child_tabs.indexOf(target)
+                    if k >= 0:
+                        child_tabs.setCurrentIndex(k)
+                        return True
+            except Exception:
+                pass
+        return True
+
+    def _open_pipeline_tab(self):
+        """Mở giao diện Sub → Dịch → Lồng."""
+        self._focus_pipeline_stage(None)
+
+    def _open_pipeline_extract(self):
+        self._focus_pipeline_stage("extract")
+
+    def _open_pipeline_translate(self):
+        self._focus_pipeline_stage("translate")
+
+    def _open_pipeline_dub(self):
+        self._focus_pipeline_stage("dub")
+
+    def _on_layout_columns_changed(self, text):
+        try:
+            cols = max(2, min(4, int(text)))
+        except Exception:
+            cols = 3
+        self.settings.setValue("editor_grid_columns", str(cols))
+        self._relayout_grid()
+
     def _add_card(self, video_path, srt_path):
-        # tránh trùng
-        for c in self.cards:
-            if c.video_path == video_path:
-                return
+        # Tránh trùng bằng set O(1). Với 260 video, cách cũ quét self.cards ở
+        # mỗi lần thêm sẽ thành O(N²) và làm bước mở thư mục chậm rõ rệt.
+        try:
+            key = os.path.normcase(os.path.abspath(video_path))
+        except Exception:
+            key = str(video_path)
+        if key in self._card_path_set:
+            return None
         card = EpisodeCard(video_path, srt_path)
         card.clicked.connect(self._on_card_clicked)
+        card.play_requested.connect(self._on_card_play)
+        card.seek_requested.connect(self._on_card_seek)
+        card.selection_changed.connect(self._update_run_label)
         self.cards.append(card)
+        self._card_path_set.add(key)
+
+        # Realtime: theo dõi thư mục chứa output của tập này. Nếu SRT nằm ở thư
+        # mục khác (thêm thủ công) thì theo dõi luôn thư mục đó.
+        self._ensure_realtime_watch_dir(os.path.dirname(video_path))
+        if srt_path:
+            self._ensure_realtime_watch_dir(os.path.dirname(srt_path))
+        try:
+            self._rt_state_cache[id(card)] = self._rt_state_signature(self._card_state(card))
+        except Exception:
+            pass
+
+        if not self._bulk_loading:
+            self._update_sidebar_counts()
+        # Khi nạp thư mục lớn, không tự mở media của tập đầu giữa quá trình dựng card.
+        if self.selected_card is None and not self._bulk_loading:
+            QTimer.singleShot(0, lambda c=card: self._on_card_clicked(c))
+        return card
 
     def _relayout_grid(self):
-        # xếp lại lưới 2 cột
+        # 2/3/4 cột theo lựa chọn ở góc phải dưới, mặc định 3 như ảnh mẫu.
         for i in reversed(range(self.grid_lay.count())):
             w = self.grid_lay.itemAt(i).widget()
             if w:
                 self.grid_lay.removeWidget(w)
-        for idx, card in enumerate(self.cards):
-            self.grid_lay.addWidget(card, idx // 1, idx % 1)   # 1 cột cho dễ đọc tên
+        try:
+            cols = int(self.cmb_layout.currentText()) if hasattr(self, "cmb_layout") else 3
+        except Exception:
+            cols = 3
+        cols = max(2, min(4, cols))
+        # setColumnStretch chỉ cần làm 1 lần cho số cột hiện tại.
+        for col in range(4):
+            self.grid_lay.setColumnStretch(col, 1 if col < cols else 0)
+        visible_cards = self._visible_cards_for_grid()
+        for card in self.cards:
+            card.setVisible(card in visible_cards)
+        for idx, card in enumerate(visible_cards):
+            self.grid_lay.addWidget(card, idx // cols, idx % cols)
+        self._schedule_visible_thumbnails()
+
+    def _schedule_visible_thumbnails(self):
+        timer = getattr(self, "_thumb_view_timer", None)
+        if timer is not None:
+            timer.start()
+
+    def _load_visible_thumbnails(self):
+        """Chỉ nạp ảnh cho vùng nhìn thấy + một hàng đệm trên/dưới."""
+        # Trong lúc nạp hàng trăm card, thumbnail phải đứng yên để không tranh CPU/IO
+        # và không kích hoạt thêm layout/paint giữa quá trình import.
+        if self._bulk_loading:
+            return
+        if not self.cards or not hasattr(self, "scroll_grid"):
+            return
+        vp = self.scroll_grid.viewport()
+        h = vp.height()
+        margin = 360  # preload xấp xỉ hơn 1 hàng card
+        for card in self.cards:
+            # Card đang có player thật thì không cần thumbnail.
+            if getattr(card, "_preview_attached", False):
+                continue
+            try:
+                p = card.mapTo(vp, QPoint(0, 0))
+                y0, y1 = p.y(), p.y() + card.height()
+                if y1 >= -margin and y0 <= h + margin:
+                    card.ensure_thumbnail()
+            except Exception:
+                # Fallback an toàn: nếu Qt chưa map được lúc layout vừa tạo,
+                # chỉ nạp vài card đầu thay vì nạp toàn bộ.
+                for c in self.cards[:12]:
+                    c.ensure_thumbnail()
+                break
 
     def _clear_all(self):
+        # Hủy phần còn lại nếu người dùng dọn danh sách giữa lúc đang nạp.
+        self._bulk_loading = False
+        self._bulk_pairs = []
+        self._bulk_index = 0
+        try:
+            self.unsetCursor()
+        except Exception:
+            pass
         self.media_player.stop()
+        if getattr(self, "_preview_card", None) is not None:
+            try:
+                self._preview_card.detach_preview_widget(self.preview)
+            except Exception:
+                pass
+            self._preview_card = None
         for c in self.cards:
             c.setParent(None)
-        self.cards = []; self.selected_card = None
+            c.deleteLater()
+        self.cards = []
+        self._card_path_set.clear()
+        # Dọn realtime cache + watcher cũ để mở project/thư mục khác không giữ
+        # hàng chục directory watch không còn dùng.
+        try:
+            self._rt_state_cache.clear()
+            watched = list(self._rt_fs_watcher.directories())
+            if watched:
+                self._rt_fs_watcher.removePaths(watched)
+            self._rt_watch_dirs.clear()
+        except Exception:
+            pass
+        self.selected_card = None
         self.lbl_fix_v.setText("—"); self.lbl_fix_s.setText("—")
+        if hasattr(self, "lbl_selected_title"): self.lbl_selected_title.setText("🔧  Chỉnh sửa: Chưa chọn video")
+        for _name in ("res", "dur", "size", "sub"):
+            _w = getattr(self, f"lbl_info_{_name}", None)
+            if _w is not None: _w.setText("—")
         self._update_run_label()
 
+    def _attach_preview_to_card(self, card):
+        if card is None:
+            return
+        old = getattr(self, "_preview_card", None)
+        if old is not None and old is not card:
+            try:
+                old.detach_preview_widget(self.preview)
+                old.btn_card_play.setText("▶")
+            except Exception:
+                pass
+        if old is not card:
+            card.attach_preview_widget(self.preview)
+            self._preview_card = card
+            QTimer.singleShot(0, self._reset_pos)
+
     def _on_card_clicked(self, card):
-        for c in self.cards:
-            c.set_selected(c is card)
+        old = self.selected_card
+        # Bấm lại đúng card đang chỉnh thì KHÔNG reload cấu hình, tránh mất thay đổi
+        # vừa kéo/chỉnh nhưng chưa chuyển sang card khác.
+        if old is card and getattr(self, "_preview_card", None) is card:
+            card.set_selected(True)
+            return
+        if old is not None and old is not card:
+            self._save_design_to_card(old)
+            old.set_selected(False)
+        card.set_selected(True)
         self.selected_card = card
         self.lbl_fix_v.setText(os.path.basename(card.video_path))
-        self.lbl_fix_s.setText(os.path.basename(card.srt_path) if card.srt_path else "⚠️ chưa có sub")
+        self.lbl_fix_v.setToolTip(card.video_path)
+        self.lbl_fix_s.setText(os.path.basename(card.srt_path) if card.srt_path else "⚠ chưa có sub")
+        self.lbl_fix_s.setToolTip(card.srt_path or "")
+        self._refresh_selected_file_info(card)
+        self._attach_preview_to_card(card)
         self._load_preview(card.video_path)
+        QTimer.singleShot(60, lambda c=card: self._restore_design_from_card(c)
+                          if self.selected_card is c else None)
+
+    def _on_card_play(self, card):
+        same_card = (self.selected_card is card and getattr(self, "_preview_card", None) is card)
+        if not same_card:
+            self._on_card_clicked(card)
+        self._toggle_play()
+
+    def _on_card_seek(self, card, pos_ms):
+        if card is not self.selected_card or getattr(self, "_preview_card", None) is not card:
+            self._on_card_clicked(card)
+        try:
+            self.media_player.setPosition(int(pos_ms))
+        except Exception:
+            pass
 
     def _change_video(self):
         if not self.selected_card:
             return
         fp, _ = QFileDialog.getOpenFileName(self, "Chọn video khác", "", "Video (*.mp4 *.mkv *.mov *.avi)")
         if fp:
+            old_path = self.selected_card.video_path
+            try:
+                self._card_path_set.discard(os.path.normcase(os.path.abspath(old_path)))
+                self._card_path_set.add(os.path.normcase(os.path.abspath(fp)))
+            except Exception:
+                pass
             self.selected_card.video_path = fp
             self.selected_card.lbl_name.setText(os.path.basename(fp))
-            self.lbl_fix_v.setText(os.path.basename(fp))
+            self.selected_card.lbl_name.setToolTip(fp)
+            try:
+                self.selected_card._load_thumbnail()
+                self.selected_card._update_source_badges()
+            except Exception:
+                pass
+            self.lbl_fix_v.setText(os.path.basename(fp)); self.lbl_fix_v.setToolTip(fp)
+            self._ensure_realtime_watch_dir(os.path.dirname(fp))
+            self._refresh_selected_file_info(self.selected_card)
+            self._update_run_label()
+            self._schedule_realtime_refresh(0)
             self._load_preview(fp)
 
     def _change_srt(self):
@@ -3145,48 +4340,184 @@ class RenderWidget(QWidget):
         fp, _ = QFileDialog.getOpenFileName(self, "Chọn sub khác", "", "Phụ đề (*.srt)")
         if fp:
             self.selected_card.srt_path = fp
-            self.selected_card.lbl_srt.setText("📄 " + os.path.basename(fp))
-            self.selected_card.lbl_srt.setStyleSheet("color:#8A8D98; font-size:10px; border:none;")
-            self.lbl_fix_s.setText(os.path.basename(fp))
+            self.selected_card.lbl_srt.setText("S1  " + os.path.basename(fp))
+            self.selected_card.lbl_srt.setToolTip(fp)
+            self.selected_card.lbl_srt.setStyleSheet("color:#63D79A; font-size:9px; border:none;")
+            try:
+                self.selected_card._update_source_badges()
+            except Exception:
+                pass
+            self.lbl_fix_s.setText(os.path.basename(fp)); self.lbl_fix_s.setToolTip(fp)
+            self._ensure_realtime_watch_dir(os.path.dirname(fp))
+            self._refresh_selected_file_info(self.selected_card)
+            self._update_run_label()
+            self._schedule_realtime_refresh(0)
 
     def _update_run_label(self):
-        self.btn_run.setText(f"🔥 RENDER TẤT CẢ ({len(self.cards)})")
-        if hasattr(self, 'btn_merge_now'):
-            self.btn_merge_now.setText(f"🔗 GỘP NGAY ({len(self.cards)})")
+        n_all = len(self.cards)
+        n_sel = len(self._selected_cards())
+        if hasattr(self, "btn_run"):
+            self.btn_run.setText(f"④  Render & Xuất ({n_sel})\nTạo video hoàn chỉnh")
+        if hasattr(self, "btn_merge_now"):
+            self.btn_merge_now.setText(f"🔗  Gộp nhanh ({n_sel})")
+        if hasattr(self, "lbl_editor_count"):
+            self.lbl_editor_count.setText(f"{n_all} video")
+        if hasattr(self, "lbl_selected_count"):
+            self.lbl_selected_count.setText(f"Đã chọn {n_sel}/{n_all}")
+        if hasattr(self, "lbl_bottom_count"):
+            self.lbl_bottom_count.setText(f"{n_all} tập")
+        self._update_sidebar_counts()
 
-    # ============ PREVIEW ============
+    # ============ THIẾT KẾ RIÊNG CHO TỪNG VIDEO ============
+    def _default_design(self):
+        return copy.deepcopy(getattr(self, "_default_design_template", None) or self._collect_design(persist=False))
+
+    def _save_design_to_card(self, card=None):
+        if self._loading_card_design:
+            return
+        card = card or self.selected_card
+        if card is None:
+            return
+        card.design_config = copy.deepcopy(self._collect_design(persist=True))
+        self._design_locked = None
+
+    def _clear_scene_design_items(self):
+        for b in list(getattr(self, "blur_boxes", []) or []):
+            try: self.scene.removeItem(b)
+            except Exception: pass
+        self.blur_boxes = []
+        if getattr(self, "sample_sub", None) is not None:
+            try: self.scene.removeItem(self.sample_sub)
+            except Exception: pass
+            self.sample_sub = None
+        if getattr(self, "logo_item", None) is not None:
+            try: self.scene.removeItem(self.logo_item)
+            except Exception: pass
+            self.logo_item = None
+
+    def _set_controls_from_design(self, d):
+        if not d:
+            return
+        self._loading_card_design = True
+        try:
+            def _set_combo(cb, text):
+                if text is None: return
+                i = cb.findText(str(text))
+                if i >= 0: cb.setCurrentIndex(i)
+            self.chk_hardsub.setChecked(bool(d.get("hardsub_en", True)))
+            _set_combo(self.cb_quality, d.get("render_quality"))
+            _set_combo(self.cb_font, d.get("font_name"))
+            self.spin_size.setValue(int(d.get("font_size", self.spin_size.value())))
+            _set_combo(self.cb_color, d.get("font_color_name", "Trắng (White)"))
+            self.chk_subbox.setChecked(bool(d.get("subbox_en", False)))
+            _set_combo(self.cb_subbox_color, d.get("subbox_color_name", "Đen"))
+            self.spn_subbox_opacity.setValue(int(d.get("subbox_opacity", 60)))
+            self.chk_blur.setChecked(bool(d.get("bp_blur_en", False)))
+            self.chk_frame.setChecked(bool(d.get("bp_frame_en", False)))
+            self.frame_input.setText(d.get("frame_path", "") or "")
+            self.chk_logo.setChecked(bool(d.get("bp_logo_en", False)))
+            self.logo_input.setText(d.get("logo_path", "") or "")
+            self.chk_flip.setChecked(bool(d.get("bp_flip", False)))
+            self.chk_zoom.setChecked(bool(d.get("bp_zoom", False)))
+            self.chk_color.setChecked(bool(d.get("bp_color", False)))
+            self.chk_noise.setChecked(bool(d.get("bp_noise", False)))
+            self.chk_speed.setChecked(bool(d.get("bp_speed", False)))
+            self.chk_pitch.setChecked(bool(d.get("bp_pitch", False)))
+            self.chk_rotate.setChecked(bool(d.get("bp_rotate", False)))
+        finally:
+            self._loading_card_design = False
+
+    def _restore_design_from_card(self, card):
+        if card is None or self.selected_card is not card:
+            return
+        d = copy.deepcopy(card.design_config) if getattr(card, "design_config", None) else self._default_design()
+        self._set_controls_from_design(d)
+        self._clear_scene_design_items()
+        rect = self.scene.sceneRect()
+        W = rect.width() or 1080
+        H = rect.height() or 1920
+        srcW = float(d.get("SW") or W or 1)
+        srcH = float(d.get("SH") or H or 1)
+        sx = W / srcW if srcW else 1.0
+        sy = H / srcH if srcH else 1.0
+
+        self._ensure_sample_sub()
+        sp = d.get("sub_pos")
+        if sp and self.sample_sub is not None:
+            try:
+                self.sample_sub.setPos(float(sp.get("item_x", sp.get("left", W*.08))) * sx,
+                                       float(sp.get("item_y", max(0, sp.get("bottom", H*.85)-50))) * sy)
+                self.sample_sub.setScale(float(sp.get("item_scale", 1.0)) * min(sx, sy))
+            except Exception: pass
+
+        for br in d.get("blur_list", []) or []:
+            try:
+                box = DraggableBlurBox(float(br["x"])*sx, float(br["y"])*sy,
+                                       max(10, float(br["w"])*sx), max(10, float(br["h"])*sy))
+                self.scene.addItem(box); self.blur_boxes.append(box)
+            except Exception: pass
+
+        self._update_logo_preview()
+        lp = d.get("logo_pos")
+        if lp and self.logo_item is not None:
+            try:
+                self.logo_item.setPos(float(lp.get("item_x", lp.get("x", W*.05))) * sx,
+                                      float(lp.get("item_y", lp.get("y", H*.05))) * sy)
+                self.logo_item.setScale(float(lp.get("scale", 1.0)) * min(sx, sy))
+            except Exception: pass
+        try: self.preview.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        except Exception: pass
+
+    # ============ PREVIEW TRỰC TIẾP TRÊN CARD ============
     def _load_preview(self, video_path):
         try:
             self.media_player.setSource(QUrl.fromLocalFile(video_path))
             self.media_player.pause()
+            if self.selected_card:
+                self.selected_card.btn_card_play.setText("▶")
+                self.selected_card.set_media_position(0, 0)
         except Exception as e:
             self._log(f"⚠️ Không mở được preview: {e}")
 
     def _toggle_play(self):
         from PyQt6.QtMultimedia import QMediaPlayer as _QMP
+        card = self.selected_card
+        if not card:
+            return
         if self.media_player.playbackState() == _QMP.PlaybackState.PlayingState:
-            self.media_player.pause(); self.btn_play.setText("▶")
+            self.media_player.pause()
+            card.btn_card_play.setText("▶")
         else:
-            self.media_player.play(); self.btn_play.setText("⏸")
+            self.media_player.play()
+            card.btn_card_play.setText("⏸")
 
     def _on_pos(self, pos):
-        self.slider.setValue(pos)
         dur = self.media_player.duration()
-        self.lbl_time.setText(f"{format_time(pos/1000)} / {format_time(dur/1000)}")
+        if self.selected_card and hasattr(self.selected_card, "set_media_position"):
+            self.selected_card.set_media_position(pos, dur)
 
     def _on_dur(self, dur):
-        self.slider.setRange(0, dur)
+        if self.selected_card and hasattr(self.selected_card, "set_media_position"):
+            self.selected_card.set_media_position(self.media_player.position(), dur)
+        if hasattr(self, "lbl_info_dur") and self.selected_card:
+            self.lbl_info_dur.setText(self._fmt_ms(dur))
 
     def _on_native_size(self, size):
         if size.width() > 0 and size.height() > 0:
             self.video_item.setSize(size)
             self.scene.setSceneRect(0, 0, size.width(), size.height())
             self.preview.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-            self._ensure_sample_sub()   # hiện ô chữ mẫu để canh vị trí sub
-            self._update_logo_preview() # hiện logo nếu có
+            if hasattr(self, "lbl_info_res") and self.selected_card is not None:
+                self.lbl_info_res.setText(f"{int(size.width())} × {int(size.height())}")
+            if self.selected_card is not None:
+                self._restore_design_from_card(self.selected_card)
 
     def _reset_pos(self):
-        self.preview.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        try:
+            if not self.scene.sceneRect().isEmpty():
+                self.preview.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        except Exception:
+            pass
 
     # ============ KHUNG MỜ / FRAME / LOGO ============
     def _add_blur_box(self):
@@ -3282,7 +4613,7 @@ class RenderWidget(QWidget):
             self.logo_input.setText(fp)
 
     # ============ THU THẬP CONFIG DESIGN ============
-    def _collect_design(self):
+    def _collect_design(self, persist=True):
         color_name = self.cb_color.currentText()
         color_ass = COLOR_PRESETS.get(color_name, {}).get("ass", "&H00FFFFFF")
         blur_list = []
@@ -3298,7 +4629,8 @@ class RenderWidget(QWidget):
         if getattr(self, 'logo_item', None) is not None and self.chk_logo.isChecked():
             lr = self.logo_item.sceneBoundingRect()
             logo_pos = {
-                "x": lr.x(), "y": lr.y(), "scale": self.logo_item.scale()
+                "x": lr.x(), "y": lr.y(), "scale": self.logo_item.scale(),
+                "item_x": self.logo_item.pos().x(), "item_y": self.logo_item.pos().y()
             }
 
         # Đọc VỊ TRÍ + CỠ chữ mẫu (nếu người dùng đã kéo canh) để render sub
@@ -3314,48 +4646,53 @@ class RenderWidget(QWidget):
                     "cx": r.center().x(), "cy": r.center().y(),
                     "left": r.left(), "bottom": r.bottom(),
                     "SW": SW, "SH": SH, "eff_size": eff_size,
+                    "item_x": self.sample_sub.pos().x(),
+                    "item_y": self.sample_sub.pos().y(),
+                    "item_scale": self.sample_sub.scale(),
                 }
         except Exception:
             sub_pos = None
-
-        self.settings.setValue("font_name", self.cb_font.currentText())
-        self.settings.setValue("font_size", self.spin_size.value())
-        self.settings.setValue("font_color_name", color_name)
-        self.settings.setValue("render_quality", self.cb_quality.currentText())
-        self.settings.setValue("hardsub_en", self.chk_hardsub.isChecked())
 
         # Nền ô chữ -> mã màu ASS &HAABBGGRR (AA=alpha: 00 đặc, FF trong).
         subbox_en = self.chk_subbox.isChecked()
         _box_bgr = {"Đen": "000000", "Xám đậm": "202020", "Xanh đen": "301500", "Trắng": "FFFFFF"}
         bgr = _box_bgr.get(self.cb_subbox_color.currentText(), "000000")
-        opac = int(self.spn_subbox_opacity.value())          # 0..100 (100 = đặc)
-        alpha = int(round((100 - opac) * 255 / 100))         # ASS alpha: 0 đặc, 255 trong
+        opac = int(self.spn_subbox_opacity.value())
+        alpha = int(round((100 - opac) * 255 / 100))
         subbox_color = f"&H{alpha:02X}{bgr}"
-        self.settings.setValue("subbox_en", subbox_en)
-        self.settings.setValue("subbox_color_name", self.cb_subbox_color.currentText())
-        self.settings.setValue("subbox_opacity", opac)
-        # Lưu thêm các thiết lập Logo/Khung mờ/Overlay/Bypass FX -> trước đây
-        # các giá trị này chỉ được ĐỌC lúc khởi động chứ chưa từng được GHI,
-        # nên có thể bị "quên" nếu app khởi động lại giữa chừng.
-        self.settings.setValue("bp_logo_en", self.chk_logo.isChecked())
-        self.settings.setValue("logo_path", self.logo_input.text().strip())
-        self.settings.setValue("bp_frame_en", self.chk_frame.isChecked())
-        self.settings.setValue("frame_path", self.frame_input.text().strip())
-        self.settings.setValue("bp_blur_en", self.chk_blur.isChecked())
-        for k, chk in (("bp_flip", self.chk_flip), ("bp_zoom", self.chk_zoom), ("bp_color", self.chk_color),
-                       ("bp_noise", self.chk_noise), ("bp_speed", self.chk_speed), ("bp_pitch", self.chk_pitch),
-                       ("bp_rotate", self.chk_rotate)):
-            self.settings.setValue(k, chk.isChecked())
+
+        # QSettings chỉ lưu mặc định cho lần mở app sau; không phải state chung của mọi card.
+        if persist:
+            self.settings.setValue("font_name", self.cb_font.currentText())
+            self.settings.setValue("font_size", self.spin_size.value())
+            self.settings.setValue("font_color_name", color_name)
+            self.settings.setValue("render_quality", self.cb_quality.currentText())
+            self.settings.setValue("hardsub_en", self.chk_hardsub.isChecked())
+            self.settings.setValue("subbox_en", subbox_en)
+            self.settings.setValue("subbox_color_name", self.cb_subbox_color.currentText())
+            self.settings.setValue("subbox_opacity", opac)
+            self.settings.setValue("bp_logo_en", self.chk_logo.isChecked())
+            self.settings.setValue("logo_path", self.logo_input.text().strip())
+            self.settings.setValue("bp_frame_en", self.chk_frame.isChecked())
+            self.settings.setValue("frame_path", self.frame_input.text().strip())
+            self.settings.setValue("bp_blur_en", self.chk_blur.isChecked())
+            for k, chk in (("bp_flip", self.chk_flip), ("bp_zoom", self.chk_zoom), ("bp_color", self.chk_color),
+                           ("bp_noise", self.chk_noise), ("bp_speed", self.chk_speed), ("bp_pitch", self.chk_pitch),
+                           ("bp_rotate", self.chk_rotate)):
+                self.settings.setValue(k, chk.isChecked())
         return {
             "hardsub_en": self.chk_hardsub.isChecked(),
             "render_quality": self.cb_quality.currentText(),
             "font_name": self.cb_font.currentText(),
             "font_size": self.spin_size.value(),
             "font_color": color_ass,
+            "font_color_name": color_name,
             "sub_pos": sub_pos,
             "logo_pos": logo_pos,
             "SW": SW, "SH": SH,
             "subbox_en": subbox_en, "subbox_color": subbox_color,
+            "subbox_color_name": self.cb_subbox_color.currentText(),
+            "subbox_opacity": opac,
             "bp_blur_en": self.chk_blur.isChecked(), "blur_list": blur_list,
             "bp_frame_en": self.chk_frame.isChecked(), "frame_path": self.frame_input.text().strip(),
             "bp_logo_en": self.chk_logo.isChecked(), "logo_path": self.logo_input.text().strip(),
@@ -3493,17 +4830,23 @@ class RenderWidget(QWidget):
 
     # ============ RENDER HÀNG LOẠT ============
     def _sync_design_all(self):
-        """Chốt cấu hình canh chỉnh hiện tại (vị trí sub + ô che + font/màu/FX)
-        làm chuẩn dùng cho TẤT CẢ các tập khi render."""
+        """Chỉ nút này mới sao chép thiết kế video hiện tại sang toàn bộ video."""
         if not self.cards:
             QMessageBox.information(self, "Chưa có file", "Hãy thêm video vào hàng đợi trước.")
             return
-        self._design_locked = self._collect_design()
-        n_blur = len(self._design_locked.get("blur_list", []))
-        self._log(f"🔄 Đã chốt canh chỉnh (vị trí sub + {n_blur} ô che) áp cho tất cả {len(self.cards)} tập.")
+        if self.selected_card is None:
+            QMessageBox.information(self, "Chưa chọn video", "Hãy chọn 1 video làm mẫu trước.")
+            return
+        self._save_design_to_card(self.selected_card)
+        master = copy.deepcopy(self.selected_card.design_config or self._default_design())
+        for c in self.cards:
+            c.design_config = copy.deepcopy(master)
+        self._design_locked = None
+        n_blur = len(master.get("blur_list", []))
+        self._log(f"🔄 Đã đồng bộ từ {os.path.basename(self.selected_card.video_path)} sang {len(self.cards)} tập ({n_blur} vùng mờ).")
         QMessageBox.information(self, "Đã đồng bộ",
-            f"Đã lưu canh chỉnh hiện tại làm chuẩn cho tất cả {len(self.cards)} tập.\n"
-            f"Bấm 'RENDER TẤT CẢ' để render đồng loạt theo canh chỉnh này.")
+            f"Đã sao chép canh chỉnh của video đang chọn sang tất cả {len(self.cards)} video.\n"
+            "Sau đó bạn vẫn có thể chọn từng video để chỉnh riêng tiếp.")
 
     def _clean_junk_files(self):
         """Dọn sạch file trung gian sau khi render, CHỈ GIỮ bản render cuối
@@ -3512,6 +4855,15 @@ class RenderWidget(QWidget):
         Xóa luôn, không hỏi (theo yêu cầu)."""
         if self._render_running:
             QMessageBox.information(self, "Đang render", "Đang render, dọn rác sau khi xong.")
+            return
+
+        ans = QMessageBox.question(
+            self, "Dọn file trung gian",
+            "Thao tác này có thể xóa video gốc, file lồng tiếng, SRT và file trung gian.\n"
+            "BOOM Studio sẽ chỉ giữ bản *_final.mp4 và bản gộp.\n\nBạn có chắc muốn tiếp tục?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
             return
 
         # Gom các thư mục chứa video trong hàng đợi (kể cả khi card đã bị xóa,
@@ -3590,11 +4942,10 @@ class RenderWidget(QWidget):
         if not self.cards:
             QMessageBox.information(self, "Chưa có video", "Hãy thêm video vào hàng đợi trước.")
             return
-        # Chuyển sang tab con để người dùng thấy log chạy
-        try:
-            self.tabs.setCurrentWidget(tab)
-        except Exception:
-            pass
+        # Chuyển sang đúng PAGE chứa pipeline để người dùng thấy giao diện/log chạy.
+        # dub_feature_tab có thể là widget con nằm trong QScrollArea, vì vậy không
+        # dùng setCurrentWidget(tab) trực tiếp nữa.
+        self._focus_pipeline_stage(None)
         tab._run_full_pipeline()
 
     def _start_render_all(self):
@@ -3604,9 +4955,13 @@ class RenderWidget(QWidget):
         if not self.cards:
             QMessageBox.information(self, "Chưa có video", "Hãy thêm video vào hàng đợi trước.")
             return
-        # Ưu tiên cấu hình ĐÃ ĐỒNG BỘ (nếu bấm nút Đồng bộ trước đó); nếu chưa
-        # đồng bộ thì lấy canh chỉnh hiện tại. Dù cách nào cũng áp CHUNG cho mọi tập.
-        self._design = getattr(self, '_design_locked', None) or self._collect_design()
+        selected_cards = self._selected_cards()
+        if not selected_cards:
+            QMessageBox.information(self, "Chưa chọn video", "Hãy tick ít nhất 1 video trong grid để Xuất.")
+            return
+        # Chốt riêng card đang mở trước khi render.
+        if self.selected_card is not None:
+            self._save_design_to_card(self.selected_card)
         # Chỉ ép resolution đồng nhất KHI có tích 'Gộp trọn bộ sau Render' — vì
         # chỉ lúc gộp mới cần các tập cùng size. Không gộp thì giữ size gốc,
         # khỏi quét (đỡ khựng nút RENDER).
@@ -3619,7 +4974,8 @@ class RenderWidget(QWidget):
         # (phòng khi thêm file thủ công bằng '+ File' không theo thứ tự).
         self.cards.sort(key=lambda c: _natural_key(os.path.basename(c.video_path)))
         self._relayout_grid()
-        self._render_queue = list(self.cards)
+        selected_cards = [c for c in self.cards if c in selected_cards]
+        self._render_queue = list(selected_cards)
         self._render_total = len(self._render_queue)
         self._render_done_count = 0
         self._rendered_files = [] # Lưu danh sách file xuất ra để gộp
@@ -3671,6 +5027,9 @@ class RenderWidget(QWidget):
             return
         self._done_units = min(self._total_units, self._done_units + int(done_delta))
         self._paint_total()
+        # Pipeline vừa báo xong 1 việc -> cập nhật bộ lọc ngay. Đây là fallback
+        # event-driven thứ hai bên cạnh QFileSystemWatcher, không phải polling.
+        self._schedule_realtime_refresh(20)
         if hasattr(self, "lbl_big_prog"):
             tag = f" · {stage}" if stage else ""
             self.lbl_big_prog.setText(
@@ -3726,8 +5085,13 @@ class RenderWidget(QWidget):
             QMessageBox.information(self, "Chưa có video", "Hãy thêm video vào hàng đợi trước.")
             return
 
+        selected_cards = self._selected_cards()
+        if not selected_cards:
+            QMessageBox.information(self, "Chưa chọn video", "Hãy tick ít nhất 2 video muốn gộp.")
+            return
+
         files_to_merge = []
-        for c in self.cards:
+        for c in selected_cards:
             vp = getattr(c, "video_path", None)
             if vp and os.path.exists(vp) and vp not in files_to_merge:
                 files_to_merge.append(vp)
@@ -3786,7 +5150,8 @@ class RenderWidget(QWidget):
         if stem.endswith("_dubbed"):
             stem = stem[:-len("_dubbed")]
         out_path = os.path.join(out_dir, f"{stem}_final.mp4")
-        cfg = self._build_cfg(vp, self._design)
+        design = copy.deepcopy(getattr(card, "design_config", None) or self._default_design())
+        cfg = self._build_cfg(vp, design)
 
         done_so_far = getattr(self, "_render_done_count", 0)
         total = getattr(self, "_render_total", 0)
@@ -3801,12 +5166,18 @@ class RenderWidget(QWidget):
         th.done.connect(lambda ok, c=card, op=out_path: self._on_one_done(ok, c, op))
         self._render_threads[out_path] = th
         self._render_pct[out_path] = 0
+        if not hasattr(self, "_render_card_map"):
+            self._render_card_map = {}
+        self._render_card_map[out_path] = card
         th.start()
 
     def _on_render_percent_multi(self, out_path, pct):
         """% của 1 tập trong nhóm song song. Thanh hiển thị = trung bình các tập
         đang chạy (đủ mượt & phản ánh cả nhóm)."""
         self._render_pct[out_path] = pct
+        card = getattr(self, "_render_card_map", {}).get(out_path)
+        if card is not None and hasattr(card, "set_play_progress"):
+            card.set_play_progress(pct)
         vals = list(self._render_pct.values())
         avg = sum(vals) / len(vals) if vals else 0
         if getattr(self, "_total_active", False):
@@ -3825,6 +5196,7 @@ class RenderWidget(QWidget):
         self._render_queue = []
         self._render_threads = {}
         self._render_pct = {}
+        self._render_card_map = {}
 
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
@@ -3868,6 +5240,7 @@ class RenderWidget(QWidget):
                 self._rendered_files.append(out_path)
         self._render_done_count = getattr(self, "_render_done_count", 0) + 1
         self.step_render.set_count(self._render_done_count, getattr(self, "_render_total", 0))
+        self._schedule_realtime_refresh(10)
         if getattr(self, "_total_active", False):
             self.total_progress_step(1, stage="Render")
         else:

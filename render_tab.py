@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QLineEdit, QSpinBox, QMessageBox, QCheckBox, QSlider,
     QTabWidget, QDoubleSpinBox, QGridLayout, QPlainTextEdit,
     QGraphicsScene, QGraphicsView, QGraphicsTextItem, QGraphicsRectItem,
-    QGraphicsPixmapItem, QGraphicsItem, QStyle, QApplication
+    QGraphicsPixmapItem, QGraphicsItem, QStyle, QApplication, QDialog
 )
 from PyQt6.QtGui import QIcon
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QUrl, QPointF, QPoint, QRectF, QTimer, QSize, QFileSystemWatcher
@@ -2261,6 +2261,7 @@ class EpisodeCard(QFrame):
     render, dịch, lồng tiếng không phải thay đổi theo giao diện mới."""
     clicked = pyqtSignal(object)
     play_requested = pyqtSignal(object)
+    zoom_requested = pyqtSignal(object)
     seek_requested = pyqtSignal(object, int)
     selection_changed = pyqtSignal()
     thumb_ready = pyqtSignal(str, str)   # source_video, thumb_path
@@ -2379,6 +2380,15 @@ class EpisodeCard(QFrame):
             "border-radius:4px; padding:0; } QPushButton:hover { background:#2B3138; border-color:#39C7D8; }")
         self.btn_card_play.clicked.connect(lambda: self.play_requested.emit(self))
         bottom.addWidget(self.btn_card_play)
+        # Nút phóng to preview ra cửa sổ lớn để canh chữ/logo cho dễ.
+        self.btn_card_zoom = QPushButton("⛶")
+        self.btn_card_zoom.setFixedSize(27, 24)
+        self.btn_card_zoom.setToolTip("Phóng to khung xem trước")
+        self.btn_card_zoom.setStyleSheet(
+            "QPushButton { background:#20242A; color:#E8EAED; border:1px solid #343A42; "
+            "border-radius:4px; padding:0; } QPushButton:hover { background:#2B3138; border-color:#39C7D8; }")
+        self.btn_card_zoom.clicked.connect(lambda: self.zoom_requested.emit(self))
+        bottom.addWidget(self.btn_card_zoom)
         self.play_slider = QSlider(Qt.Orientation.Horizontal)
         self.play_slider.setRange(0, 0)
         self.play_slider.setSingleStep(250)
@@ -4143,6 +4153,7 @@ class RenderWidget(QWidget):
         card = EpisodeCard(video_path, srt_path)
         card.clicked.connect(self._on_card_clicked)
         card.play_requested.connect(self._on_card_play)
+        card.zoom_requested.connect(self._on_card_zoom)
         card.seek_requested.connect(self._on_card_seek)
         card.selection_changed.connect(self._update_run_label)
         self.cards.append(card)
@@ -4256,6 +4267,78 @@ class RenderWidget(QWidget):
             _w = getattr(self, f"lbl_info_{_name}", None)
             if _w is not None: _w.setText("—")
         self._update_run_label()
+
+    def _on_card_zoom(self, card):
+        """Phóng to khung xem trước ra cửa sổ lớn để canh chữ/logo cho dễ.
+        Dùng LẠI chính self.preview (PreviewGraphicsView) nên mọi kéo/thả chữ,
+        logo, vùng mờ đều áp thẳng lên cấu hình card đang chọn. Đóng cửa sổ ->
+        preview tự trả về card như cũ."""
+        # Đảm bảo card này đang là card đang chọn + đang giữ preview.
+        if self.selected_card is not card or getattr(self, "_preview_card", None) is not card:
+            self._on_card_clicked(card)
+        if getattr(self, "_preview_card", None) is not card:
+            return
+
+        # Gỡ preview khỏi card, nhét vào dialog lớn.
+        try:
+            card.detach_preview_widget(self.preview)
+        except Exception:
+            pass
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Xem trước — {os.path.basename(card.video_path)}")
+        dlg.setStyleSheet("QDialog { background:#0b0d10; }")
+        # To ~80% màn hình, ưu tiên cao cho video dọc 9:16.
+        try:
+            scr = QApplication.primaryScreen().availableGeometry()
+            dlg.resize(int(scr.width() * 0.55), int(scr.height() * 0.9))
+        except Exception:
+            dlg.resize(700, 900)
+
+        vlay = QVBoxLayout(dlg)
+        vlay.setContentsMargins(8, 8, 8, 8)
+        vlay.setSpacing(8)
+
+        hint = QLabel("Kéo trực tiếp chữ / logo trên video. Lăn chuột để phóng to/thu nhỏ chữ. Đóng để lưu vị trí.")
+        hint.setStyleSheet("color:#8D949E; font-size:12px; border:none;")
+        hint.setWordWrap(True)
+        vlay.addWidget(hint)
+
+        self.preview.setMinimumHeight(0)
+        self.preview.show()
+        vlay.addWidget(self.preview, 1)
+
+        btn_close = QPushButton("Đóng & lưu vị trí")
+        btn_close.setStyleSheet(
+            "QPushButton { background:#1f6feb; color:#fff; border:none; border-radius:6px; "
+            "padding:8px 14px; font-weight:bold; } QPushButton:hover { background:#2f7bf6; }")
+        btn_close.clicked.connect(dlg.accept)
+        vlay.addWidget(btn_close)
+
+        # Fit lại scene khi cửa sổ mở/đổi cỡ.
+        def _fit():
+            try:
+                if self.scene and not self.scene.sceneRect().isEmpty():
+                    self.preview.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            except Exception:
+                pass
+        QTimer.singleShot(0, _fit)
+        QTimer.singleShot(120, _fit)
+
+        dlg.exec()
+
+        # Đóng dialog -> trả preview về đúng card, khôi phục chiều cao nhỏ.
+        try:
+            vlay.removeWidget(self.preview)
+        except Exception:
+            pass
+        self.preview.setMinimumHeight(145)
+        try:
+            card.attach_preview_widget(self.preview)
+            self._preview_card = card
+            QTimer.singleShot(0, self._reset_pos)
+        except Exception:
+            pass
 
     def _attach_preview_to_card(self, card):
         if card is None:
