@@ -303,7 +303,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.68"
+APP_VERSION = "1.0.69"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -938,6 +938,26 @@ class HonggouMergeThread(QThread):
 # ==========================================
 # CÁC LUỒNG XỬ LÝ NỀN (THREADS)
 # ==========================================
+def _upsize_duju_cover(url):
+    """Nâng độ phân giải poster byteimg/duju để KHÔNG bị mờ.
+    Ảnh duju hay ở bản thu nhỏ (tplv-shrink:128w, :192w...) -> phóng to lên
+    card bị nhòe. Đổi sang bản lớn ~540px cho nét.
+    Ví dụ: ...~tplv-shrink:128w -> ...~tplv-shrink:540:0
+           ...-tplv-shrink:192w.webp -> ...-tplv-shrink:540:0.webp"""
+    if not url:
+        return url
+    try:
+        # dạng shrink:128w / shrink:192w (chỉ rộng) -> shrink:540:0
+        url = re.sub(r'shrink:\d+w', 'shrink:540:0', url)
+        # dạng shrink:128:0 (rộng nhỏ) -> shrink:540:0 nếu số < 400
+        def _bump(m):
+            w = int(m.group(1))
+            return f'shrink:{max(w,540)}:0' if w < 400 else m.group(0)
+        url = re.sub(r'shrink:(\d+):0', _bump, url)
+    except Exception:
+        pass
+    return url
+
 class DujuRankThread(QThread):
     """Lấy phim BXH từ duju.info (nguồn THAM KHẢO) để hiện card đẹp.
     API: https://duju.info/api/rank?sub_id=<bxh>&offset=<n>&limit=<n>
@@ -1010,7 +1030,7 @@ class DujuRankThread(QThread):
                                   or it.get("title") or "Không rõ tên"),
                         "series_id": sid,
                         "total_episodes": int(series.get("episode_cnt") or 0),
-                        "cover_url": series.get("cover") or "",
+                        "cover_url": _upsize_duju_cover(series.get("cover") or ""),
                         "score": str(series.get("score") or it.get("score") or "").strip(),
                         "play_str": self._fmt_count(series.get("play_cnt") or it.get("play_cnt")),
                         "tags": tag_list,
@@ -1022,6 +1042,92 @@ class DujuRankThread(QThread):
                 if len(items) < limit:
                     break
                 offset += limit
+            self.finished_signal.emit()
+        except Exception:
+            self.finished_signal.emit()
+
+class DujuScheduleThread(QThread):
+    """Lấy LỊCH phim sắp ra mắt từ duju.info/schedule (SSR trong HTML).
+    Chia theo <section data-day="YYYY-MM-DD">. Mỗi phim: /schedule/<id>,
+    cardTitle/alt=tên Việt, img=poster, posterTime=giờ chiếu.
+    Phim sắp ra mắt CHƯA có trên hongguo -> chỉ xem trước, không tải."""
+    days_ready = pyqtSignal(list)      # [(date, label, count), ...]
+    item_loaded_signal = pyqtSignal(dict)
+    finished_signal = pyqtSignal()
+
+    def __init__(self, want_date=None):
+        super().__init__()
+        self.want_date = want_date
+
+    def run(self):
+        headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")}
+        try:
+            r = requests.get("https://duju.info/schedule", headers=headers, timeout=20)
+            if r.status_code != 200:
+                self.finished_signal.emit(); return
+            html = r.text
+
+            days = []
+            for m in re.finditer(
+                r'data-chip="(\d{4}-\d{2}-\d{2})"[\s\S]{0,200}?dayChipDay">([^<]+)</span>'
+                r'[\s\S]{0,120}?dayChipCount">(\d+)', html):
+                days.append((m.group(1), m.group(2).strip(), int(m.group(3))))
+            if not days:
+                seen_d = set()
+                for m in re.finditer(r'data-day="(\d{4}-\d{2}-\d{2})"', html):
+                    if m.group(1) not in seen_d:
+                        seen_d.add(m.group(1)); days.append((m.group(1), m.group(1), 0))
+            self.days_ready.emit(days)
+
+            sections = {}
+            for p in re.split(r'<section\b', html)[1:]:
+                md = re.search(r'data-day="(\d{4}-\d{2}-\d{2})"', p[:300])
+                if md:
+                    sections[md.group(1)] = p
+
+            target = self.want_date or (days[0][0] if days else None)
+            sec = sections.get(target, "")
+            if not sec:
+                self.finished_signal.emit(); return
+
+            # Nếu ngày đang xem LÀ HÔM NAY (theo giờ máy) -> ẩn phim đã qua giờ
+            # chiếu, chỉ hiện phim sắp tới (giống duju). Ngày tương lai: hiện đủ.
+            from datetime import datetime
+            now = datetime.now()
+            is_today = (target == now.strftime("%Y-%m-%d"))
+            cur_minutes = now.hour * 60 + now.minute
+
+            seen = set()
+            for m in re.finditer(r'href="/schedule/(\d+)"([\s\S]*?)</a>', sec):
+                sid = m.group(1)
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                blk = m.group(2)
+                mt = re.search(r'cardTitle[^>]*>([^<]+)<', blk) or re.search(r'\balt="([^"]+)"', blk)
+                title = mt.group(1).strip() if mt else "Phim sắp ra mắt"
+                mi = re.search(r'<img\b[^>]*\bsrc="([^"]+)"', blk)
+                poster = _upsize_duju_cover(mi.group(1)) if mi else ""
+                mtime = re.search(r'posterTime[^>]*>([^<]+)<', blk)
+                showtime = mtime.group(1).strip() if mtime else ""
+
+                # Lọc phim đã qua giờ (chỉ áp dụng cho hôm nay, và chỉ khi đọc
+                # được giờ chiếu dạng HH:MM).
+                if is_today and showtime:
+                    mm = re.match(r'(\d{1,2}):(\d{2})', showtime)
+                    if mm:
+                        show_minutes = int(mm.group(1)) * 60 + int(mm.group(2))
+                        if show_minutes < cur_minutes:
+                            continue  # đã qua giờ chiếu -> bỏ
+
+                self.item_loaded_signal.emit({
+                    "title": title, "series_id": sid, "total_episodes": 0,
+                    "cover_url": poster, "score": "", "play_str": "",
+                    "tags": [showtime] if showtime else [],
+                    "is_local": True, "from_duju": True,
+                    "from_schedule": True, "showtime": showtime,
+                })
             self.finished_signal.emit()
         except Exception:
             self.finished_signal.emit()
@@ -1075,44 +1181,78 @@ class HistoryCoverThread(QThread):
         self.covers_dir = covers_dir
         self.auth_token = auth_token
 
-    def run(self):
-        for row, sid, url in self.jobs:
-            content = None
-            # 1) Ưu tiên cover từ server (phim trong kho)
-            if sid and self.auth_token:
+    def _fetch_one(self, job):
+        """Tải cover 1 phim. Trả (row, content) hoặc None."""
+        row, sid, url = job
+        # 0) Cache: đã tải trước đó -> đọc file, khỏi tải lại (nhanh nhất).
+        try:
+            cpath = os.path.join(self.covers_dir, f"{sid}.img")
+            if os.path.exists(cpath) and os.path.getsize(cpath) > 500:
+                with open(cpath, 'rb') as f:
+                    return (row, f.read())
+        except Exception:
+            pass
+
+        content = None
+        # 1) Poster từ url web (duju/byteimg) -> ưu tiên nếu có url (nhanh, khỏi
+        #    hỏi server cho phim không có trong kho).
+        if url:
+            cu = url
+            if cu.startswith("//"):
+                cu = "https:" + cu
+            if cu.startswith("http"):
                 try:
-                    rs = requests.get(
-                        f"{SERVER_URL}/api/client/cover/{sid}",
-                        headers={"Authorization": f"Bearer {self.auth_token}"},
-                        timeout=20
-                    )
+                    rs = requests.get(cu, timeout=15, headers={
+                        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                       "Chrome/125.0.0.0 Safari/537.36"),
+                        "Referer": "https://duju.info/",
+                        "Accept": "image/webp,image/*,*/*;q=0.8"})
                     if rs.status_code == 200 and rs.content and len(rs.content) > 500:
                         content = rs.content
                 except Exception:
                     pass
-            # 2) Server không có -> tải thẳng từ url (poster web hongguo/byteimg)
-            #    Dùng cho phim tìm bằng fallback web / BXH duju (không có ở server).
-            if not content and url:
-                cu = url
-                if cu.startswith("//"):
-                    cu = "https:" + cu
-                if cu.startswith("http"):
+        # 2) Không có url / tải url lỗi -> thử server (phim trong kho).
+        if not content and sid and self.auth_token:
+            try:
+                rs = requests.get(
+                    f"{SERVER_URL}/api/client/cover/{sid}",
+                    headers={"Authorization": f"Bearer {self.auth_token}"},
+                    timeout=15)
+                if rs.status_code == 200 and rs.content and len(rs.content) > 500:
+                    content = rs.content
+            except Exception:
+                pass
+        if content:
+            try:
+                with open(os.path.join(self.covers_dir, f"{sid}.img"), 'wb') as f:
+                    f.write(content)
+            except Exception:
+                pass
+            return (row, content)
+        return None
+
+    def run(self):
+        # Tải SONG SONG nhiều poster cùng lúc (8 luồng) cho nhanh, thay vì tuần
+        # tự từng cái (18 ảnh × ~1s = quá lâu). Ảnh xong cái nào emit cái đó.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        try:
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(self._fetch_one, j) for j in self.jobs]
+                for fu in as_completed(futs):
                     try:
-                        rs = requests.get(cu, timeout=20, headers={
-                            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                           "Chrome/125.0.0.0 Safari/537.36"),
-                            "Referer": "https://duju.info/",
-                            "Accept": "image/webp,image/*,*/*;q=0.8"})
-                        if rs.status_code == 200 and rs.content and len(rs.content) > 500:
-                            content = rs.content
+                        res = fu.result()
                     except Exception:
-                        pass
-            if content:
-                try:
-                    with open(os.path.join(self.covers_dir, f"{sid}.img"), 'wb') as f: f.write(content)
-                except Exception: pass
-                self.cover_ready.emit(row, content)
+                        res = None
+                    if res:
+                        self.cover_ready.emit(res[0], res[1])
+        except Exception:
+            # Dự phòng: nếu ThreadPool lỗi -> tải tuần tự.
+            for j in self.jobs:
+                res = self._fetch_one(j)
+                if res:
+                    self.cover_ready.emit(res[0], res[1])
+
 
 class SearchMoviesThread(QThread):
     results_signal = pyqtSignal(list)
@@ -2722,8 +2862,9 @@ class DubThread(QThread):
 class MovieCard(QFrame):
     """Card phim kiểu duju: poster bo góc + badge điểm số/lượt xem overlay +
     tên phim + thể loại. Dùng làm itemWidget trong QListWidget grid.
-    Click -> phát clicked_signal(url) để mở/quét phim."""
+    Click -> phát clicked_signal(url). Nút Lưu -> phát save_signal(dict)."""
     clicked_signal = pyqtSignal(str)
+    save_signal = pyqtSignal(dict)
 
     CARD_W = 180
     POSTER_H = 240
@@ -2732,7 +2873,11 @@ class MovieCard(QFrame):
         super().__init__(parent)
         self.url = data.get("url", "")
         self.series_id = str(data.get("series_id", ""))
-        self.setFixedSize(self.CARD_W, self.POSTER_H + 62)
+        self._data = dict(data)   # giữ để lưu
+        self._is_schedule = bool(data.get("from_schedule"))
+        # Card schedule cao thêm 1 chút để chứa nút Lưu.
+        extra = 34 if self._is_schedule else 0
+        self.setFixedSize(self.CARD_W, self.POSTER_H + 62 + extra)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setObjectName("movieCard")
         self.setStyleSheet("""
@@ -2764,13 +2909,43 @@ class MovieCard(QFrame):
         self.lbl_title.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(self.lbl_title)
 
-        # --- Thể loại (badge nhỏ) ---
+        # --- Thể loại / giờ chiếu (badge nhỏ) ---
         tags = data.get("tags") or []
         if tags:
             self.lbl_tags = QLabel(" · ".join(tags[:2]))
             self.lbl_tags.setStyleSheet("color:#94a3b8; font-size:10px;")
             self.lbl_tags.setAlignment(Qt.AlignmentFlag.AlignHCenter)
             lay.addWidget(self.lbl_tags)
+
+        # --- Nút LƯU (chỉ phim sắp ra mắt) ---
+        if self._is_schedule:
+            self.btn_save = QPushButton("💾 Lưu phim này")
+            self.btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_save.setFixedHeight(26)
+            self._set_save_style(False)
+            self.btn_save.clicked.connect(self._on_save_clicked)
+            lay.addWidget(self.btn_save)
+
+    def _set_save_style(self, saved):
+        if saved:
+            self.btn_save.setText("✅ Đã lưu")
+            self.btn_save.setStyleSheet(
+                "QPushButton { background:#059669; color:#fff; font-size:11px; "
+                "font-weight:bold; border:none; border-radius:6px; padding:3px; }")
+        else:
+            self.btn_save.setText("💾 Lưu phim này")
+            self.btn_save.setStyleSheet(
+                "QPushButton { background:#f59e0b; color:#fff; font-size:11px; "
+                "font-weight:bold; border:none; border-radius:6px; padding:3px; }"
+                "QPushButton:hover { background:#d97706; }")
+
+    def mark_saved(self, saved=True):
+        if hasattr(self, 'btn_save'):
+            self._set_save_style(saved)
+
+    def _on_save_clicked(self):
+        self.save_signal.emit(self._data)
+        self.mark_saved(True)
 
     def set_poster(self, img_bytes):
         """Nhận bytes ảnh -> vẽ bo góc + overlay badge điểm/lượt/tập."""
@@ -3276,7 +3451,55 @@ class HonggouWidget(QWidget):
             except Exception: pass
         return alive
 
-    def _save_to_history(self, series_id, title, cover_url, total_eps=0, cover_bytes=None, downloaded=False):
+    def _get_saved_file(self):
+        return os.path.join(os.path.expanduser("~"), f".hongguo_saved_{self.username}.json")
+
+    def _load_saved(self):
+        f = self._get_saved_file()
+        if os.path.exists(f):
+            try:
+                with open(f, 'r', encoding='utf-8') as fh: return json.load(fh)
+            except Exception: return []
+        return []
+
+    def _save_saved(self, items):
+        try:
+            with open(self._get_saved_file(), 'w', encoding='utf-8') as fh:
+                json.dump(items, fh, ensure_ascii=False, indent=2)
+        except Exception: pass
+
+    def _add_saved_movie(self, data):
+        """Lưu 1 phim quan tâm (từ card Sắp Ra Mắt) để tải sau khi lên sóng."""
+        sid = str(data.get("series_id", ""))
+        if not sid: return
+        items = self._load_saved()
+        if any(str(x.get("series_id")) == sid for x in items):
+            return  # đã lưu rồi
+        items.insert(0, {
+            "series_id": sid,
+            "title": data.get("title", ""),
+            "cover_url": data.get("cover_url", ""),
+            "showtime": data.get("showtime", ""),
+            "ts": time.time(),
+        })
+        self._save_saved(items)
+        # tải cover về lưu sẵn (để lần sau hiện nhanh)
+        try:
+            cu = data.get("cover_url", "")
+            if cu:
+                th = HistoryCoverThread([(0, sid, cu)], self._get_covers_dir(), self.auth_token)
+                self._keep_thread_alive(th); th.start()
+        except Exception: pass
+
+    def _is_saved(self, series_id):
+        sid = str(series_id)
+        return any(str(x.get("series_id")) == sid for x in self._load_saved())
+
+    def _remove_saved_movie(self, series_id):
+        sid = str(series_id)
+        items = [x for x in self._load_saved() if str(x.get("series_id")) != sid]
+        self._save_saved(items)
+
         if not series_id: return
         series_id = str(series_id)
         if series_id in getattr(self, '_cached_history_ids', set()): return
@@ -3437,7 +3660,7 @@ class HonggouWidget(QWidget):
         genre_layout.setSpacing(10)
         
         self.genre_buttons = []
-        genres = [("🔥 Tất Cả", None), ("👍 Đề Cử", "DUJU_prestige"), ("🔴 Hồng Quả", "DUJU_hot"), ("📈 Xem Nhiều", "DUJU_play"), ("🔎 Tìm Kiếm Hot", "DUJU_search"), ("🆕 Phim Mới", "DUJU_new"), ("👀 Đáng Xem", "DUJU_must"), ("❤️ Yêu Thích", "DUJU_followed")]
+        genres = [("🔥 Tất Cả", None), ("👍 Đề Cử", "DUJU_prestige"), ("🔴 Hồng Quả", "DUJU_hot"), ("📈 Xem Nhiều", "DUJU_play"), ("🔎 Tìm Kiếm Hot", "DUJU_search"), ("🆕 Phim Mới", "DUJU_new"), ("👀 Đáng Xem", "DUJU_must"), ("❤️ Yêu Thích", "DUJU_followed"), ("📅 Sắp Ra Mắt", "DUJU_schedule"), ("💾 Phim Đã Lưu", "SAVED")]
         for name, tag in genres:
             btn = QPushButton(name)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3456,6 +3679,24 @@ class HonggouWidget(QWidget):
         grid_layout.addWidget(self.genre_container)
         self._update_genre_styles(self.genre_buttons[0])
 
+        # Thanh tab NGÀY cho "Sắp Ra Mắt" (ẩn mặc định, hiện khi bấm nút đó).
+        # Cuộn ngang vì có ~14 ngày.
+        self.day_bar = QScrollArea()
+        self.day_bar.setWidgetResizable(True)
+        self.day_bar.setFixedHeight(46)
+        self.day_bar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.day_bar.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.day_bar.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self.day_bar_inner = QWidget()
+        self.day_bar_layout = QHBoxLayout(self.day_bar_inner)
+        self.day_bar_layout.setContentsMargins(0, 4, 0, 4)
+        self.day_bar_layout.setSpacing(6)
+        self.day_bar.setWidget(self.day_bar_inner)
+        self.day_bar.hide()
+        self.day_buttons = []
+        self._current_day = None
+        grid_layout.addWidget(self.day_bar)
+
         self.loading_bar = QProgressBar()
         self.loading_bar.setRange(0, 0); self.loading_bar.setTextVisible(False); self.loading_bar.setFixedHeight(4)
         self.loading_bar.setStyleSheet("QProgressBar { background-color: #1e293b; border: none; border-radius: 2px; } QProgressBar::chunk { background-color: #38bdf8; border-radius: 2px; }")
@@ -3464,7 +3705,7 @@ class HonggouWidget(QWidget):
         self.hot_list = QListWidget()
         self.hot_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.hot_list.setIconSize(QSize(160, 220))
-        self.hot_list.setGridSize(QSize(192, 316))
+        self.hot_list.setGridSize(QSize(192, 342))
         self.hot_list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.hot_list.setMovement(QListWidget.Movement.Static)
         self.hot_list.setDragEnabled(False)
@@ -4232,6 +4473,40 @@ class HonggouWidget(QWidget):
         self.content_stack.setCurrentWidget(self.page_grid)
         self._cached_history_ids = {str(h.get('series_id', '')) for h in self._load_history()}
 
+        if genre == "SAVED":
+            self.day_bar.hide()
+            self.loading_bar.hide()
+            self._duju_missing_covers = []
+            self._duju_card_by_row = {}
+            saved = self._load_saved()
+            if not saved:
+                empty = QListWidgetItem("💾 Chưa có phim nào được lưu.\n\nVào 📅 Sắp Ra Mắt, thấy phim thích thì bấm\n'💾 Lưu phim này' để tải sau khi phim lên sóng.")
+                empty.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                empty.setFlags(Qt.ItemFlag.NoItemFlags)
+                self.hot_list.addItem(empty); return
+            for s in saved:
+                # Khi xem lại: thử cho tải (phim có thể đã lên sóng). Card thường
+                # (không phải schedule) -> bấm vào sẽ quét hongguo như bình thường.
+                self._render_single_hot_movie({
+                    "title": s.get("title", ""),
+                    "series_id": str(s.get("series_id", "")),
+                    "total_episodes": 0,
+                    "cover_url": s.get("cover_url", ""),
+                    "score": "", "play_str": "",
+                    "tags": [f"⏰ {s.get('showtime')}" ] if s.get("showtime") else [],
+                    "is_local": True, "from_duju": True, "from_saved": True,
+                })
+            # tải cover cho phim đã lưu
+            covers = getattr(self, '_duju_missing_covers', [])
+            if covers:
+                self._duju_missing_covers = []
+                if not (getattr(self, 'duju_cover_thread', None) and self.duju_cover_thread.isRunning()):
+                    self.duju_cover_thread = HistoryCoverThread(covers, self._get_covers_dir(), self.auth_token)
+                    self.duju_cover_thread.cover_ready.connect(self._on_history_cover_ready)
+                    self._keep_thread_alive(self.duju_cover_thread)
+                    self.duju_cover_thread.start()
+            return
+
         if genre == "HISTORY":
             self.loading_bar.hide()
             history = self._load_history()
@@ -4288,13 +4563,58 @@ class HonggouWidget(QWidget):
         if isinstance(genre, str) and genre.startswith("DUJU_"):
             self._duju_missing_covers = []
             self._duju_card_by_row = {}
-            self.hot_thread = DujuRankThread(genre, max_movies=100)
+            if genre == "DUJU_schedule":
+                # Lịch phim sắp ra mắt: dùng thread riêng + hiện thanh tab ngày.
+                want = getattr(self, '_current_day', None)
+                self.hot_thread = DujuScheduleThread(want_date=want)
+                self.hot_thread.days_ready.connect(self._on_schedule_days)
+            else:
+                self.day_bar.hide()
+                self.hot_thread = DujuRankThread(genre, max_movies=100)
         else:
+            self.day_bar.hide()
             self.hot_thread = HotMoviesLoadThread(genre)
         self.hot_thread.item_loaded_signal.connect(self._render_single_hot_movie)
         self.hot_thread.finished_signal.connect(self._on_hot_movies_finished)
         self._keep_thread_alive(self.hot_thread)
         self.hot_thread.start()
+
+    def _on_schedule_days(self, days):
+        """Dựng thanh tab ngày cho Sắp Ra Mắt (chỉ dựng 1 lần / lần load)."""
+        if self.sender() is not getattr(self, 'hot_thread', None):
+            return
+        # Xóa nút ngày cũ
+        for b in self.day_buttons:
+            b.setParent(None)
+        self.day_buttons = []
+        # bỏ stretch cuối nếu có
+        while self.day_bar_layout.count():
+            it = self.day_bar_layout.takeAt(0)
+            if it.widget(): it.widget().setParent(None)
+        if not days:
+            self.day_bar.hide(); return
+        if self._current_day is None:
+            self._current_day = days[0][0]
+        for date, label, count in days:
+            b = QPushButton(f"{label}\n{count} phim" if count else label)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFixedHeight(38)
+            b.setProperty("day_date", date)
+            active = (date == self._current_day)
+            b.setStyleSheet(
+                "QPushButton { background-color: %s; color: #fff; font-size: 11px; "
+                "font-weight: bold; border-radius: 8px; padding: 2px 12px; border: none; } "
+                "QPushButton:hover { background-color: #d97706; }"
+                % ("#f59e0b" if active else "#334155"))
+            b.clicked.connect(lambda ch, d=date: self._on_day_clicked(d))
+            self.day_bar_layout.addWidget(b)
+            self.day_buttons.append(b)
+        self.day_bar_layout.addStretch()
+        self.day_bar.show()
+
+    def _on_day_clicked(self, date):
+        self._current_day = date
+        self.load_hot_movies_shelf("DUJU_schedule")
 
     def _on_hot_movies_finished(self):
         # Cùng lý do như trên: chỉ xử lý nếu đúng là luồng hiện tại báo xong,
@@ -4441,12 +4761,21 @@ class HonggouWidget(QWidget):
 
         # Phim duju -> card đẹp (MovieCard) với badge điểm/lượt/thể loại.
         if m.get("from_duju"):
-            data = dict(m); data["url"] = url
+            # Phim SẮP RA MẮT chưa có trên hongguo -> đánh dấu url đặc biệt để
+            # bấm vào chỉ báo "sắp ra mắt", không quét tải (tránh lỗi Không tìm thấy).
+            card_url = url
+            if m.get("from_schedule"):
+                st = m.get("showtime", "")
+                card_url = f"SCHEDULE::{series_id}::{m.get('title','')}::{st}"
+            data = dict(m); data["url"] = card_url
             card = MovieCard(data)
             card.clicked_signal.connect(self._on_card_clicked)
+            card.save_signal.connect(self._add_saved_movie)
+            if m.get("from_schedule") and self._is_saved(series_id):
+                card.mark_saved(True)
             item = QListWidgetItem()
             item.setSizeHint(card.size())
-            item.setData(Qt.ItemDataRole.UserRole, url or "")
+            item.setData(Qt.ItemDataRole.UserRole, card_url or "")
             self.hot_list.addItem(item)
             self.hot_list.setItemWidget(item, card)
             row = self.hot_list.count() - 1
@@ -4474,6 +4803,18 @@ class HonggouWidget(QWidget):
 
     def _on_card_clicked(self, url):
         """Card duju được bấm -> mở/quét phim (dùng chung luồng _from_shelf)."""
+        # Phim SẮP RA MẮT: chưa có trên hongguo -> chỉ báo, không quét tải.
+        if url.startswith("SCHEDULE::"):
+            parts = url.split("::")
+            title = parts[2] if len(parts) > 2 else "Phim này"
+            st = parts[3] if len(parts) > 3 else ""
+            msg = f"🎬 \"{title}\" là phim SẮP RA MẮT, hiện chưa thể tải."
+            if st:
+                msg += f"\n⏰ Giờ chiếu dự kiến: {st}"
+            msg += "\n\nDanh sách này chỉ để tham khảo trước. Khi phim lên sóng, "
+            msg += "bạn tìm lại bằng nút Tất Cả hoặc ô tìm kiếm để tải nhé!"
+            QMessageBox.information(self, "Phim sắp ra mắt", msg)
+            return
         if getattr(self, 'scan_thread', None) and self.scan_thread.isRunning():
             return
         sid = url.split("series_id=")[-1] if "series_id=" in url else ""
