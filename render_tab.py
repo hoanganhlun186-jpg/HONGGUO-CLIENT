@@ -1446,6 +1446,20 @@ class MergeRenderedThread(QThread):
             pass
         return None
 
+    def _probe_has_audio(self, ffmpeg, filepath):
+        """True nếu file có ít nhất 1 stream audio."""
+        try:
+            si = subprocess.STARTUPINFO() if os.name == "nt" else None
+            if si: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            r = subprocess.run(
+                [ffmpeg, "-i", filepath],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                startupinfo=si, text=True, encoding="utf-8", errors="replace"
+            )
+            return "Audio:" in (r.stderr or "")
+        except Exception:
+            return False
+
     def _prepare_thumbnail(self):
         """Chuẩn hóa ảnh bìa thành JPG 1280×720 (chuẩn thumbnail YouTube), nền phủ
         16:9 không méo. Trả về đường dẫn JPG tạm, hoặc None nếu không có ảnh."""
@@ -1531,152 +1545,206 @@ class MergeRenderedThread(QThread):
         ffmpeg = get_ffmpeg_path()
         import tempfile, time, subprocess
 
-        # ── 1. Phát hiện resolution VÀ fps không đồng nhất ──────────────────
-        resolutions = []
-        fps_list = []
-        for fp in self.file_list:
-            resolutions.append(self._probe_resolution(ffmpeg, fp))
-            fps_list.append(self._probe_fps(ffmpeg, fp))
+        files = [p for p in (self.file_list or []) if p and os.path.exists(p)]
+        if len(files) < 2:
+            self.log.emit("❌ Không đủ ít nhất 2 file hợp lệ để gộp.\n")
+            self.done.emit(False, "")
+            return
 
+        # ── Probe thông số đầu vào ───────────────────────────────────────────
+        resolutions = [self._probe_resolution(ffmpeg, fp) for fp in files]
+        fps_list = [self._probe_fps(ffmpeg, fp) for fp in files]
         unique_res = set(r for r in resolutions if r is not None)
         unique_fps = set(f for f in fps_list if f is not None)
         mixed_res = len(unique_res) > 1
         mixed_fps = len(unique_fps) > 1
-        mixed = mixed_res or mixed_fps   # lệch 1 trong 2 -> buộc re-encode
+        mixed = mixed_res or mixed_fps
 
-        # FPS đích: nếu lệch, lấy fps cao nhất làm chuẩn (mượt nhất, không mất frame)
-        target_fps = max(unique_fps) if unique_fps else None
-
-        if mixed:
-            if mixed_res:
-                res_list = ", ".join(f"{w}×{h}" for w, h in resolutions if (w, h) in unique_res)
-                self.log.emit(f"⚠️ Resolution KHÔNG đồng nhất: {res_list}\n")
-            if mixed_fps:
-                fps_txt = ", ".join(f"{f:g}fps" for f in sorted(unique_fps))
-                self.log.emit(
-                    f"⚠️ FPS KHÔNG đồng nhất giữa các tập: {fps_txt}\n"
-                    f"   (Đây là lý do gộp bằng -c copy bị ĐỨNG HÌNH ở tập giữa)\n"
-                )
-            self.log.emit("   → Bắt buộc re-encode để chuẩn hóa kích thước, fps và timestamp.\n\n")
-            # Resolution đích: lớn nhất theo diện tích (nếu chỉ lệch fps thì res đồng nhất)
-            if unique_res:
-                target_w, target_h = max(unique_res, key=lambda wh: wh[0] * wh[1])
-            else:
-                target_w, target_h = 1920, 1080
-            target_w = (target_w // 2) * 2
-            target_h = (target_h // 2) * 2
-            self.log.emit(f"   🎯 Đích: {target_w}×{target_h}"
-                          + (f" @ {target_fps:g}fps\n\n" if target_fps else "\n\n"))
+        target_fps = max(unique_fps) if unique_fps else 30.0
+        if unique_res:
+            target_w, target_h = max(unique_res, key=lambda wh: wh[0] * wh[1])
         else:
-            self.log.emit(f"🔗 Bắt đầu gộp {len(self.file_list)} file (đồng nhất, không đổi âm thanh)...\n")
+            target_w, target_h = 1920, 1080
+        target_w = max(2, (int(target_w) // 2) * 2)
+        target_h = max(2, (int(target_h) // 2) * 2)
 
-        list_txt = os.path.join(tempfile.gettempdir(), f"concat_list_{int(time.time())}.txt")
-        try:
+        if mixed_res:
+            res_list = ", ".join(f"{r[0]}×{r[1]}" for r in resolutions if r is not None)
+            self.log.emit(f"⚠️ Resolution KHÔNG đồng nhất: {res_list}\n")
+        if mixed_fps:
+            fps_txt = ", ".join(f"{f:g}fps" for f in sorted(unique_fps))
+            self.log.emit(f"⚠️ FPS KHÔNG đồng nhất: {fps_txt}\n")
+        if mixed:
+            self.log.emit(
+                f"   → Chuẩn hóa từng input trước khi concat: {target_w}×{target_h} @ {target_fps:g}fps.\n"
+            )
+        else:
+            self.log.emit(f"🔗 Bắt đầu gộp {len(files)} file bằng fast-copy an toàn...\n")
+
+        stamp = f"{int(time.time() * 1000)}_{os.getpid()}"
+        list_txt = os.path.join(tempfile.gettempdir(), f"concat_list_{stamp}.txt")
+        filter_txt = os.path.join(tempfile.gettempdir(), f"concat_filter_{stamp}.txt")
+        si = subprocess.STARTUPINFO() if os.name == "nt" else None
+        if si: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        def _write_concat_list():
             with open(list_txt, "w", encoding="utf-8") as f:
-                for fp in self.file_list:
+                for fp in files:
                     safe_path = fp.replace('\\', '/').replace("'", r"\'")
                     f.write(f"file '{safe_path}'\n")
 
-            si = subprocess.STARTUPINFO() if os.name == "nt" else None
-            if si: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        def _build_filter_concat_base():
+            """Dùng input riêng + concat filter để không bị sai duration/timebase
+            khi các tập khác FPS/time_base/codec/sample-rate. Đồng thời tự chèn
+            silent audio cho tập không có tiếng để concat vẫn giữ audio các tập khác.
+            """
+            input_args = []
+            filter_parts = []
+            labels = []
+            input_index = 0
+            for i, fp in enumerate(files):
+                v_idx = input_index
+                input_args += ["-i", fp]
+                input_index += 1
+
+                if self._probe_has_audio(ffmpeg, fp):
+                    a_idx = v_idx
+                else:
+                    dur = max(0.1, float(_probe_duration_sec(fp) or 0.1))
+                    input_args += ["-f", "lavfi", "-t", f"{dur:.3f}",
+                                   "-i", "anullsrc=r=48000:cl=stereo"]
+                    a_idx = input_index
+                    input_index += 1
+                    self.log.emit(f"   🔇 {os.path.basename(fp)} không có audio → chèn im lặng.\n")
+
+                filter_parts.append(
+                    f"[{v_idx}:v:0]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                    f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+                    f"fps={target_fps:g},setpts=PTS-STARTPTS[v{i}]"
+                )
+                filter_parts.append(
+                    f"[{a_idx}:a:0]aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"aresample=async=1,asetpts=PTS-STARTPTS[a{i}]"
+                )
+                labels.append(f"[v{i}][a{i}]")
+
+            filter_parts.append(
+                "".join(labels) + f"concat=n={len(files)}:v=1:a=1[vmerge][amerge]"
+            )
+            with open(filter_txt, "w", encoding="utf-8") as f:
+                f.write(";".join(filter_parts))
+            return ([ffmpeg, "-y", "-nostdin", *input_args,
+                     "-filter_complex_script", filter_txt,
+                     "-map", "[vmerge]", "-map", "[amerge]"])
+
+        def _finish_success(mode):
+            self.log.emit(f"✅ Gộp trọn bộ thành công ({mode}): {os.path.basename(self.out_file)}\n")
+            thumb_jpg = self._prepare_thumbnail()
+            if thumb_jpg:
+                self._embed_cover_mp4(ffmpeg, self.out_file, thumb_jpg, si)
+                self._export_thumbnail_beside_video(thumb_jpg)
+                try: os.remove(thumb_jpg)
+                except Exception: pass
+            self.done.emit(True, self.out_file)
+
+        try:
+            _write_concat_list()
+            merge_codec = get_optimal_ffmpeg_codec()
+            proc = None
+            need_cpu_normalize = False
 
             if mixed:
-                # ── Re-encode: scale mọi clip về resolution đích, reset timestamp ──
-                # scale + setsar chuẩn hóa SAR; fps=copy giữ nguyên fps gốc;
-                # aresample chuẩn hóa sample rate audio trước khi concat.
-                vf = (
-                    f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
-                    f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
-                    f"setsar=1"
+                # KHÔNG dùng concat demuxer để re-encode file khác FPS/time_base:
+                # nó có thể kéo sai timestamp/duration. Dùng concat filter input riêng.
+                base_cmd = _build_filter_concat_base()
+                enc_args = build_video_encoder_args(
+                    merge_codec, crf_val=20, preset_hw="quality", preset_sw="medium"
                 )
-                if target_fps:
-                    vf += f",fps={target_fps:g}"   # CHUẨN HÓA fps chung -> hết đứng hình
-                merge_codec = get_optimal_ffmpeg_codec()
-                _fb = get_codec_fallback_reason()
-                if _fb:
-                    self.log.emit(f"   ⚠️ {_fb}\n")
-                enc_args = build_video_encoder_args(merge_codec, crf_val=20,
-                                                    preset_hw="quality", preset_sw="medium")
-                cmd = [
-                    ffmpeg, "-y",
-                    "-f", "concat", "-safe", "0", "-i", list_txt,
-                    # Chuẩn hóa timestamp (sửa non-monotonic DTS từ ghép đoạn)
-                    "-video_track_timescale", "90000",
-                    "-vf", vf,
-                    *enc_args,
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-af", "aresample=async=1",
-                    "-movflags", "+faststart",
-                    self.out_file
-                ]
-            else:
-                # Resolution đồng nhất → copy stream, chỉ reset timestamp.
-                # (Nhúng ảnh bìa + xuất thumbnail làm ở bước hậu xử lý bên dưới,
-                #  áp dụng chung cho cả nhánh re-encode lẫn copy.)
-                cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_txt]
-                cmd.extend(["-c", "copy"])
-                cmd.extend(["-movflags", "+faststart", self.out_file])
-
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                startupinfo=si, text=True, encoding="utf-8", errors="replace"
-            )
-
-            if proc.returncode == 0 and os.path.exists(self.out_file):
-                mode = "re-encode" if mixed else "copy stream"
-                self.log.emit(f"✅ Gộp trọn bộ thành công ({mode}): {os.path.basename(self.out_file)}\n")
-                thumb_jpg = self._prepare_thumbnail()
-                if thumb_jpg:
-                    self._embed_cover_mp4(ffmpeg, self.out_file, thumb_jpg, si)
-                    self._export_thumbnail_beside_video(thumb_jpg)
-                    try: os.remove(thumb_jpg)
-                    except: pass
-                self.done.emit(True, self.out_file)
-            else:
-                err = proc.stderr[-800:] if proc.stderr else "Lỗi không xác định"
-                # Fallback: nếu re-encode bằng codec phần cứng lỗi -> thử lại
-                # bằng libx264 (CPU) cho chắc ăn, tránh hỏng cả bản gộp trọn bộ.
-                did_fallback = False
-                if mixed and "libx264" not in merge_codec.lower():
-                    self.log.emit("⚠️ Gộp bằng codec phần cứng lỗi → thử lại bằng libx264 (CPU)...\n")
-                    cmd_fb = [
-                        ffmpeg, "-y",
-                        "-f", "concat", "-safe", "0", "-i", list_txt,
-                        "-video_track_timescale", "90000",
-                        "-vf", vf,
-                        "-c:v", "libx264", "-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p",
-                        "-c:a", "aac", "-b:a", "192k",
-                        "-af", "aresample=async=1",
-                        "-movflags", "+faststart",
-                        self.out_file
-                    ]
-                    proc = subprocess.run(
-                        cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        startupinfo=si, text=True, encoding="utf-8", errors="replace"
-                    )
-                    did_fallback = True
-                if did_fallback and proc.returncode == 0 and os.path.exists(self.out_file):
-                    self.log.emit(f"✅ Gộp trọn bộ thành công (re-encode libx264): {os.path.basename(self.out_file)}\n")
-                    thumb_jpg = self._prepare_thumbnail()
-                    if thumb_jpg:
-                        self._embed_cover_mp4(ffmpeg, self.out_file, thumb_jpg, si)
-                        self._export_thumbnail_beside_video(thumb_jpg)
-                        try: os.remove(thumb_jpg)
-                        except: pass
-                    self.done.emit(True, self.out_file)
+                cmd = [*base_cmd, *enc_args,
+                       "-c:a", "aac", "-b:a", "192k", "-shortest",
+                       "-video_track_timescale", "90000", "-movflags", "+faststart",
+                       self.out_file]
+                proc = subprocess.run(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    startupinfo=si, text=True, encoding="utf-8", errors="replace"
+                )
+                if proc.returncode != 0 or not os.path.exists(self.out_file) or os.path.getsize(self.out_file) <= 1024:
+                    if "libx264" not in (merge_codec or "").lower():
+                        self.log.emit("⚠️ Codec phần cứng gộp lỗi → chuyển libx264 (CPU)...\n")
+                        need_cpu_normalize = True
+                    else:
+                        err = (proc.stderr or "")[-1000:]
+                        self.log.emit(f"❌ Lỗi gộp/chuẩn hóa FFmpeg:\n{err}\n")
+                        self.done.emit(False, "")
+                        return
                 else:
-                    if did_fallback and proc.stderr:
-                        err = proc.stderr[-800:]
+                    _finish_success("chuẩn hóa + concat")
+                    return
+            else:
+                # Fast path cho các file render mới đã cùng resolution/FPS.
+                cmd = [ffmpeg, "-y", "-nostdin", "-f", "concat", "-safe", "0",
+                       "-i", list_txt, "-c", "copy", "-movflags", "+faststart",
+                       self.out_file]
+                proc = subprocess.run(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    startupinfo=si, text=True, encoding="utf-8", errors="replace"
+                )
+                fast_ok = (proc.returncode == 0 and os.path.exists(self.out_file)
+                           and os.path.getsize(self.out_file) > 1024)
+                if fast_ok and target_fps:
+                    out_fps = self._probe_fps(ffmpeg, self.out_file)
+                    if out_fps and abs(out_fps - target_fps) > 0.05:
+                        self.log.emit(
+                            f"⚠️ Fast-copy ra {out_fps:g}fps thay vì {target_fps:g}fps "
+                            "→ chuẩn hóa lại bằng CPU.\n"
+                        )
+                        fast_ok = False
+                if fast_ok:
+                    _finish_success("copy stream")
+                    return
+                need_cpu_normalize = True
+
+            if need_cpu_normalize:
+                # Fallback chung: input riêng + filter concat + CPU. Không phụ thuộc
+                # codec/time_base của từng tập nên an toàn hơn re-encode concat demuxer.
+                try:
+                    if os.path.exists(self.out_file):
+                        os.remove(self.out_file)
+                except Exception:
+                    pass
+                base_cmd = _build_filter_concat_base()
+                cmd_fb = [*base_cmd,
+                          "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                          "-pix_fmt", "yuv420p",
+                          "-c:a", "aac", "-b:a", "192k", "-shortest",
+                          "-video_track_timescale", "90000", "-movflags", "+faststart",
+                          self.out_file]
+                proc = subprocess.run(
+                    cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    startupinfo=si, text=True, encoding="utf-8", errors="replace"
+                )
+                if proc.returncode == 0 and os.path.exists(self.out_file) and os.path.getsize(self.out_file) > 1024:
+                    # kiểm tra FPS sau fallback lần cuối
+                    out_fps = self._probe_fps(ffmpeg, self.out_file)
+                    if out_fps and abs(out_fps - target_fps) > 0.10:
+                        self.log.emit(
+                            f"⚠️ File gộp tạo được nhưng FPS còn lệch ({out_fps:g}/{target_fps:g}).\n"
+                        )
+                    _finish_success("libx264 CPU")
+                else:
+                    err = (proc.stderr or "")[-1000:]
                     self.log.emit(f"❌ Lỗi gộp file FFmpeg:\n{err}\n")
                     self.done.emit(False, "")
         except Exception as e:
             self.log.emit(f"❌ Exception khi gộp: {e}\n")
             self.done.emit(False, "")
         finally:
-            if os.path.exists(list_txt):
-                try: os.remove(list_txt)
-                except: pass
+            for tmp in (list_txt, filter_txt):
+                try:
+                    if tmp and os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
 
 def _probe_duration_sec(video_path):
     """Đọc tổng thời lượng (giây) của video bằng ffmpeg -i. Trả 0 nếu không đọc được."""
@@ -1904,7 +1972,7 @@ class SingleRenderThread(QThread):
             filter_chains.append(f"{pad} {','.join(af_chain)} [aout]")
             audio_map = "[aout]"
             
-        cmd = ["ffmpeg", "-y", "-progress", "pipe:1"] + inputs; temp_filter = ""
+        cmd = [get_ffmpeg_path(), "-y", "-progress", "pipe:1"] + inputs; temp_filter = ""
         
         if filter_chains:
             basename = os.path.basename(self.vp)
@@ -1952,6 +2020,10 @@ class SingleRenderThread(QThread):
                         enc_args.extend(["-b:v", "1000k", "-preset", nv_preset])
                     else:
                         enc_args.extend(["-b:v", "1000k", "-preset", preset_hw])
+                if audio_map:
+                    # Không để AAC dài hơn video vài ms; nếu audio dài hơn, concat -c copy
+                    # sẽ tạo khe timestamp ở điểm nối và có thể làm FPS/tbr nhảy sai.
+                    enc_args.extend(["-shortest"])
                 enc_args.extend(["-movflags", "+faststart", self.op])
             else:
                 enc_args.extend(["-c:v", codec, "-pix_fmt", "yuv420p"])
@@ -1960,6 +2032,8 @@ class SingleRenderThread(QThread):
                     enc_args.extend(["-crf", str(crf_val), "-preset", preset_sw])
                 else:
                     enc_args.extend(["-b:v", "1000k", "-preset", preset_sw])
+                if audio_map:
+                    enc_args.extend(["-shortest"])
                 enc_args.extend(["-movflags", "+faststart", self.op])
             cmd.extend(enc_args)
         else:
@@ -2039,6 +2113,8 @@ class SingleRenderThread(QThread):
                         cpu_args += ["-crf", str(crf_val), "-preset", preset_sw]
                     else:
                         cpu_args += ["-b:v", "1000k", "-preset", preset_sw]
+                    if ctx.get("audio_map"):
+                        cpu_args += ["-shortest"]
                     cpu_args += ["-movflags", "+faststart", self.op]
                     cmd_cpu = base_cmd + cpu_args
 
@@ -3094,8 +3170,15 @@ class RenderWidget(QWidget):
         ir.addWidget(self.intro_input,1); ir.addWidget(btn_intro_pick); cover_lay.addLayout(ir)
         self.chk_intro.stateChanged.connect(lambda: self.settings.setValue("intro_en", self.chk_intro.isChecked()))
         self.intro_input.textChanged.connect(lambda: self.settings.setValue("intro_path", self.intro_input.text().strip()))
-        self.chk_frame = QCheckBox("Overlay PNG"); self.chk_frame.setChecked(self.settings.value("bp_frame_en", False, type=bool)); cover_lay.addWidget(self.chk_frame)
-        fr = QHBoxLayout(); self.frame_input = QLineEdit(self.settings.value("frame_path", "")); self.frame_input.setPlaceholderText("Ảnh PNG overlay...")
+        # Overlay PNG chỉ dùng trong phiên hiện tại / từng card, KHÔNG lưu QSettings.
+        # Đồng thời xóa giá trị cũ đã từng lưu để lần mở app sau không tự hiện lại.
+        try:
+            self.settings.remove("bp_frame_en")
+            self.settings.remove("frame_path")
+        except Exception:
+            pass
+        self.chk_frame = QCheckBox("Overlay PNG"); self.chk_frame.setChecked(False); cover_lay.addWidget(self.chk_frame)
+        fr = QHBoxLayout(); self.frame_input = QLineEdit(""); self.frame_input.setPlaceholderText("Ảnh PNG overlay...")
         bf = QPushButton("Chọn"); bf.setFixedWidth(58); bf.clicked.connect(self._select_frame)
         fr.addWidget(self.frame_input,1); fr.addWidget(bf); cover_lay.addLayout(fr); cover_lay.addStretch()
 
@@ -3956,9 +4039,14 @@ class RenderWidget(QWidget):
         self._log(f"📂 Đã nạp {total} video từ {self._bulk_source_label} trong {elapsed:.1f}s (không khóa giao diện).")
 
     def _auto_pair(self, folder):
-        """Quét folder, ghép cặp video+srt. Ưu tiên *_dubbed.mp4 + *_vi.srt;
-        không có dubbed thì dùng video gốc; không có _vi.srt thì dùng .srt gốc.
-        Gom theo 'stem gốc' của mỗi tập (bỏ hậu tố _dubbed)."""
+        """Quét folder, ghép cặp video+srt.
+
+        Ưu tiên theo mỗi tập: *_dubbed > video gốc > *_final.
+        *_final chỉ được dùng khi video gốc/dubbed đã không còn (ví dụ sau khi
+        dọn file trung gian). Nhờ vậy mở lại thư mục sau khi render KHÔNG sinh
+        thêm 1 card *_final cho cùng một tập và không render lặp thành
+        *_final_final.mp4. File *_TronBo_Rendered.mp4 không đưa vào grid tập.
+        """
         try:
             names = os.listdir(folder)
         except Exception:
@@ -3966,23 +4054,27 @@ class RenderWidget(QWidget):
         videos = [n for n in names if n.lower().endswith((".mp4", ".mkv", ".mov", ".avi"))]
         srt_set = set(n for n in names if n.lower().endswith(".srt"))
 
-        # gom video theo stem gốc (bỏ _dubbed)
-        groups = {}   # base_stem -> {"dubbed":..., "plain":...}
+        groups = {}   # base_stem -> {"dubbed":..., "plain":..., "final":...}
         for v in videos:
             stem = os.path.splitext(v)[0]
-            if stem.endswith("_dubbed"):
+            low = stem.lower()
+            if low.endswith("_tronbo_rendered"):
+                continue
+            if low.endswith("_dubbed"):
                 base = stem[:-len("_dubbed")]
                 groups.setdefault(base, {})["dubbed"] = v
+            elif low.endswith("_final"):
+                base = stem[:-len("_final")]
+                groups.setdefault(base, {})["final"] = v
             else:
                 groups.setdefault(stem, {})["plain"] = v
 
         pairs = []
         for base in sorted(groups.keys(), key=_natural_key):
             g = groups[base]
-            video = g.get("dubbed") or g.get("plain")
+            video = g.get("dubbed") or g.get("plain") or g.get("final")
             if not video:
                 continue
-            # chọn srt: ưu tiên <base>_vi.srt, rồi <base>.srt
             srt = None
             if f"{base}_vi.srt" in srt_set:
                 srt = f"{base}_vi.srt"
@@ -3996,8 +4088,11 @@ class RenderWidget(QWidget):
     def _guess_srt_for(self, video_path):
         """Đoán srt đi kèm 1 video lẻ (khi thêm bằng + File)."""
         stem = os.path.splitext(video_path)[0]
-        if stem.endswith("_dubbed"):
+        low = stem.lower()
+        if low.endswith("_dubbed"):
             stem = stem[:-len("_dubbed")]
+        elif low.endswith("_final"):
+            stem = stem[:-len("_final")]
         for cand in (stem + "_vi.srt", stem + ".srt"):
             if os.path.exists(cand):
                 return cand
@@ -4229,7 +4324,66 @@ class RenderWidget(QWidget):
                     c.ensure_thumbnail()
                 break
 
+    def _ensure_preview_alive(self):
+        """Đảm bảo shared PreviewGraphicsView chưa bị Qt xoá cùng EpisodeCard cũ.
+
+        Preview được di chuyển qua lại giữa các card. Khi một card bị deleteLater(),
+        mọi QWidget còn parent với card đó cũng bị Qt xoá. Nếu self.preview vẫn trỏ
+        tới wrapper Python cũ thì lần click card kế tiếp sẽ crash với:
+        RuntimeError: wrapped C/C++ object of type PreviewGraphicsView has been deleted.
+        """
+        p = getattr(self, "preview", None)
+        alive = False
+        if p is not None:
+            try:
+                p.parentWidget()
+                alive = True
+            except RuntimeError:
+                alive = False
+            except Exception:
+                alive = True
+        if not alive:
+            self.preview = PreviewGraphicsView(self.scene, self)
+            self.preview.setMinimumHeight(145)
+            self.preview.setStyleSheet("background:#050607; border:none;")
+            self.preview.hide()
+            self._preview_card = None
+        return self.preview
+
+    def _park_preview(self):
+        """Tách preview khỏi card hiện tại và chuyển quyền sở hữu về RenderWidget.
+        Phải làm TRƯỚC khi xoá card để Qt không xoá luôn shared preview.
+        """
+        p = self._ensure_preview_alive()
+        old = getattr(self, "_preview_card", None)
+        if old is not None:
+            try:
+                old.detach_preview_widget(p)
+            except Exception:
+                pass
+        self._preview_card = None
+        try:
+            p.setParent(self)
+            p.hide()
+        except RuntimeError:
+            # Nếu Qt đã xoá đúng lúc chuyển parent, dựng lại ngay một preview sạch.
+            self.preview = PreviewGraphicsView(self.scene, self)
+            self.preview.setMinimumHeight(145)
+            self.preview.setStyleSheet("background:#050607; border:none;")
+            self.preview.hide()
+        except Exception:
+            pass
+
     def _clear_all(self):
+        # Không xoá card khi worker còn dùng card đó; tránh wrapped C/C++ deleted.
+        _merge_busy = False
+        try:
+            _merge_busy = hasattr(self, "merge_thread") and self.merge_thread is not None and self.merge_thread.isRunning()
+        except Exception:
+            _merge_busy = False
+        if getattr(self, "_render_running", False) or _merge_busy:
+            QMessageBox.information(self, "Đang xử lý", "Đang render/gộp file. Hãy dừng hoặc chờ xong trước khi xóa danh sách video.")
+            return
         # Hủy phần còn lại nếu người dùng dọn danh sách giữa lúc đang nạp.
         self._bulk_loading = False
         self._bulk_pairs = []
@@ -4239,12 +4393,10 @@ class RenderWidget(QWidget):
         except Exception:
             pass
         self.media_player.stop()
-        if getattr(self, "_preview_card", None) is not None:
-            try:
-                self._preview_card.detach_preview_widget(self.preview)
-            except Exception:
-                pass
-            self._preview_card = None
+        # QUAN TRỌNG: preview là widget dùng chung. Remove khỏi layout thôi chưa đủ,
+        # vì parent Qt vẫn là EpisodeCard cũ. Phải re-parent về RenderWidget trước
+        # khi deleteLater() các card, nếu không preview sẽ bị xoá theo card.
+        self._park_preview()
         for c in self.cards:
             c.setParent(None)
             c.deleteLater()
@@ -4328,32 +4480,62 @@ class RenderWidget(QWidget):
         dlg.exec()
 
         # Đóng dialog -> trả preview về đúng card, khôi phục chiều cao nhỏ.
+        p = self._ensure_preview_alive()
         try:
-            vlay.removeWidget(self.preview)
+            vlay.removeWidget(p)
         except Exception:
             pass
-        self.preview.setMinimumHeight(145)
         try:
-            card.attach_preview_widget(self.preview)
+            p.setParent(self)
+            p.hide()
+            p.setMinimumHeight(145)
+        except RuntimeError:
+            p = self._ensure_preview_alive()
+        except Exception:
+            pass
+        try:
+            card.attach_preview_widget(p)
             self._preview_card = card
             QTimer.singleShot(0, self._reset_pos)
         except Exception:
-            pass
+            # Nếu card đã bị đóng/xoá lúc dialog mở, giữ preview an toàn ở host.
+            try:
+                p.setParent(self); p.hide()
+            except Exception:
+                pass
+            self._preview_card = None
 
     def _attach_preview_to_card(self, card):
         if card is None:
             return
+        p = self._ensure_preview_alive()
         old = getattr(self, "_preview_card", None)
         if old is not None and old is not card:
             try:
-                old.detach_preview_widget(self.preview)
+                old.detach_preview_widget(p)
                 old.btn_card_play.setText("▶")
             except Exception:
                 pass
+            # RemoveWidget không đổi parent. Park tạm về RenderWidget để nếu card
+            # cũ bị deleteLater() thì shared preview không bị chết theo.
+            try:
+                p.setParent(self)
+                p.hide()
+            except RuntimeError:
+                p = self._ensure_preview_alive()
+            except Exception:
+                pass
         if old is not card:
-            card.attach_preview_widget(self.preview)
-            self._preview_card = card
-            QTimer.singleShot(0, self._reset_pos)
+            try:
+                card.attach_preview_widget(p)
+                self._preview_card = card
+                QTimer.singleShot(0, self._reset_pos)
+            except RuntimeError:
+                # Phòng trường hợp wrapper C++ vừa bị xoá bởi event deleteLater cũ.
+                p = self._ensure_preview_alive()
+                card.attach_preview_widget(p)
+                self._preview_card = card
+                QTimer.singleShot(0, self._reset_pos)
 
     def _on_card_clicked(self, card):
         old = self.selected_card
@@ -4756,8 +4938,8 @@ class RenderWidget(QWidget):
             self.settings.setValue("subbox_opacity", opac)
             self.settings.setValue("bp_logo_en", self.chk_logo.isChecked())
             self.settings.setValue("logo_path", self.logo_input.text().strip())
-            self.settings.setValue("bp_frame_en", self.chk_frame.isChecked())
-            self.settings.setValue("frame_path", self.frame_input.text().strip())
+            # Overlay PNG cố ý KHÔNG lưu vào QSettings.
+            # Nó chỉ thuộc design_config của card trong phiên hiện tại.
             self.settings.setValue("bp_blur_en", self.chk_blur.isChecked())
             for k, chk in (("bp_flip", self.chk_flip), ("bp_zoom", self.chk_zoom), ("bp_color", self.chk_color),
                            ("bp_noise", self.chk_noise), ("bp_speed", self.chk_speed), ("bp_pitch", self.chk_pitch),
@@ -4881,7 +5063,10 @@ class RenderWidget(QWidget):
             from collections import Counter
             from concurrent.futures import ThreadPoolExecutor
             ffmpeg = get_ffmpeg_path()
-            vids = [getattr(c, "video_path", None) for c in self.cards]
+            _scope_cards = self._selected_cards() if hasattr(self, "_selected_cards") else list(self.cards)
+            if not _scope_cards:
+                _scope_cards = list(self.cards)
+            vids = [getattr(c, "video_path", None) for c in _scope_cards]
             vids = [v for v in vids if v and os.path.exists(v)]
             if not vids:
                 return None
@@ -5062,6 +5247,7 @@ class RenderWidget(QWidget):
         self._render_total = len(self._render_queue)
         self._render_done_count = 0
         self._rendered_files = [] # Lưu danh sách file xuất ra để gộp
+        self._render_failed_files = []  # không tự gộp thiếu tập nếu có render lỗi
         self._render_running = True
         self._stopping = False
         self._render_threads = {}         # out_path -> SingleRenderThread đang chạy
@@ -5252,6 +5438,25 @@ class RenderWidget(QWidget):
         if not hasattr(self, "_render_card_map"):
             self._render_card_map = {}
         self._render_card_map[out_path] = card
+
+        # GIỮ QThread SỐNG cho tới khi QThread.finished phát ra thật sự.
+        # SingleRenderThread.done được emit trước khi run() thoát hoàn toàn
+        # (sau đó vẫn còn khối finally dọn file tạm). Nếu _on_one_done() pop
+        # reference cuối cùng quá sớm, PyQt có thể huỷ QThread khi nó vẫn chạy
+        # và làm crash toàn app với lỗi:
+        #   QThread: Destroyed while thread is still running
+        if not hasattr(self, "_render_threads_alive"):
+            self._render_threads_alive = []
+        self._render_threads_alive.append(th)
+
+        def _release_render_thread(t=th):
+            try:
+                if t in self._render_threads_alive:
+                    self._render_threads_alive.remove(t)
+            except Exception:
+                pass
+
+        th.finished.connect(_release_render_thread)
         th.start()
 
     def _on_render_percent_multi(self, out_path, pct):
@@ -5294,6 +5499,19 @@ class RenderWidget(QWidget):
             self._log("⛔ Đã dừng render.")
             QMessageBox.information(self, "Đã dừng", "Đã dừng render theo yêu cầu.")
         else:
+            failed = list(getattr(self, "_render_failed_files", []) or [])
+            if failed:
+                self.step_render.set_status("error", 100)
+                if getattr(self, "_total_active", False):
+                    self.total_progress_end()
+                self._log(f"⚠️ Có {len(failed)} tập render lỗi → KHÔNG tự gộp để tránh xuất trọn bộ bị thiếu tập.")
+                names = "\n".join("• " + os.path.basename(p) for p in failed[:10])
+                more = f"\n... và {len(failed)-10} tập khác" if len(failed) > 10 else ""
+                QMessageBox.warning(
+                    self, "Render chưa đủ tập",
+                    f"Có {len(failed)} tập render lỗi nên BOOM Studio không tự gộp trọn bộ.\n\n{names}{more}\n\nHãy render lại các tập lỗi rồi gộp."
+                )
+                return
             if self.chk_merge_all.isChecked() and len(self._rendered_files) > 1:
                 self._start_merge(self._rendered_files)
             else:
@@ -5321,6 +5539,10 @@ class RenderWidget(QWidget):
             card.set_status("xong" if ok else "lỗi")
             if ok:
                 self._rendered_files.append(out_path)
+            else:
+                if not hasattr(self, "_render_failed_files"):
+                    self._render_failed_files = []
+                self._render_failed_files.append(getattr(card, "video_path", out_path))
         self._render_done_count = getattr(self, "_render_done_count", 0) + 1
         self.step_render.set_count(self._render_done_count, getattr(self, "_render_total", 0))
         self._schedule_realtime_refresh(10)
@@ -5332,6 +5554,11 @@ class RenderWidget(QWidget):
         self._pump_render_queue()
         
     def _start_merge(self, file_list):
+        file_list = [p for p in (file_list or []) if p and os.path.exists(p)]
+        if len(file_list) < 2:
+            self._log("⚠️ Không đủ ít nhất 2 file hợp lệ để gộp.")
+            QMessageBox.warning(self, "Không đủ file", "Cần ít nhất 2 file video hợp lệ để gộp.")
+            return
         # Render song song -> file xong KHÔNG theo thứ tự. Sắp lại theo số tập
         # để gộp trọn bộ đúng 1 -> cuối.
         file_list = sorted(file_list, key=lambda p: _natural_key(os.path.basename(p)))
