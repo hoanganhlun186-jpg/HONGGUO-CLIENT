@@ -303,7 +303,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.73"
+APP_VERSION = "1.0.72"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -375,14 +375,6 @@ def _pekka_synthesize(text, voice_code, api_key, out_path, speed_rate="1.0", log
 # ==========================================
 # FFMPEG HELPER VÀ LUỒNG GỘP FILE (MERGE)
 # ==========================================
-def _natural_episode_sort_key(path):
-    """Sort tên tập theo số tự nhiên: Tap_2 < Tap_10 < Tap_100.
-    Dùng chung cho video gốc và *_dubbed.mp4 để concat luôn đúng thứ tự tập.
-    """
-    name = os.path.basename(str(path))
-    parts = re.split(r'(\d+)', name.lower())
-    return tuple((0, int(p)) if p.isdigit() else (1, p) for p in parts)
-
 def get_ffmpeg_path():
     if sys.platform == "win32":
         if os.path.exists("ffmpeg.exe"): 
@@ -525,177 +517,70 @@ class HonggouMergeThread(QThread):
         return w, h, fps
 
     def _probe_duration_ms(self, ffmpeg, ffprobe, filepath):
-        """Đo ĐỘ DÀI LUỒNG VIDEO (ms), không lấy format/container duration.
-
-        Timeline concat và timeline SRT bắt buộc dùng cùng video-duration.
-        Nếu lấy format duration của MPEG-TS, AAC priming/audio tail có thể dư
-        vài chục ms mỗi tập và dồn thành vài giây ở cuối bộ phim.
-
-        Thứ tự: stream=duration -> quét packet video -> ffmpeg stream-copy null.
-        Tuyệt đối không fallback sang format=duration.
-        """
+        """Đo độ dài (ms) của file. Ưu tiên ffprobe (format=duration của .ts),
+        fallback đọc 'Duration:' từ ffmpeg -i. Trả None nếu thất bại."""
         si = None; cf = 0
         if sys.platform == "win32":
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             cf = 0x08000000
-
-        fps_hint = None
         if ffprobe:
-            # 1) Nhanh và chính xác khi container có duration cho video stream.
             try:
                 r = subprocess.run(
-                    [ffprobe, '-v', 'error', '-select_streams', 'v:0',
-                     '-show_entries', 'stream=duration,avg_frame_rate', '-of', 'json', filepath],
+                    [ffprobe, '-v', 'error', '-show_entries', 'format=duration',
+                     '-of', 'default=noprint_wrappers=1:nokey=1', filepath],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     startupinfo=si, creationflags=cf)
-                if r.returncode == 0 and r.stdout:
-                    data = json.loads(r.stdout.decode('utf-8', errors='ignore') or '{}')
-                    streams = data.get('streams') or []
-                    if streams:
-                        st = streams[0]
-                        dur_s = st.get('duration')
-                        try:
-                            if dur_s not in (None, '', 'N/A') and float(dur_s) > 0:
-                                return int(round(float(dur_s) * 1000))
-                        except Exception:
-                            pass
-                        afr = str(st.get('avg_frame_rate') or '')
-                        if '/' in afr:
-                            try:
-                                n, d = afr.split('/', 1)
-                                if float(d) != 0:
-                                    fps_hint = float(n) / float(d)
-                            except Exception:
-                                fps_hint = None
+                txt = r.stdout.decode('utf-8', errors='ignore').strip()
+                if txt and txt.upper() != 'N/A':
+                    return int(round(float(txt) * 1000))
             except Exception:
                 pass
-
-            # 2) TS/container lạ: quét packet VIDEO, không decode hình.
-            try:
-                p = subprocess.Popen(
-                    [ffprobe, '-v', 'error', '-select_streams', 'v:0',
-                     '-show_entries', 'packet=pts_time,duration_time',
-                     '-of', 'csv=p=0', filepath],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    startupinfo=si, creationflags=cf, text=True, errors='ignore')
-                first_pts = None
-                max_pts = None
-                dur_at_max = None
-                last_good_dur = None
-                if p.stdout is not None:
-                    for line in p.stdout:
-                        vals = [v.strip() for v in line.strip().split(',')]
-                        if not vals:
-                            continue
-                        try:
-                            pts = float(vals[0])
-                        except Exception:
-                            continue
-                        pdur = None
-                        if len(vals) > 1:
-                            try:
-                                if vals[1] and vals[1].upper() != 'N/A':
-                                    pdur = float(vals[1])
-                            except Exception:
-                                pdur = None
-                        if first_pts is None or pts < first_pts:
-                            first_pts = pts
-                        if max_pts is None or pts > max_pts:
-                            max_pts = pts
-                            dur_at_max = pdur
-                        if pdur and pdur > 0:
-                            last_good_dur = pdur
-                p.wait()
-                if first_pts is not None and max_pts is not None and max_pts >= first_pts:
-                    tail = dur_at_max or last_good_dur
-                    if not tail and fps_hint and fps_hint > 0:
-                        tail = 1.0 / fps_hint
-                    span = (max_pts - first_pts) + (tail or 0.0)
-                    if span > 0:
-                        return int(round(span * 1000))
-            except Exception:
-                pass
-
-        # 3) Máy thiếu ffprobe: packet-copy video sang null và đọc out_time.
-        if ffmpeg:
-            try:
-                r = subprocess.run(
-                    [ffmpeg, '-v', 'error', '-fflags', '+genpts',
-                     '-progress', 'pipe:1', '-nostats', '-i', filepath,
-                     '-map', '0:v:0', '-an', '-c:v', 'copy', '-f', 'null', '-'],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    startupinfo=si, creationflags=cf)
-                progress = r.stdout.decode('utf-8', errors='ignore')
-                out_time = None
-                for line in progress.splitlines():
-                    if line.startswith('out_time='):
-                        out_time = line.split('=', 1)[1].strip()
-                if out_time and out_time != 'N/A':
-                    m = re.match(r'(\d+):(\d+):(\d+(?:\.\d+)?)', out_time)
-                    if m:
-                        h, mn, sec = m.groups()
-                        total_s = int(h)*3600 + int(mn)*60 + float(sec)
-                        if total_s > 0:
-                            return int(round(total_s * 1000))
-            except Exception:
-                pass
+        try:
+            r = subprocess.run([ffmpeg, '-i', filepath],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               startupinfo=si, creationflags=cf)
+            err = r.stderr.decode('utf-8', errors='ignore')
+            m = re.search(r'Duration:\s*(\d+):(\d+):(\d+)\.(\d+)', err)
+            if m:
+                h, mn, s, cs = m.groups()
+                return ((int(h)*3600 + int(mn)*60 + int(s)) * 1000
+                        + int(cs.ljust(3, '0')[:3]))
+        except Exception:
+            pass
         return None
 
     def _detect_gpu_encoder(self, ffmpeg, family):
-        """Dò encoder GPU THẬT SỰ chạy được, không chỉ nhìn tên trong `ffmpeg -encoders`.
-
-        Bản cũ dễ chọn nhầm NVENC chỉ vì FFmpeg có build encoder này, dù máy không
-        có NVIDIA. Khi NVENC fail nó rớt thẳng CPU và bỏ qua QSV/AMF -> re-encode
-        mỗi tập cực chậm. Bản này test encode 1 frame rất nhỏ và cache kết quả.
-        """
+        """Dò encoder GPU khả dụng cho họ codec ('h264' hoặc 'hevc').
+        Trả tên encoder hoặc None (=> CPU). Cache theo family."""
         cache = getattr(self, "_gpu_enc_cache", None)
         if cache is None:
             cache = {}
             self._gpu_enc_cache = cache
         if family in cache:
             return cache[family] or None
-
         if family == "hevc":
             order = ["hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_videotoolbox"]
         else:
             order = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"]
-
-        si = None; cf = 0
-        if sys.platform == "win32":
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            cf = 0x08000000
-
-        # Chỉ test những encoder có trong build FFmpeg trước.
-        enc_txt = ""
+        found = ""
         try:
+            si = None; cf = 0
+            if sys.platform == "win32":
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                cf = 0x08000000
             r = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               startupinfo=si, creationflags=cf, timeout=10)
+                               startupinfo=si, creationflags=cf)
             enc_txt = (r.stdout.decode("utf-8", errors="ignore")
                        + r.stderr.decode("utf-8", errors="ignore"))
-        except Exception:
-            pass
-
-        found = ""
-        for enc in order:
-            if enc_txt and enc not in enc_txt:
-                continue
-            try:
-                # Test 1 frame 64x64: rất nhanh nhưng đủ biết driver/GPU có dùng được không.
-                cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                       "-f", "lavfi", "-i", "color=c=black:s=64x64:r=30",
-                       "-frames:v", "1", "-an", "-pix_fmt", "yuv420p",
-                       "-c:v", enc, "-f", "null", "-"]
-                rr = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                    startupinfo=si, creationflags=cf, timeout=12)
-                if rr.returncode == 0:
+            for enc in order:
+                if enc in enc_txt:
                     found = enc
                     break
-            except Exception:
-                continue
-
+        except Exception:
+            found = ""
         cache[family] = found
         return found or None
 
@@ -707,7 +592,7 @@ class HonggouMergeThread(QThread):
         if use_gpu:
             enc = self._detect_gpu_encoder(ffmpeg, family)
             if enc and "nvenc" in enc:
-                return ["-c:v", enc, "-preset", "p1", "-cq", "23",
+                return ["-c:v", enc, "-preset", "p5", "-cq", "22",
                         "-g", g, "-no-scenecut", "1", "-pix_fmt", "yuv420p"] \
                        + (["-tag:v", "hvc1"] if family == "hevc" else [])
             if enc and "qsv" in enc:
@@ -715,24 +600,18 @@ class HonggouMergeThread(QThread):
                         "-g", g, "-pix_fmt", "yuv420p"] \
                        + (["-tag:v", "hvc1"] if family == "hevc" else [])
             if enc and "amf" in enc:
-                return ["-c:v", enc, "-quality", "speed", "-qp_i", "23",
-                        "-qp_p", "23", "-g", g, "-pix_fmt", "yuv420p"] \
+                return ["-c:v", enc, "-quality", "quality", "-qp_i", "22",
+                        "-qp_p", "22", "-g", g, "-pix_fmt", "yuv420p"] \
                        + (["-tag:v", "hvc1"] if family == "hevc" else [])
             if enc and "videotoolbox" in enc:
                 return ["-c:v", enc, "-q:v", "55", "-g", g, "-pix_fmt", "yuv420p"] \
                        + (["-tag:v", "hvc1"] if family == "hevc" else [])
-        # CPU fallback. Khi merge đang chạy 4 tập song song, KHÔNG để mỗi
-        # tiến trình x264/x265 tự ăn toàn bộ CPU (4 x all-cores sẽ nghẽn ngược).
-        # Chia số thread CPU tương đối đều theo số worker merge hiện tại.
-        _mw = max(1, int(getattr(self, "_merge_parallel_workers", 1) or 1))
-        _cpu_threads = max(1, int((os.cpu_count() or 4) / _mw))
+        # CPU fallback
         if family == "hevc":
-            return ["-c:v", "libx265", "-preset", "ultrafast", "-crf", "24",
-                    "-threads", str(_cpu_threads),
+            return ["-c:v", "libx265", "-preset", "veryfast", "-crf", "23",
                     "-x265-params", f"keyint={g}:min-keyint={g}:scenecut=0:log-level=none",
                     "-tag:v", "hvc1", "-pix_fmt", "yuv420p"]
-        return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "21",
-                "-threads", str(_cpu_threads),
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 "-g", g, "-keyint_min", g, "-sc_threshold", "0",
                 "-pix_fmt", "yuv420p"]
 
@@ -818,7 +697,7 @@ class HonggouMergeThread(QThread):
                         '-af', 'aresample=async=1']
             else:
                 cmd += ['-an']
-            cmd += ['-muxdelay', '0', '-muxpreload', '0', '-f', 'mpegts', ts_path]
+            cmd += ['-f', 'mpegts', ts_path]
             return cmd
 
         # 1) GPU
@@ -836,10 +715,10 @@ class HonggouMergeThread(QThread):
             cmd = [ffmpeg, '-y', '-fflags', '+genpts', '-i', fp,
                    '-c:v', 'copy', '-bsf:v', bsf,
                    '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2',
-                   '-muxdelay', '0', '-muxpreload', '0', '-f', 'mpegts', ts_path]
+                   '-f', 'mpegts', ts_path]
         else:
             cmd = [ffmpeg, '-y', '-fflags', '+genpts', '-i', fp,
-                   '-c:v', 'copy', '-bsf:v', bsf, '-an', '-muxdelay', '0', '-muxpreload', '0', '-f', 'mpegts', ts_path]
+                   '-c:v', 'copy', '-bsf:v', bsf, '-an', '-f', 'mpegts', ts_path]
         res = _run(cmd)
         if res.returncode == 0 and os.path.exists(ts_path):
             return True
@@ -847,10 +726,10 @@ class HonggouMergeThread(QThread):
         if has_audio:
             cmd2 = [ffmpeg, '-y', '-fflags', '+genpts', '-i', fp, '-c:v', 'copy',
                     '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2',
-                    '-muxdelay', '0', '-muxpreload', '0', '-f', 'mpegts', ts_path]
+                    '-f', 'mpegts', ts_path]
         else:
             cmd2 = [ffmpeg, '-y', '-fflags', '+genpts', '-i', fp,
-                    '-c:v', 'copy', '-an', '-muxdelay', '0', '-muxpreload', '0', '-f', 'mpegts', ts_path]
+                    '-c:v', 'copy', '-an', '-f', 'mpegts', ts_path]
         res = _run(cmd2)
         return res.returncode == 0 and os.path.exists(ts_path)
 
@@ -882,7 +761,7 @@ class HonggouMergeThread(QThread):
         for i, task in enumerate(self.merge_tasks):
             out_name = task["output_name"]
             files_to_merge = task["files"]
-            if not files_to_merge:
+            if len(files_to_merge) <= 1:
                 continue
 
             final_output = os.path.join(self.movie_folder, out_name)
@@ -957,133 +836,66 @@ class HonggouMergeThread(QThread):
                         msg += " · tất cả đồng nhất, ghép nhanh"
                     self.progress_msg.emit(msg)
 
-                # ── 3) CHUẨN HÓA ĐA LUỒNG -> .ts ────────────────────────
-                # Đã quét HẾT metadata ở bước 1/2 rồi mới xử lý. Các tập độc lập
-                # nên có thể remux / re-encode song song mà KHÔNG ảnh hưởng thứ tự
-                # concat: kết quả được đặt lại vào ts_files đúng index gốc.
-                #
-                # 4 worker là mức cân bằng tốt: tận dụng NVENC/QSV/AMF nhưng không
-                # dồn I/O/VRAM quá mạnh như 8-10 tiến trình FFmpeg cùng lúc.
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-
-                PARALLEL_FIX_WORKERS = 4
-                worker_count = max(1, min(PARALLEL_FIX_WORKERS, len(probes)))
-                self._merge_parallel_workers = worker_count
-
-                # Warm-up GPU encoder 1 lần TRƯỚC khi mở pool để tránh 4 thread
-                # cùng lúc chạy bài test encoder và tranh ghi _gpu_enc_cache.
-                gpu_encoder = self._detect_gpu_encoder(ffmpeg_path, target_family)
-                _gpu_label = gpu_encoder if gpu_encoder else "CPU fallback"
-                self.progress_msg.emit(
-                    f"🚀 Chuẩn hoá đa luồng: {worker_count} tập/lần · {_gpu_label} · "
-                    f"{mismatched} tập cần re-encode — Phần {i+1}/{total_tasks}")
-
-                ts_files = [None] * len(probes)
-
-                def _normalize_one(j, p):
+                # ── 3) CHUẨN HÓA TỪNG TẬP -> .ts ─────────────────────
+                ts_files = []
+                for j, p in enumerate(probes):
                     fp = p["fp"]
                     ts_path = fp + ".ts"
                     res_off = (tw and th and p["w"] and p["h"]
                                and (p["w"], p["h"]) != (tw, th))
                     fps_off = (tfps and p["fps"] and abs(p["fps"] - tfps) > 0.05)
-                    kind = "remux"
-                    detail = ""
-                    try:
-                        if res_off or fps_off:
-                            kind = "fix"
-                            detail = (("res" if res_off else "")
-                                      + ("+fps" if (res_off and fps_off)
-                                         else ("fps" if fps_off else "")))
-                            self.progress_msg.emit(
-                                f"🛠 [{j+1}/{len(probes)}] Bắt đầu sửa {detail}...")
-                            ok = self._fix_episode_to_ts(
-                                ffmpeg_path, fp, ts_path,
-                                tw or (p["w"] or 1920), th or (p["h"] or 1080),
-                                tfps, p["has_audio"], _run, family=target_family)
-                        else:
-                            self.progress_msg.emit(
-                                f"⚡ [{j+1}/{len(probes)}] Bắt đầu remux nhanh...")
-                            ok = self._remux_episode_to_ts(
-                                ffmpeg_path, fp, ts_path, p["vcodec"], p["has_audio"], _run)
-                        return j, ts_path, bool(ok), kind, detail, ""
-                    except Exception as ex:
-                        return j, ts_path, False, kind, detail, str(ex)
 
-                done_count = 0
-                with ThreadPoolExecutor(max_workers=worker_count,
-                                        thread_name_prefix="merge_fix") as ex:
-                    futs = {ex.submit(_normalize_one, j, p): j
-                            for j, p in enumerate(probes)}
-                    for fut in as_completed(futs):
-                        j, ts_path, ok, kind, detail, err = fut.result()
-                        if not ok:
-                            # Hủy các task chưa chạy; FFmpeg đang chạy sẽ tự kết thúc.
-                            for other in futs:
-                                other.cancel()
-                            _name = os.path.basename(probes[j]["fp"])
-                            raise Exception(
-                                f"Khong xu ly duoc tap {j+1} ({_name})"
-                                + (f": {err[:160]}" if err else ""))
-                        ts_files[j] = ts_path
-                        done_count += 1
-                        if kind == "fix":
-                            self.progress_msg.emit(
-                                f"✅ [{done_count}/{len(probes)}] Xong tập {j+1} (đã sửa {detail})")
-                        else:
-                            self.progress_msg.emit(
-                                f"✅ [{done_count}/{len(probes)}] Xong tập {j+1} (remux)")
+                    if res_off or fps_off:
+                        self.progress_msg.emit(
+                            f"🛠 Sửa tập {j+1}/{len(probes)} (lệch "
+                            + ("res" if res_off else "")
+                            + ("+fps" if (res_off and fps_off) else ("fps" if fps_off else ""))
+                            + f") — Phần {i+1}...")
+                        ok = self._fix_episode_to_ts(
+                            ffmpeg_path, fp, ts_path,
+                            tw or (p["w"] or 1920), th or (p["h"] or 1080),
+                            tfps, p["has_audio"], _run, family=target_family)
+                    else:
+                        self.progress_msg.emit(
+                            f"⚡ Chuẩn hoá nhanh tập {j+1}/{len(probes)} — Phần {i+1}...")
+                        ok = self._remux_episode_to_ts(
+                            ffmpeg_path, fp, ts_path, p["vcodec"], p["has_audio"], _run)
 
-                # type guard: nếu vì lý do bất thường thiếu 1 slot thì dừng, không
-                # concat thiếu tập rồi tạo file trọn bộ sai.
-                if any(not x for x in ts_files):
-                    raise Exception("Thieu file TS sau buoc chuan hoa da luong")
+                    if not ok:
+                        raise Exception(f"Khong xu ly duoc tap {j+1} ({os.path.basename(fp)})")
+                    ts_files.append(ts_path)
 
-                # ── 3b) MASTER TIMELINE: VIDEO duration của từng .ts ─────────
-                # Cùng một dãy duration dùng cho BOTH:
-                #   1) ffconcat đặt mốc bắt đầu tập kế tiếp
-                #   2) durations.json để cộng offset SRT.
-                # Không dùng format duration của TS vì AAC thường dư ~20ms/tập.
-                durations_map = {}
-                episode_durations_ms = []
-                for p, ts_path in zip(probes, ts_files):
-                    dms = self._probe_duration_ms(ffmpeg_path, ffprobe_path, ts_path)
-                    if not dms or dms <= 0:
-                        raise Exception(
-                            f"Khong doc duoc VIDEO duration cua {os.path.basename(p['fp'])}. "
-                            "Can ffprobe.exe canh ffmpeg.exe de gop timeline chinh xac.")
-                    dms = int(dms)
-                    durations_map[os.path.basename(p["fp"])] = dms
-                    episode_durations_ms.append(dms)
-
-                dur_json = os.path.join(
-                    self.movie_folder, os.path.splitext(out_name)[0] + ".durations.json")
-                with open(dur_json, "w", encoding="utf-8") as _df:
-                    json.dump(durations_map, _df, ensure_ascii=False, indent=2)
+                # ── 3b) GHI ĐỘ DÀI THẬT của từng tập (đo trên .ts đã chuẩn hóa,
+                #        chính là cái đi vào concat) ra <out>.durations.json.
+                #        Gộp SRT sẽ đọc bảng này để tính offset -> sub khớp 100%,
+                #        không lệch dồn dù tập bị re-encode đổi fps.
+                try:
+                    durations_map = {}
+                    for p, ts_path in zip(probes, ts_files):
+                        dms = self._probe_duration_ms(ffmpeg_path, ffprobe_path, ts_path)
+                        if dms:
+                            durations_map[os.path.basename(p["fp"])] = dms
+                    if durations_map:
+                        dur_json = os.path.join(
+                            self.movie_folder,
+                            os.path.splitext(out_name)[0] + ".durations.json")
+                        with open(dur_json, "w", encoding="utf-8") as _df:
+                            json.dump(durations_map, _df, ensure_ascii=False)
+                except Exception:
+                    pass  # không chặn ghép nếu ghi bảng lỗi
 
                 temp_files = list(ts_files)
 
-                # ── 4) GHÉP: ffconcat dùng CHÍNH duration của video stream ─────
+                # ── 4) GHÉP CUỐI: concat .ts bằng -c copy (nhanh) ─────
                 with open(list_txt_path, 'w', encoding='utf-8') as f:
-                    f.write("ffconcat version 1.0\n")
-                    for tp, dms in zip(ts_files, episode_durations_ms):
-                        _p = tp.replace(os.sep, '/').replace("'", "'\\''")
-                        f.write(f"file '{_p}'\n")
-                        f.write(f"duration {dms / 1000.0:.6f}\n")
+                    for tp in ts_files:
+                        f.write(f"file '{tp.replace(os.sep, '/')}'\n")
                 temp_files.append(list_txt_path)
 
                 self.progress_msg.emit(f"⚡ Ráp mạch phim phần {i+1}/{total_tasks}: {out_name}...")
-                # Video vẫn stream-copy (nhanh, không giảm chất lượng). Audio AAC
-                # được encode lại 1 lần để xử lý sạch packet audio dư ở ranh giới
-                # khi ffconcat dùng video-duration; tránh Non-monotonic DTS/glitch.
-                if any_have_audio:
-                    cmd = [ffmpeg_path, '-y', '-f', 'concat', '-safe', '0', '-i', list_txt_path,
-                           '-c:v', 'copy',
-                           '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2',
-                           '-af', 'aresample=async=1:first_pts=0',
-                           '-movflags', '+faststart', final_output]
-                else:
-                    cmd = [ffmpeg_path, '-y', '-f', 'concat', '-safe', '0', '-i', list_txt_path,
-                           '-c:v', 'copy', '-an', '-movflags', '+faststart', final_output]
+                cmd = [ffmpeg_path, '-y', '-f', 'concat', '-safe', '0', '-i', list_txt_path,
+                       '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
+                       '-movflags', '+faststart', final_output]
                 result = _run(cmd)
 
                 if result.returncode == 0 and os.path.exists(final_output):
@@ -1091,18 +903,6 @@ class HonggouMergeThread(QThread):
                     ok_verify, reason = self._verify_output(
                         ffmpeg_path, ffprobe_path, final_output, any_have_audio)
                     if ok_verify:
-                        expected_ms = sum(episode_durations_ms)
-                        actual_ms = self._probe_duration_ms(ffmpeg_path, ffprobe_path, final_output)
-                        if actual_ms:
-                            drift_ms = int(actual_ms) - int(expected_ms)
-                            self.progress_msg.emit(
-                                f"🧭 Timeline check: dự kiến {expected_ms/1000:.3f}s · "
-                                f"video {actual_ms/1000:.3f}s · lệch {drift_ms:+d}ms")
-                            # Chỉ chặn khi sai lớn; vài frame cuối là bình thường.
-                            if abs(drift_ms) > max(1000, len(episode_durations_ms) * 20):
-                                raise Exception(
-                                    f"Timeline output lech {drift_ms}ms so voi manifest; "
-                                    "dung de tranh tao SRT tron bo sai.")
                         success = True
                     else:
                         raise Exception(f"Ghep xong nhung file loi: {reason}")
@@ -1703,122 +1503,6 @@ class SearchMoviesThread(QThread):
             self.error_signal.emit("Máy chủ đang quá tải. Vui lòng chờ 1-2 phút rồi bấm lại nhé!")
 
 
-def _hg_find_detail(data, expected_id):
-    """Only accept named series matching the requested ID, never recommendations."""
-    stack = [data]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, dict):
-            sid = item.get('series_id')
-            if (isinstance(sid, str) and sid == expected_id
-                    and isinstance(item.get('series_name'), str)
-                    and item['series_name'].strip()):
-                return item
-            stack.extend(item.values())
-        elif isinstance(item, list):
-            stack.extend(item)
-    return None
-
-
-def _hg_parse_html(html, expected_id):
-    decoder = json.JSONDecoder()
-    for match in re.finditer(r'(?:window\s*\.\s*)?_ROUTER_DATA\s*=\s*', html):
-        try:
-            data, _ = decoder.raw_decode(html[match.end():].lstrip())
-            detail = _hg_find_detail(data, expected_id)
-            if detail:
-                return detail
-        except (ValueError, TypeError):
-            continue
-    return None
-
-
-def _hg_browser_detail(url, expected_id):
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError('Thiếu Playwright trong Python chạy ứng dụng. '
-                           'Cài bằng: python -m pip install playwright') from exc
-    found = []
-    with sync_playwright() as pw:
-        browser = None
-        for channel in ('chrome', 'msedge', None):
-            try:
-                options = {'headless': True}
-                if channel:
-                    options['channel'] = channel
-                browser = pw.chromium.launch(**options)
-                break
-            except Exception:
-                continue
-        if browser is None:
-            raise RuntimeError('Không khởi động được Chrome/Edge. Cài Chrome hoặc chạy: '
-                               'python -m playwright install chromium')
-        try:
-            context = browser.new_context(locale='zh-CN')
-            page = context.new_page()
-            page.set_default_timeout(5000)
-
-            def collect(response):
-                host = (urlparse(response.url).hostname or '').lower()
-                if not (host == 'hongguoduanju.com' or host.endswith('.hongguoduanju.com')):
-                    return
-                if response.request.resource_type not in ('xhr', 'fetch'):
-                    return
-                try:
-                    detail = _hg_find_detail(response.json(), expected_id)
-                    if detail:
-                        found.append(detail)
-                except Exception:
-                    pass
-
-            page.on('response', collect)
-            deadline = time.monotonic() + 60
-            try:
-                page.goto(url, wait_until='domcontentloaded', timeout=30000)
-            except Exception:
-                # A slow optional resource must not discard already received data.
-                pass
-            while time.monotonic() < deadline:
-                if found:
-                    return found[0]
-                try:
-                    detail = _hg_parse_html(page.content(), expected_id)
-                    if detail:
-                        return detail
-                    # Serialize in the page to preserve string IDs and avoid handles.
-                    raw = page.evaluate('() => JSON.stringify(window._ROUTER_DATA || null)')
-                    detail = _hg_find_detail(json.loads(raw), expected_id)
-                    if detail:
-                        return detail
-                    page.wait_for_timeout(500)
-                except Exception:
-                    if page.is_closed():
-                        break
-            raise RuntimeError('Trang đã mở nhưng chưa trả dữ liệu phim sau 60 giây. '
-                               'Hãy mở link trong Chrome kiểm tra đăng nhập/xác minh '
-                               'hoặc phim còn khả dụng, rồi thử lại. Không tạo lượt tải khi thiếu dữ liệu.')
-        finally:
-            browser.close()
-
-
-def _hg_episode_count(detail):
-    info = detail.get('series_episode_info') or {}
-    # Released count takes precedence over planned total for ongoing series.
-    for value in (info.get('episode_cnt'), info.get('episode_total_cnt'), detail.get('episode_cnt')):
-        try:
-            count = int(value)
-            if count > 0:
-                return count
-        except (ValueError, TypeError):
-            pass
-    match = re.search(r'(\d+)', str(detail.get('episode_right_text') or ''))
-    if match:
-        return int(match.group(1))
-    videos = detail.get('vid_list')
-    return len(videos) if isinstance(videos, list) else 0
-
-
 class HonggouScanThread(QThread):
     scan_result = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
@@ -1890,37 +1574,72 @@ class HonggouScanThread(QThread):
                     f"Web hongguoduanju có thể đang bận. Hãy thử lại sau ít phút.")
                 return
 
-            parsed = urlparse(self.url)
-            expected_id = parse_qs(parsed.query).get("series_id", [""])[0]
-            if not expected_id:
-                match = re.search(r"/(?:detail|player)/(\d+)", parsed.path)
-                expected_id = match.group(1) if match else ""
-            if not expected_id.isdigit():
-                self.error_signal.emit("Link chưa có mã phim hợp lệ (series_id). Hãy sao chép link trang chi tiết phim.")
+            detail = None
+            parse_stage = "init"
+
+            json_match = re.search(r'window\._ROUTER_DATA\s*=\s*(\{.+\})\s*;?\s*</script>', html, re.DOTALL)
+            if not json_match:
+                # phòng khi đổi tên biến / bỏ tiền tố window.
+                json_match = re.search(r'_ROUTER_DATA\s*=\s*(\{.+\})\s*;?\s*</script>', html, re.DOTALL)
+
+            if json_match:
+                raw = json_match.group(1)
+                # cắt về JSON cân bằng dấu ngoặc thay vì non-greedy (tránh dừng ở } lồng nhau đầu tiên)
+                depth, end, in_str, esc = 0, None, False, False
+                for i, ch in enumerate(raw):
+                    if in_str:
+                        if esc: esc = False
+                        elif ch == '\\': esc = True
+                        elif ch == '"': in_str = False
+                        continue
+                    if ch == '"': in_str = True
+                    elif ch == '{': depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                if end:
+                    raw = raw[:end]
+                try:
+                    data = json.loads(raw)
+                    detail = (data.get("loaderData", {}) or {}).get("detail_page", {}) or {}
+                    detail = detail.get("seriesDetail", {}) or {}
+                    parse_stage = "ok" if detail else "path_miss"
+                except json.JSONDecodeError as e:
+                    parse_stage = f"json_err: {e}"
+            else:
+                low = html.lower()
+                if any(k in low for k in ("captcha", "verify", "验证", "滑块")):
+                    parse_stage = "blocked_captcha"
+                elif any(k in low for k in ("login", "sign in", "登录")):
+                    parse_stage = "need_login"
+                elif len(html) < 2000:
+                    parse_stage = f"html_too_short(len={len(html)})"
+                else:
+                    parse_stage = "no_router_data"
+
+            if not detail:
+                snippet = (html[:400].replace("\r", " ").replace("\n", " ") if html else "")
+                self.error_signal.emit(
+                    f"Không bóc tách được dữ liệu [{parse_stage}]. Vui lòng kiểm tra lại link.\n"
+                    f"---\nHTML mở đầu: {snippet}")
                 return
-            detail = _hg_parse_html(html, expected_id)
-            if not detail:
-                try:
-                    loader_response = requests.get(
-                        "https://hongguoduanju.com/detail",
-                        params={"series_id": expected_id, "__loader": "detail_page", "__ssrDirect": "true"},
-                        headers={"User-Agent": "Mozilla/5.0", "Referer": self.url}, timeout=25)
-                    loader_response.raise_for_status()
-                    detail = _hg_find_detail(loader_response.json(), expected_id)
-                except (requests.exceptions.RequestException, ValueError):
-                    pass
-            if not detail:
-                try:
-                    detail = _hg_browser_detail(self.url, expected_id)
-                except Exception as exc:
-                    self.error_signal.emit(f"Không đọc được dữ liệu phim: {exc}")
-                    return
 
             series_id = str(detail.get("series_id") or "")
             title = detail.get("series_name") or "Phim không rõ tên"
             cover_url = detail.get("series_cover") or ""
 
-            total_episodes = _hg_episode_count(detail)
+            total_episodes = 0
+            right_text = detail.get("episode_right_text") or ""
+            if right_text:
+                num_match = re.search(r'(\d+)', right_text)
+                if num_match: total_episodes = int(num_match.group(1))
+            if total_episodes == 0:
+                vid_list = detail.get("vid_list") or []
+                if isinstance(vid_list, list) and len(vid_list) > 0: total_episodes = len(vid_list)
+            if total_episodes == 0:
+                total_episodes = int(detail.get("episode_cnt") or 0)
 
             payload = {
                 "url": self.url, "series_id": series_id, "expected_total": total_episodes,
@@ -6628,12 +6347,6 @@ class HonggouWidget(QWidget):
         merge_tasks = []
         safe_title = re.sub(r'[\\/*?:"<>|]', "", self.current_title)
 
-        # Thread dịch/lồng tiếng có thể hoàn thành không theo thứ tự. Luôn sort
-        # theo số tập tự nhiên để Tap_100 không chen trước Tap_11.
-        files_to_merge = sorted(
-            [f for f in (files_to_merge or []) if os.path.exists(f)],
-            key=_natural_episode_sort_key)
-
         if mode == 1:
             merge_tasks.append({
                 "output_name": f"{safe_title} - Trọn Bộ.mp4",
@@ -6644,15 +6357,18 @@ class HonggouWidget(QWidget):
             for i in range(0, len(files_to_merge), chunk_size):
                 chunk = files_to_merge[i:i + chunk_size]
                 part_num = (i // chunk_size) + 1
-                if chunk:
-                    # Phần cuối chỉ 1 tập vẫn đi qua cùng MergeThread để MP4 và
-                    # SRT được tạo theo một timeline, không chỉ rename mỗi video.
+                if len(chunk) > 1:
                     merge_tasks.append({
                         "output_name": f"{safe_title} - Phần {part_num}.mp4",
                         "files": chunk
                     })
+                elif len(chunk) == 1:
+                    out_path = os.path.join(self.save_folder, self.current_series_id, f"{safe_title} - Phần {part_num}.mp4")
+                    try:
+                        if os.path.exists(chunk[0]): shutil.move(chunk[0], out_path)
+                    except: pass
 
-        merge_tasks = [t for t in merge_tasks if len(t["files"]) >= 1]
+        merge_tasks = [t for t in merge_tasks if len(t["files"]) > 1]
 
         if not merge_tasks:
             self.btn_download.setEnabled(True)
@@ -6835,9 +6551,8 @@ class HonggouWidget(QWidget):
                     # video, trong khi format=duration hay dài hơn (audio priming
                     # / audio dài hơn video) -> nếu cộng theo container, offset dư
                     # ra mỗi tập, dồn qua trăm tập thành sub tới muộn dần.
-                    # Ưu tiên MASTER TIMELINE do MergeThread ghi. Chính các
-                    # duration này cũng đã được ghi vào ffconcat, nên video và SRT
-                    # dùng đúng cùng một mốc. Không có bảng mới probe riêng v:0.
+                    # Ưu tiên bảng độ dài thật (khóa theo tên file gốc). Không
+                    # có bảng (ghép sub không qua MergeThread) mới probe như cũ.
                     dur = dur_table.get(os.path.basename(vf))
                     if not dur:
                         dur = _get_video_duration_ms(vf)
@@ -6847,23 +6562,21 @@ class HonggouWidget(QWidget):
                         any_srt = True
 
                     if dur:
-                        offset_ms += int(dur)
+                        offset_ms += dur
                     else:
-                        # Không đoán duration bằng câu sub cuối + 1 giây. Khoảng
-                        # lặng cuối mỗi tập khác nhau -> sai sẽ cộng dồn rất nặng.
                         missing_dur = True
-                        break
+                        blocks_tmp = _parse_srt_blocks(srt_path) if os.path.exists(srt_path) else []
+                        if blocks_tmp:
+                            offset_ms += blocks_tmp[-1][1] + 1000
 
                 if not any_srt:
                     continue
 
-                if missing_dur:
-                    if hasattr(self, 'txt_stt_log'):
-                        self.txt_stt_log.append(
-                            f"❌ Không gộp sub {out_name_noext}{suffix}: thiếu VIDEO duration "
-                            "của ít nhất 1 tập. Hãy đặt ffprobe.exe cạnh ffmpeg.exe rồi gộp lại."
-                        )
-                    continue
+                if missing_dur and hasattr(self, 'txt_stt_log'):
+                    self.txt_stt_log.append(
+                        "⚠️ Có tập không đọc được thời lượng video (ffprobe lỗi) — "
+                        "time sub trọn bộ có thể lệch. Kiểm tra ffprobe.exe cạnh ffmpeg."
+                    )
 
                 combined_blocks = []
                 for ep_offset, sp in per_ep:
@@ -7470,7 +7183,7 @@ class HonggouWidget(QWidget):
                 self._batch_tab_finished()
             return
 
-        dubbed = sorted(getattr(self, '_gemini_vi_map', {}).keys(), key=_natural_episode_sort_key)
+        dubbed = sorted(getattr(self, '_gemini_vi_map', {}).keys())
 
         # ── RETRY tối đa 3 LẦN các tập THIẾU bản _dubbed.mp4 TRƯỚC KHI GHÉP ──
         # Quan trọng với chế độ ghép trọn bộ: nếu 1 tập lồng lỗi (VD hết ổ
