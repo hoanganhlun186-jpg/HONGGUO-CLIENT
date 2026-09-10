@@ -22,7 +22,8 @@ from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsTextItem, QGraphicsRectItem,
     QGraphicsPixmapItem, QGraphicsItem, QStyle, QApplication, QDialog
 )
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QFontMetrics
+from PyQt6.QtCore import QBuffer, QIODevice
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QUrl, QPointF, QPoint, QRectF, QTimer, QSize, QFileSystemWatcher
 from PyQt6.QtGui import QCursor, QTextCursor, QFont, QPixmap, QPen, QBrush, QColor, QPainter
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -1400,12 +1401,82 @@ _DEFAULT_THUMB_PROMPT = (
 )
 
 
+class ThumbnailPositionPreview(QLabel):
+    """Click/drag inside the displayed image to place the badge center."""
+    positionChanged = pyqtSignal(float, float)
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._source_pixmap = None
+        self._dragging_badge = False
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("Bấm hoặc giữ chuột kéo trên ảnh để đặt chữ. Vị trí áp dụng cho mọi phần.")
+
+    def setPixmap(self, pixmap):
+        self._source_pixmap = QPixmap(pixmap)
+        self._fit_image()
+
+    def clear(self):
+        self._source_pixmap = None
+        super().clear()
+
+    def _fit_image(self):
+        if self._source_pixmap is not None and not self._source_pixmap.isNull():
+            super().setPixmap(self._source_pixmap.scaled(
+                max(1, self.contentsRect().width()), max(1, self.contentsRect().height()),
+                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_image()
+
+    def _place_badge(self, event, clamp=False):
+        pix = self.pixmap()
+        if pix is None or pix.isNull() or self._source_pixmap is None:
+            return False
+        rect = self.contentsRect()
+        w = pix.width() / pix.devicePixelRatio()
+        h = pix.height() / pix.devicePixelRatio()
+        left, top = rect.x() + (rect.width()-w)/2, rect.y() + (rect.height()-h)/2
+        x, y = (event.position().x()-left)/w, (event.position().y()-top)/h
+        if not clamp and not (0 <= x <= 1 and 0 <= y <= 1):
+            return False
+        self.positionChanged.emit(max(0.0, min(1.0, x)), max(0.0, min(1.0, y)))
+        return True
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._place_badge(event):
+            self._dragging_badge = True
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging_badge:
+            self._place_badge(event, clamp=True)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._dragging_badge:
+            self._place_badge(event, clamp=True)
+            self._dragging_badge = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
 class MergeRenderedThread(QThread):
     log = pyqtSignal(str)
     done = pyqtSignal(bool, str)
 
-    def __init__(self, file_list, out_file, intro_image=None):
+    def __init__(self, file_list, out_file, intro_image=None, allow_single=False, part_badge=None):
         super().__init__()
+        self.part_badge = part_badge
+        self.allow_single = allow_single
         self.file_list = file_list
         self.out_file = out_file
         self.intro_image = intro_image
@@ -1469,6 +1540,10 @@ class MergeRenderedThread(QThread):
             from PIL import Image
             im = Image.open(self.intro_image).convert("RGB")
             tw, th = 1280, 720
+            # Thumbnail theo phần giữ khổ ảnh gốc, kể cả ảnh dọc Reels.
+            if self.part_badge:
+                ratio = min(1.0, 1920.0 / max(im.size))
+                tw, th = max(1, round(im.width * ratio)), max(1, round(im.height * ratio))
             # Phủ kín khung 16:9 (cover), cắt phần thừa — không để viền đen
             src_ratio = im.width / im.height
             dst_ratio = tw / th
@@ -1486,7 +1561,54 @@ class MergeRenderedThread(QThread):
             left = (new_w - tw) // 2
             top = (new_h - th) // 2
             im = im.crop((left, top, left + tw, top + th))
-            out_jpg = os.path.join(tempfile.gettempdir(), f"yt_thumb_{int(time.time())}.jpg")
+            if self.part_badge:
+                from PIL import ImageDraw, ImageFont
+                label = self.part_badge["label"]
+                size = max(12, int(tw * max(4, min(20, self.part_badge.get("size", 10.5))) / 100))
+                styles = {
+                    "Vàng viền xanh": ("#FFEB35", "#0064D2", None),
+                    "Trắng viền đen": ("#FFFFFF", "#101010", None),
+                    "Trắng nền đỏ": ("#FFFFFF", "#8E1220", "#D91F36"),
+                    "Vàng nền xanh": ("#FFEB35", "#061727", "#123A64"),
+                }
+                fill, outline, background = styles.get(self.part_badge.get("style"), styles["Vàng nền xanh"])
+                candidates = [os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "arialbd.ttf"),
+                              "DejaVuSans-Bold.ttf"]
+                font = None
+                for candidate in candidates:
+                    try:
+                        font = ImageFont.truetype(candidate, size)
+                        break
+                    except OSError:
+                        pass
+                if font is None:
+                    raise RuntimeError("Không tìm thấy font Unicode để ghi số phần")
+                draw = ImageDraw.Draw(im)
+                stroke = max(1, int(size * .055))
+                box = draw.textbbox((0, 0), label, font=font, stroke_width=stroke)
+                while box[2] - box[0] > tw * .88 and size > 8:
+                    size -= 1
+                    font = ImageFont.truetype(font.path, size)
+                    box = draw.textbbox((0, 0), label, font=font, stroke_width=stroke)
+                bw, bh = box[2] - box[0], box[3] - box[1]
+                margin = max(2, int(tw * .035))
+                position = self.part_badge.get("position", "Giữa ảnh")
+                y = margin if position == "Trên ảnh" else (th - bh - margin if position == "Dưới ảnh" else int(th * .55))
+                y = max(0, min(y, th - bh))
+                x = max(0, (tw - bw) // 2)
+                if self.part_badge.get("position") == "Tự do":
+                    cx = max(0.0, min(1.0, float(self.part_badge.get("x", .5))))
+                    cy = max(0.0, min(1.0, float(self.part_badge.get("y", .55))))
+                    x = max(0, min(int(cx * tw - bw / 2), tw - bw))
+                    y = max(0, min(int(cy * th - bh / 2), th - bh))
+                if background:
+                    draw.rounded_rectangle((max(0, x-margin//2), max(0, y-margin//3),
+                                            min(tw-1, x+bw+margin//2), min(th-1, y+bh+margin//3)),
+                                           radius=max(1, margin//3), fill=background)
+                draw.text((x-box[0], y-box[1]), label, font=font, fill=fill,
+                          stroke_width=stroke, stroke_fill=outline)
+            fd, out_jpg = tempfile.mkstemp(prefix="boom_thumb_", suffix=".jpg")
+            os.close(fd)
             im.save(out_jpg, "JPEG", quality=92)
             return out_jpg
         except Exception as e:
@@ -1546,7 +1668,7 @@ class MergeRenderedThread(QThread):
         import tempfile, time, subprocess
 
         files = [p for p in (self.file_list or []) if p and os.path.exists(p)]
-        if len(files) < 2:
+        if len(files) < (1 if self.allow_single else 2):
             self.log.emit("❌ Không đủ ít nhất 2 file hợp lệ để gộp.\n")
             self.done.emit(False, "")
             return
@@ -1898,6 +2020,16 @@ class SingleRenderThread(QThread):
 
         logo_en = self.cfg.get("logo_en")
         logo_path = self.cfg.get("logo_path")
+        temp_watermark = ""
+        if logo_en and self.cfg.get("watermark_kind") == "Tên kênh":
+            logo_path = None
+            png = self.cfg.get("watermark_png")
+            if png:
+                with tempfile.NamedTemporaryFile(suffix=".png", prefix="boom_watermark_", delete=False) as f:
+                    temp_watermark = f.name
+                    f.write(png)
+                logo_path = temp_watermark
+        logo_opacity = max(0.0, min(1.0, float(self.cfg.get("logo_opacity", 1.0))))
         if logo_en and not logo_path:
             self.log.emit("⚠️ Logo đang BẬT nhưng chưa chọn file ảnh -> bỏ qua logo.\n")
         elif logo_en and logo_path and not os.path.exists(logo_path):
@@ -1909,14 +2041,29 @@ class SingleRenderThread(QThread):
                 inputs.extend(["-loop", "1", "-i", logo_path])
                 lx, ly = int(self.cfg["logo_x"]), int(self.cfg["logo_y"]); logo_scale = self.cfg.get("logo_scale", 1.0)
                 if abs(logo_scale - 1.0) > 0.01: 
-                    filter_chains.append(f"[{logo_idx}:v] format=yuva420p,scale=iw*{logo_scale:.3f}:ih*{logo_scale:.3f} [logo_s]")
+                    filter_chains.append(f"[{logo_idx}:v] format=rgba,scale=iw*{logo_scale:.3f}:ih*{logo_scale:.3f},colorchannelmixer=aa={logo_opacity:.3f} [logo_s]")
                 else:
-                    filter_chains.append(f"[{logo_idx}:v] format=yuva420p [logo_s]")
+                    filter_chains.append(f"[{logo_idx}:v] format=rgba,colorchannelmixer=aa={logo_opacity:.3f} [logo_s]")
                 filter_chains.append(f"{last_vid_out}[logo_s] overlay=x={lx}:y={ly}:shortest=1 [v_logo]")
                 last_vid_out = "[v_logo]"
                 self.log.emit(f"   🖼️ Đã chèn logo tại x={lx}, y={ly}, scale={logo_scale:.3f}\n")
             except Exception as e:
                 self.log.emit(f"⚠️ Lỗi chèn logo vào filter chain, bỏ qua logo: {e}\n")
+
+        temp_name_watermark = ""
+        if logo_en and self.cfg.get("watermark_kind") == "Ảnh logo + Tên kênh" and self.cfg.get("watermark_png"):
+            with tempfile.NamedTemporaryFile(suffix=".png", prefix="boom_name_watermark_", delete=False) as f:
+                temp_name_watermark = f.name
+                f.write(self.cfg["watermark_png"])
+            name_idx = inputs.count("-i")
+            inputs.extend(["-loop", "1", "-i", temp_name_watermark])
+            ns = max(.01, float(self.cfg.get("watermark_name_scale", 1.0)))
+            na = max(0.0, min(1.0, float(self.cfg.get("watermark_name_opacity", .25))))
+            nx, ny = int(self.cfg["watermark_name_x"]), int(self.cfg["watermark_name_y"])
+            filter_chains.append(f"[{name_idx}:v]format=rgba,scale=iw*{ns:.3f}:ih*{ns:.3f},colorchannelmixer=aa={na:.3f}[name_s]")
+            filter_chains.append(f"{last_vid_out}[name_s]overlay=x={nx}:y={ny}:shortest=1[v_name]")
+            last_vid_out = "[v_name]"
+            self.log.emit(f"   🏷️ Đã chèn tên kênh tại x={nx}, y={ny}, scale={ns:.3f}\n")
 
         if escaped_srt and self.cfg.get("hardsub_en", True): 
             filter_chains.append(f"{last_vid_out} subtitles='{escaped_srt}':force_style='{style}' [vout]")
@@ -2161,7 +2308,7 @@ class SingleRenderThread(QThread):
         except Exception as e:
             self.log.emit(f"❌ Lỗi: {e}\n"); self.done.emit(False)
         finally:
-            for tmp in [temp_filter, temp_srt]:
+            for tmp in [temp_filter, temp_srt, temp_watermark, temp_name_watermark]:
                 try:
                     if tmp and os.path.exists(tmp): os.remove(tmp)
                 except Exception: pass
@@ -3139,8 +3286,36 @@ class RenderWidget(QWidget):
 
         # --- LOGO ---
         logo_lay = QVBoxLayout(self.tab_logo); logo_lay.setContentsMargins(9,9,9,9); logo_lay.setSpacing(7)
-        self.chk_logo = QCheckBox("Bật Logo / Tiêu đề"); self.chk_logo.setChecked(self.settings.value("bp_logo_en", False, type=bool))
+        self.chk_logo = QCheckBox("Bật Logo / Watermark mờ"); self.chk_logo.setChecked(self.settings.value("bp_logo_en", False, type=bool))
         logo_lay.addWidget(self.chk_logo)
+        self.cmb_watermark_kind = QComboBox()
+        self.cmb_watermark_kind.addItems(["Ảnh logo", "Tên kênh", "Ảnh logo + Tên kênh"])
+        self.cmb_watermark_kind.setCurrentText(str(self.settings.value("watermark_kind", "Ảnh logo")))
+        logo_lay.addWidget(self.cmb_watermark_kind)
+        self.watermark_text = QLineEdit(str(self.settings.value("watermark_text", "")))
+        self.watermark_text.setPlaceholderText("Nhập tên kênh, ví dụ @BOOMFILM")
+        self.watermark_text.setMaxLength(200)
+        logo_lay.addWidget(self.watermark_text)
+        wm_row = QHBoxLayout()
+        self.lbl_watermark_opacity = QLabel("Độ trong suốt:")
+        wm_row.addWidget(self.lbl_watermark_opacity)
+        self.spn_watermark_transparency = QSpinBox()
+        self.spn_watermark_transparency.setRange(0, 100)
+        self.spn_watermark_transparency.setSuffix(" %")
+        self.spn_watermark_transparency.setValue(int(self.settings.value("watermark_transparency", 75)))
+        wm_row.addWidget(self.spn_watermark_transparency)
+        logo_lay.addLayout(wm_row)
+        name_row = QHBoxLayout()
+        self.lbl_name_transparency = QLabel("Trong suốt tên kênh:")
+        self.spn_name_transparency = QSpinBox()
+        self.spn_name_transparency.setRange(0, 100)
+        self.spn_name_transparency.setSuffix(" %")
+        self.spn_name_transparency.setValue(int(self.settings.value("watermark_name_transparency", 75)))
+        name_row.addWidget(self.lbl_name_transparency)
+        name_row.addWidget(self.spn_name_transparency)
+        logo_lay.addLayout(name_row)
+        logo_lay.addWidget(QLabel("0%: rõ hoàn toàn · 100%: vô hình", styleSheet="color:#6F8DB4; font-size:8px;"))
+
         lgrow = QHBoxLayout(); self.logo_input = QLineEdit(self.settings.value("logo_path", "")); self.logo_input.setPlaceholderText("Chọn ảnh logo PNG...")
         bg2 = QPushButton("Chọn"); bg2.setFixedWidth(58); bg2.clicked.connect(self._select_logo)
         lgrow.addWidget(self.logo_input,1); lgrow.addWidget(bg2); logo_lay.addLayout(lgrow)
@@ -3149,6 +3324,15 @@ class RenderWidget(QWidget):
         self.logo_input.textChanged.connect(lambda: self._update_logo_preview())
         self.chk_logo.stateChanged.connect(lambda: setattr(self, "_design_locked", None))
         self.logo_input.textChanged.connect(lambda: setattr(self, "_design_locked", None))
+        self.cmb_watermark_kind.currentTextChanged.connect(self._watermark_changed)
+        self.watermark_text.textChanged.connect(self._watermark_changed)
+        self.spn_watermark_transparency.valueChanged.connect(self._watermark_changed)
+        self.spn_name_transparency.valueChanged.connect(self._watermark_changed)
+        both = self.cmb_watermark_kind.currentText() == "Ảnh logo + Tên kênh"
+        self.watermark_text.setVisible(self.cmb_watermark_kind.currentText() != "Ảnh logo")
+        self.lbl_watermark_opacity.setText("Trong suốt ảnh logo:" if both else "Độ trong suốt:")
+        self.lbl_name_transparency.setVisible(both)
+        self.spn_name_transparency.setVisible(both)
         logo_lay.addStretch()
 
         # --- CHE CHỮ / VÙNG MỜ ---
@@ -3237,11 +3421,23 @@ class RenderWidget(QWidget):
             "QFrame { background:#171A1E; border:1px solid #2F353C; border-radius:5px; }")
         ec = QVBoxLayout(export_cfg); ec.setContentsMargins(7, 5, 7, 5); ec.setSpacing(4)
         merge_row = QHBoxLayout()
-        self.chk_merge_all = QCheckBox("Gộp trọn bộ sau Xuất")
-        self.chk_merge_all.setChecked(self.settings.value("merge_after_render", False, type=bool))
-        self.chk_merge_all.setStyleSheet("color:#70D6A2; font-weight:700; font-size:9px;")
-        self.chk_merge_all.stateChanged.connect(lambda: self.settings.setValue("merge_after_render", self.chk_merge_all.isChecked()))
-        merge_row.addWidget(self.chk_merge_all); merge_row.addStretch()
+        merge_row.addWidget(QLabel("Chế độ xuất"))
+        self.cmb_merge_mode = QComboBox()
+        self.cmb_merge_mode.addItems(["Tập lẻ", "Gộp trọn bộ", "Theo phần"])
+        old_merge = self.settings.value("merge_after_render", False, type=bool)
+        mode = str(self.settings.value("render_merge_mode", "Gộp trọn bộ" if old_merge else "Tập lẻ"))
+        self.cmb_merge_mode.setCurrentIndex(max(0, self.cmb_merge_mode.findText(mode)))
+        merge_row.addWidget(self.cmb_merge_mode)
+        merge_row.addStretch()
+        self.lbl_merge_parts = QLabel("Số tập / phần")
+        self.spn_merge_parts = QSpinBox()
+        self.spn_merge_parts.setRange(1, 9999)
+        self.spn_merge_parts.setValue(int(self.settings.value("render_merge_parts", 20)))
+        self.spn_merge_parts.valueChanged.connect(lambda v: self.settings.setValue("render_merge_parts", v))
+        merge_row.addWidget(self.lbl_merge_parts)
+        merge_row.addWidget(self.spn_merge_parts)
+        self.cmb_merge_mode.currentTextChanged.connect(self._update_merge_mode)
+        self._update_merge_mode(self.cmb_merge_mode.currentText())
         ec.addLayout(merge_row)
 
         rp_row = QHBoxLayout(); rp_row.setSpacing(5)
@@ -3421,6 +3617,70 @@ class RenderWidget(QWidget):
         r_orient.addWidget(self.chk_portrait)
         r_orient.addStretch()
         v.addLayout(r_orient)
+        self.chk_part_thumbnail = QCheckBox("Tự ghi số phần lên thumbnail khi gộp Theo phần")
+        self.chk_part_thumbnail.setChecked(self.settings.value("part_thumbnail", True, type=bool))
+        self.chk_part_thumbnail.toggled.connect(lambda value: self.settings.setValue("part_thumbnail", value))
+        v.addWidget(self.chk_part_thumbnail)
+        badge_row = QHBoxLayout()
+        self.cmb_part_caption = QComboBox()
+        self.cmb_part_caption.addItems(["PHẦN", "TẬP"])
+        self.cmb_part_caption.setCurrentText(str(self.settings.value("part_thumbnail_caption", "PHẦN")))
+        self.cmb_part_caption.currentTextChanged.connect(lambda value: self.settings.setValue("part_thumbnail_caption", value))
+        self.cmb_part_badge_position = QComboBox()
+        self.cmb_part_badge_position.addItems(["Trên ảnh", "Giữa ảnh", "Dưới ảnh", "Tự do"])
+        self.cmb_part_badge_position.setCurrentText(str(self.settings.value("part_thumbnail_position", "Giữa ảnh")))
+        self.cmb_part_badge_position.currentTextChanged.connect(lambda value: self.settings.setValue("part_thumbnail_position", value))
+        badge_row.addWidget(self.cmb_part_caption)
+        badge_row.addWidget(self.cmb_part_badge_position)
+        v.addLayout(badge_row)
+        self.cmb_part_style = QComboBox()
+        self.cmb_part_style.addItems(["Vàng viền xanh", "Trắng viền đen", "Trắng nền đỏ", "Vàng nền xanh"])
+        self.cmb_part_style.setCurrentText(str(self.settings.value("part_thumbnail_style", "Vàng viền xanh")))
+        v.addWidget(self.cmb_part_style)
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Cỡ chữ (% rộng ảnh):"))
+        self.spn_part_size = QDoubleSpinBox()
+        self.spn_part_size.setRange(4, 20)
+        self.spn_part_size.setSingleStep(.5)
+        self.spn_part_size.setValue(float(self.settings.value("part_thumbnail_size", 10.5)))
+        size_row.addWidget(self.spn_part_size)
+        v.addLayout(size_row)
+        preview_row = QHBoxLayout()
+        preview_row.addWidget(QLabel("Xem phần:"))
+        self.spn_part_preview = QSpinBox()
+        self.spn_part_preview.setRange(1, 9999)
+        preview_row.addWidget(self.spn_part_preview)
+        self.btn_part_preview = QPushButton("Xem trước / Tính số phần")
+        preview_row.addWidget(self.btn_part_preview)
+        v.addLayout(preview_row)
+        self.lbl_part_count = QLabel("Số phần = số tập đã chọn chia số tập/phần, làm tròn lên.")
+        self.lbl_part_count.setWordWrap(True)
+        v.addWidget(self.lbl_part_count)
+        self._part_badge_x = float(self.settings.value("part_thumbnail_x", .5))
+        self._part_badge_y = float(self.settings.value("part_thumbnail_y", .55))
+        self.lbl_part_preview = ThumbnailPositionPreview("Chọn ảnh trong Cover rồi bấm Xem trước")
+        self.lbl_part_preview.positionChanged.connect(self._move_part_thumbnail_badge)
+        self.lbl_part_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_part_preview.setFixedHeight(300)
+        self.lbl_part_preview.setMinimumWidth(0)
+        self.lbl_part_preview.setWordWrap(True)
+        self.lbl_part_preview.setStyleSheet("background:#10141D; border:1px solid #394457;")
+        v.addWidget(self.lbl_part_preview)
+        drag_hint = QLabel("Giữ chuột kéo trên ảnh để đặt chữ tự do. Chỉ cần một ảnh gốc; tool tự đổi số cho mọi phần.")
+        drag_hint.setWordWrap(True)
+        v.addWidget(drag_hint)
+        self._part_preview_timer = QTimer(self)
+        self._part_preview_timer.setSingleShot(True)
+        self._part_preview_timer.timeout.connect(self._refresh_part_thumbnail_preview)
+        for widget in (self.cmb_part_style, self.cmb_part_caption, self.cmb_part_badge_position):
+            widget.currentTextChanged.connect(lambda *_: self._part_preview_timer.start(200))
+        self.spn_part_size.valueChanged.connect(lambda *_: self._part_preview_timer.start(200))
+        self.spn_part_preview.valueChanged.connect(lambda *_: self._part_preview_timer.start(200))
+        self.intro_input.textChanged.connect(lambda *_: self._part_preview_timer.start(200))
+        self.btn_part_preview.clicked.connect(self._refresh_part_thumbnail_preview)
+        hint = QLabel("Dùng ảnh đã chọn làm Cover. Mỗi phần xuất một ảnh riêng cạnh video.\nẢnh gốc nên chưa có số phần; số tự tăng 1, 2, 3…")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
 
         self.thumb_result_row = QHBoxLayout()
         self.thumb_result_row.addStretch()
@@ -3454,6 +3714,58 @@ class RenderWidget(QWidget):
             self._thumb_srt_path = f
             self.lbl_thumb_srt.setText(os.path.basename(f))
             self.lbl_thumb_srt.setStyleSheet("color:#10B981; font-size:10px; border:none;")
+
+    def _move_part_thumbnail_badge(self, x, y):
+        self._part_badge_x, self._part_badge_y = x, y
+        self.cmb_part_badge_position.setCurrentText("Tự do")
+        self.settings.setValue("part_thumbnail_x", x)
+        self.settings.setValue("part_thumbnail_y", y)
+        # Không restart timer trên mỗi mouseMove để preview vẫn cập nhật khi kéo liên tục.
+        if not self._part_preview_timer.isActive():
+            self._part_preview_timer.start(40)
+
+    def _part_thumbnail_options(self):
+        options = {"caption": self.cmb_part_caption.currentText(),
+                   "position": self.cmb_part_badge_position.currentText(),
+                   "style": self.cmb_part_style.currentText(), "size": self.spn_part_size.value(),
+                   "x": self._part_badge_x, "y": self._part_badge_y}
+        self.settings.setValue("part_thumbnail_style", options["style"])
+        self.settings.setValue("part_thumbnail_size", options["size"])
+        return options
+
+    def _refresh_part_thumbnail_preview(self):
+        options = self._part_thumbnail_options()
+        count = len(self._selected_cards())
+        per_part = self.spn_merge_parts.value() if hasattr(self, "spn_merge_parts") else 20
+        total = (count + per_part - 1) // per_part
+        self.spn_part_preview.blockSignals(True)
+        self.spn_part_preview.setMaximum(max(1, total))
+        self.spn_part_preview.blockSignals(False)
+        number = self.spn_part_preview.value()
+        self.lbl_part_count.setText(
+            f"Dự kiến: {count} tập / {per_part} tập mỗi phần → {total} phần. "
+            "Chỉ áp dụng khi xuất Theo phần; có tập render lỗi sẽ không tự gộp.")
+        path = self.intro_input.text().strip()
+        if not os.path.isfile(path):
+            self.lbl_part_preview.clear()
+            self.lbl_part_preview.setText("Chọn ảnh bìa tại tab Cover để xem trước mẫu chữ.")
+            return
+        badge = dict(options, label=f"{options['caption']} {number}")
+        # Dùng đúng hàm tạo ảnh khi xuất để preview và kết quả thống nhất.
+        worker = MergeRenderedThread([], "", path, part_badge=badge)
+        errors = []
+        worker.log.connect(errors.append)
+        preview = worker._prepare_thumbnail()
+        if not preview:
+            self.lbl_part_preview.clear()
+            self.lbl_part_preview.setText("Không tạo được ảnh xem trước. " + " ".join(errors))
+            return
+        try:
+            pix = QPixmap(preview)
+            self.lbl_part_preview.setPixmap(pix)
+        finally:
+            try: os.remove(preview)
+            except OSError: pass
 
     def _start_thumbnail(self):
         if getattr(self, "_thumb_thread", None) and self._thumb_thread.isRunning():
@@ -4058,7 +4370,7 @@ class RenderWidget(QWidget):
         for v in videos:
             stem = os.path.splitext(v)[0]
             low = stem.lower()
-            if low.endswith("_tronbo_rendered"):
+            if low.endswith("_tronbo_rendered") or re.search(r"_phan_\d+_tap_\d+-\d+$", low):
                 continue
             if low.endswith("_dubbed"):
                 base = stem[:-len("_dubbed")]
@@ -4655,6 +4967,10 @@ class RenderWidget(QWidget):
             try: self.scene.removeItem(self.sample_sub)
             except Exception: pass
             self.sample_sub = None
+        if getattr(self, "name_watermark_item", None) is not None:
+            try: self.scene.removeItem(self.name_watermark_item)
+            except Exception: pass
+            self.name_watermark_item = None
         if getattr(self, "logo_item", None) is not None:
             try: self.scene.removeItem(self.logo_item)
             except Exception: pass
@@ -4682,6 +4998,11 @@ class RenderWidget(QWidget):
             self.frame_input.setText(d.get("frame_path", "") or "")
             self.chk_logo.setChecked(bool(d.get("bp_logo_en", False)))
             self.logo_input.setText(d.get("logo_path", "") or "")
+            self.cmb_watermark_kind.setCurrentText(d.get("watermark_kind", "Ảnh logo"))
+            self.watermark_text.setText(d.get("watermark_text", ""))
+            # Thiết kế cũ chưa có độ trong suốt: giữ nguyên logo rõ như trước.
+            self.spn_watermark_transparency.setValue(int(d.get("watermark_transparency", 0)))
+            self.spn_name_transparency.setValue(int(d.get("watermark_name_transparency", 75)))
             self.chk_flip.setChecked(bool(d.get("bp_flip", False)))
             self.chk_zoom.setChecked(bool(d.get("bp_zoom", False)))
             self.chk_color.setChecked(bool(d.get("bp_color", False)))
@@ -4730,6 +5051,11 @@ class RenderWidget(QWidget):
                                       float(lp.get("item_y", lp.get("y", H*.05))) * sy)
                 self.logo_item.setScale(float(lp.get("scale", 1.0)) * min(sx, sy))
             except Exception: pass
+        np = d.get("watermark_name_pos")
+        if np and getattr(self, "name_watermark_item", None) is not None:
+            self.name_watermark_item.setPos(float(np.get("item_x", np.get("x", W*.05))) * sx,
+                                            float(np.get("item_y", np.get("y", H*.15))) * sy)
+            self.name_watermark_item.setScale(float(np.get("scale", 1.0)) * min(sx, sy))
         try: self.preview.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         except Exception: pass
 
@@ -4837,10 +5163,41 @@ class RenderWidget(QWidget):
         except Exception:
             pass
             
+    def _watermark_changed(self, *_):
+        both = self.cmb_watermark_kind.currentText() == "Ảnh logo + Tên kênh"
+        self.watermark_text.setVisible(self.cmb_watermark_kind.currentText() != "Ảnh logo")
+        self.lbl_watermark_opacity.setText("Trong suốt ảnh logo:" if both else "Độ trong suốt:")
+        self.lbl_name_transparency.setVisible(both)
+        self.spn_name_transparency.setVisible(both)
+        if getattr(self, "_loading_card_design", False):
+            return
+        self._design_locked = None
+        self._update_logo_preview()
+
+    @staticmethod
+    def _watermark_pixmap(text):
+        # Cùng một ảnh chữ cho preview và FFmpeg: hỗ trợ tiếng Việt và ký tự đặc biệt.
+        font = QFont("Arial")
+        font.setPixelSize(64)
+        font.setBold(True)
+        bounds = QFontMetrics(font).boundingRect(text)
+        pix = QPixmap(max(1, bounds.width() + 16), max(1, bounds.height() + 16))
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setFont(font)
+        painter.setPen(QColor("white"))
+        painter.drawText(8 - bounds.left(), 8 - bounds.top(), text)
+        painter.end()
+        return pix
+
     def _update_logo_preview(self):
         """Khởi tạo và hiển thị ảnh Logo lên màn hình Preview"""
+        self._update_name_watermark_preview()
         path = self.logo_input.text().strip()
-        if not self.chk_logo.isChecked() or not os.path.exists(path):
+        is_text = self.cmb_watermark_kind.currentText() == "Tên kênh"
+        text = self.watermark_text.text().strip()
+        if not self.chk_logo.isChecked() or (not text if is_text else not os.path.isfile(path)):
             if getattr(self, 'logo_item', None):
                 self.scene.removeItem(self.logo_item)
                 self.logo_item = None
@@ -4857,9 +5214,28 @@ class RenderWidget(QWidget):
             H = scene_rect.height() or 1920
             self.logo_item.setPos(W * 0.05, H * 0.05)
 
-        pixmap = QPixmap(path)
-        if not pixmap.isNull():
-            self.logo_item.setPixmap(pixmap)
+        pixmap = self._watermark_pixmap(text) if is_text else QPixmap(path)
+        self.logo_item.setPixmap(pixmap)
+        self.logo_item.setOpacity(1.0 - self.spn_watermark_transparency.value() / 100.0)
+
+    def _update_name_watermark_preview(self):
+        text = self.watermark_text.text().strip()
+        enabled = self.chk_logo.isChecked() and self.cmb_watermark_kind.currentText() == "Ảnh logo + Tên kênh" and bool(text)
+        item = getattr(self, "name_watermark_item", None)
+        if not enabled:
+            if item is not None:
+                self.scene.removeItem(item)
+                self.name_watermark_item = None
+            return
+        if item is None:
+            item = ScalablePixmapItem()
+            item.setZValue(7)
+            self.scene.addItem(item)
+            rect = self.scene.sceneRect()
+            item.setPos((rect.width() or 1080) * .05, (rect.height() or 1920) * .15)
+            self.name_watermark_item = item
+        item.setPixmap(self._watermark_pixmap(text))
+        item.setOpacity(1.0 - self.spn_name_transparency.value() / 100.0)
 
     def _clear_blur_boxes(self):
         for b in self.blur_boxes:
@@ -4897,6 +5273,13 @@ class RenderWidget(QWidget):
                 "x": lr.x(), "y": lr.y(), "scale": self.logo_item.scale(),
                 "item_x": self.logo_item.pos().x(), "item_y": self.logo_item.pos().y()
             }
+
+        name_pos = None
+        item = getattr(self, "name_watermark_item", None)
+        if item is not None:
+            rect = item.sceneBoundingRect()
+            name_pos = {"x": rect.x(), "y": rect.y(), "scale": item.scale(),
+                        "item_x": item.pos().x(), "item_y": item.pos().y()}
 
         # Đọc VỊ TRÍ + CỠ chữ mẫu (nếu người dùng đã kéo canh) để render sub
         # đúng chỗ + đúng cỡ. Quy ước theo hệ toạ độ scene = kích thước video.
@@ -4938,6 +5321,10 @@ class RenderWidget(QWidget):
             self.settings.setValue("subbox_opacity", opac)
             self.settings.setValue("bp_logo_en", self.chk_logo.isChecked())
             self.settings.setValue("logo_path", self.logo_input.text().strip())
+            self.settings.setValue("watermark_kind", self.cmb_watermark_kind.currentText())
+            self.settings.setValue("watermark_text", self.watermark_text.text())
+            self.settings.setValue("watermark_name_transparency", self.spn_name_transparency.value())
+            self.settings.setValue("watermark_transparency", self.spn_watermark_transparency.value())
             # Overlay PNG cố ý KHÔNG lưu vào QSettings.
             # Nó chỉ thuộc design_config của card trong phiên hiện tại.
             self.settings.setValue("bp_blur_en", self.chk_blur.isChecked())
@@ -4954,6 +5341,11 @@ class RenderWidget(QWidget):
             "font_color_name": color_name,
             "sub_pos": sub_pos,
             "logo_pos": logo_pos,
+            "watermark_kind": self.cmb_watermark_kind.currentText(),
+            "watermark_text": self.watermark_text.text(),
+            "watermark_name_pos": name_pos,
+            "watermark_name_transparency": self.spn_name_transparency.value(),
+            "watermark_transparency": self.spn_watermark_transparency.value(),
             "SW": SW, "SH": SH,
             "subbox_en": subbox_en, "subbox_color": subbox_color,
             "subbox_color_name": self.cb_subbox_color.currentText(),
@@ -5023,7 +5415,29 @@ class RenderWidget(QWidget):
             lx = min(lx, max(0, W - 10))
             ly = min(ly, max(0, H - 10))
 
+        np = design.get("watermark_name_pos") or {}
+        nx = min(int(max(0, np.get("x", SW * .05) * sx)), max(0, W - 10))
+        ny = min(int(max(0, np.get("y", SH * .15) * sy)), max(0, H - 10))
+        nscale = float(np.get("scale", 1.0)) * sx
+        if nscale <= .01:
+            nscale = 1.0
+        watermark_png = None
+        if design.get("bp_logo_en") and design.get("watermark_kind") in ("Tên kênh", "Ảnh logo + Tên kênh"):
+            text = design.get("watermark_text", "").strip()
+            if text:
+                buffer = QBuffer()
+                buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+                if not self._watermark_pixmap(text).save(buffer, "PNG"):
+                    raise RuntimeError("Không thể tạo ảnh watermark tên kênh")
+                watermark_png = bytes(buffer.data())
+                buffer.close()
+
         return {
+            "watermark_kind": design.get("watermark_kind", "Ảnh logo"),
+            "watermark_png": watermark_png,
+            "watermark_name_x": nx, "watermark_name_y": ny, "watermark_name_scale": nscale,
+            "watermark_name_opacity": 1.0 - max(0, min(100, int(design.get("watermark_name_transparency", 75)))) / 100.0,
+            "logo_opacity": 1.0 - max(0, min(100, int(design.get("watermark_transparency", 0)))) / 100.0,
             "scene_w": int(W), "scene_h": int(H),
             "blur_en": design["bp_blur_en"], "blur_list": design["blur_list"],
             "frame_en": design["bp_frame_en"], "frame_path": design["frame_path"],
@@ -5163,7 +5577,7 @@ class RenderWidget(QWidget):
             for name in os.listdir(d):
                 low = name.lower()
                 # Giữ lại bản render cuối và bản gộp trọn bộ
-                if low.endswith(KEEP_SUFFIX):
+                if low.endswith(KEEP_SUFFIX) or re.search(r"_phan_\d+_tap_\d+-\d+\.mp4$", low):
                     continue
                 path = os.path.join(d, name)
                 if not os.path.isfile(path):
@@ -5216,6 +5630,12 @@ class RenderWidget(QWidget):
         self._focus_pipeline_stage(None)
         tab._run_full_pipeline()
 
+    def _update_merge_mode(self, mode):
+        self.lbl_merge_parts.setVisible(mode == "Theo phần")
+        self.spn_merge_parts.setVisible(mode == "Theo phần")
+        self.settings.setValue("render_merge_mode", mode)
+        self.settings.setValue("merge_after_render", mode != "Tập lẻ")
+
     def _start_render_all(self):
         if self._render_running:
             QMessageBox.information(self, "Đang render", "Đang render, vui lòng đợi xong.")
@@ -5230,14 +5650,14 @@ class RenderWidget(QWidget):
         # Chốt riêng card đang mở trước khi render.
         if self.selected_card is not None:
             self._save_design_to_card(self.selected_card)
-        # Chỉ ép resolution đồng nhất KHI có tích 'Gộp trọn bộ sau Render' — vì
+        # Chỉ ép resolution đồng nhất KHI chọn Gộp trọn bộ hoặc Theo phần — vì
         # chỉ lúc gộp mới cần các tập cùng size. Không gộp thì giữ size gốc,
         # khỏi quét (đỡ khựng nút RENDER).
         self._target_res = None
-        if hasattr(self, "chk_merge_all") and self.chk_merge_all.isChecked():
+        if self.cmb_merge_mode.currentText() != "Tập lẻ":
             self._target_res = self._get_target_res()
             if self._target_res:
-                self._log(f"📐 Có gộp trọn bộ → ép mọi tập về {self._target_res[0]}×{self._target_res[1]} cho đồng nhất.")
+                self._log(f"📐 Có gộp sau xuất → ép mọi tập về {self._target_res[0]}×{self._target_res[1]} cho đồng nhất.")
         # Sắp lại theo SỐ tập để gộp trọn bộ đúng thứ tự 1 -> cuối
         # (phòng khi thêm file thủ công bằng '+ File' không theo thứ tự).
         self.cards.sort(key=lambda c: _natural_key(os.path.basename(c.video_path)))
@@ -5256,7 +5676,8 @@ class RenderWidget(QWidget):
         self.btn_stop.setEnabled(True)
         if hasattr(self, 'btn_merge_now'):
             self.btn_merge_now.setEnabled(False)
-        self.chk_merge_all.setEnabled(False)
+        self.cmb_merge_mode.setEnabled(False)
+        self.spn_merge_parts.setEnabled(False)
         if not getattr(self, "_total_active", False):
             self._big_set_percent(0)
             self._big_set_count(0, self._render_total)
@@ -5490,7 +5911,8 @@ class RenderWidget(QWidget):
         self.btn_stop.setEnabled(False)
         if hasattr(self, 'btn_merge_now'):
             self.btn_merge_now.setEnabled(True)
-        self.chk_merge_all.setEnabled(True)
+        self.cmb_merge_mode.setEnabled(True)
+        self.spn_merge_parts.setEnabled(True)
 
         if stopped:
             self.step_render.set_status("error", 0)
@@ -5512,7 +5934,9 @@ class RenderWidget(QWidget):
                     f"Có {len(failed)} tập render lỗi nên BOOM Studio không tự gộp trọn bộ.\n\n{names}{more}\n\nHãy render lại các tập lỗi rồi gộp."
                 )
                 return
-            if self.chk_merge_all.isChecked() and len(self._rendered_files) > 1:
+            if self.cmb_merge_mode.currentText() == "Theo phần" and self._rendered_files:
+                self._start_merge_parts(self._rendered_files)
+            elif self.cmb_merge_mode.currentText() == "Gộp trọn bộ" and len(self._rendered_files) > 1:
                 self._start_merge(self._rendered_files)
             else:
                 self.step_render.set_status("success", 100)
@@ -5553,6 +5977,91 @@ class RenderWidget(QWidget):
         # Khởi động tập kế cho đủ số song song (hoặc kết thúc nếu hết)
         self._pump_render_queue()
         
+    def _start_merge_parts(self, file_list):
+        files = sorted(file_list, key=lambda p: _natural_key(os.path.basename(p)))
+        if not files or any(not os.path.isfile(p) for p in files):
+            QMessageBox.warning(self, "Thiếu file", "Không gộp theo phần vì có file render bị thiếu.")
+            return
+        size = self.spn_merge_parts.value()
+        out_dir = os.path.dirname(files[0])
+        name = os.path.basename(out_dir) or "TronBo"
+        # Phạm vi là vị trí tập trong danh sách đã natural-sort (bắt đầu từ 1).
+        self._merge_parts_queue = [
+            (files[i:i + size], os.path.join(out_dir,
+             f"{name}_Phan_{i // size + 1:02d}_Tap_{i + 1:03d}-{min(i + size, len(files)):03d}.mp4"))
+            for i in range(0, len(files), size)
+        ]
+        self._log(f"📚 {len(files)} tập → {len(self._merge_parts_queue)} phần, tối đa {size} tập/phần.")
+        self._merge_parts_outputs = []
+        self._merge_parts_badge_options = None
+        if self.chk_part_thumbnail.isChecked():
+            self._merge_parts_badge_options = self._part_thumbnail_options()
+        self._merge_parts_intro = None
+        if self.chk_intro.isChecked() and self.intro_input.text().strip():
+            if os.path.exists(self.intro_input.text().strip()):
+                self._merge_parts_intro = self.intro_input.text().strip()
+            else:
+                self._log("⚠️ Không tìm thấy ảnh bìa, bỏ qua nhúng.")
+        if self._merge_parts_badge_options and not self._merge_parts_intro:
+            self._log("⚠️ Chưa bật/chọn Cover: các phần sẽ chưa có thumbnail đánh số. Chọn ảnh tại tab Cover trước khi gộp.")
+        self._merge_parts_active = True
+        self.btn_run.setEnabled(False)
+        self.btn_run.setText("⏳ ĐANG GỘP THEO PHẦN...")
+        if hasattr(self, 'btn_merge_now'):
+            self.btn_merge_now.setEnabled(False)
+        self.cmb_merge_mode.setEnabled(False)
+        self.spn_merge_parts.setEnabled(False)
+        self._start_next_merge_part()
+
+    def _start_next_merge_part(self):
+        files, out_path = self._merge_parts_queue.pop(0)
+        self._log(f"🔗 Đang gộp {os.path.basename(out_path)} ({len(files)} tập)...")
+        self._merge_part_result = (False, out_path)
+        badge = None
+        if self._merge_parts_badge_options:
+            number = len(self._merge_parts_outputs) + 1
+            badge = dict(self._merge_parts_badge_options,
+                         label=f"{self._merge_parts_badge_options['caption']} {number}")
+        self.merge_thread = MergeRenderedThread(files, out_path, self._merge_parts_intro,
+                                                allow_single=True, part_badge=badge)
+        self.merge_thread.log.connect(self._log)
+        self.merge_thread.done.connect(self._remember_merge_part_result)
+        # Chỉ thay reference và chạy phần sau khi worker cũ thực sự thoát.
+        self.merge_thread.finished.connect(self._on_merge_part_finished)
+        self.merge_thread.start()
+
+    def _remember_merge_part_result(self, ok, path):
+        self._merge_part_result = (ok, path)
+
+    def _on_merge_part_finished(self):
+        ok, path = self._merge_part_result
+        if ok:
+            self._merge_parts_outputs.append(path)
+            self._log(f"✅ Đã gộp: {os.path.basename(path)}")
+            if self._merge_parts_queue:
+                self._start_next_merge_part()
+                return
+        self._merge_parts_queue = []
+        self._merge_parts_active = False
+        self.btn_run.setEnabled(True)
+        if hasattr(self, 'btn_merge_now'):
+            self.btn_merge_now.setEnabled(True)
+        self.cmb_merge_mode.setEnabled(True)
+        self.spn_merge_parts.setEnabled(True)
+        self._update_run_label()
+        self.step_render.set_status("success" if ok else "error", 100)
+        if getattr(self, "_total_active", False):
+            if ok:
+                self._done_units = self._total_units
+                self._paint_total(self._total_units)
+            self.total_progress_end()
+        if ok:
+            QMessageBox.information(self, "Hoàn tất Theo phần",
+                "Đã gộp thành công:\n" + "\n".join(self._merge_parts_outputs))
+        else:
+            QMessageBox.warning(self, "Lỗi gộp theo phần",
+                "Đã dừng vì một phần gộp lỗi. Các phần đã hoàn tất được giữ lại. Hãy kiểm tra log.")
+
     def _start_merge(self, file_list):
         file_list = [p for p in (file_list or []) if p and os.path.exists(p)]
         if len(file_list) < 2:
