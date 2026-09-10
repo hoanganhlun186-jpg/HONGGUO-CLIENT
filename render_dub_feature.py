@@ -23,6 +23,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QSettings, QTimer, QThread, pyqtSignal
 
+from series_queue import QueueMessageBox as QMessageBox
+
 # ── Whisper STT ────
 try:
     from whisper_stt import WhisperSttThread, _HAS_FW as _WHISPER_AVAILABLE
@@ -500,6 +502,14 @@ class DubFeatureWidget(QWidget):
         row_tw.addWidget(self.spn_trans_workers)
         self.chk_show_browser = QCheckBox("👁 Hiện trình duyệt")
         row_tw.addWidget(self.chk_show_browser)
+        self.chk_address_consistency = QCheckBox("Ưu tiên đúng xưng hô (dịch tuần tự)")
+        self.chk_address_consistency.setChecked(self.settings.value("address_consistency", True, type=bool))
+        self.chk_address_consistency.setToolTip("Dịch lần lượt từng tập/đoạn, kèm thoại trước/sau và cập nhật bối cảnh. Chậm hơn chế độ song song.")
+        lay.addWidget(self.chk_address_consistency)
+        self.txt_address_notes = QLineEdit(str(self.settings.value("address_notes", "")))
+        self.txt_address_notes.setPlaceholderText("Quy ước: A gọi B là anh, xưng em; B gọi A là em, xưng anh…")
+        lay.addWidget(self.txt_address_notes)
+
         row_tw.addStretch()
         lay.addLayout(row_tw)
 
@@ -919,6 +929,8 @@ class DubFeatureWidget(QWidget):
             QMessageBox.warning(self, "Thất bại", f"Không thể tải mẫu thử:\n{msg}")
 
     def _log(self, msg):
+        sink = getattr(self.host, "_queue_log_sink", None)
+        if callable(sink): sink(msg)
         self.txt_log.append(msg)
         self.txt_log.verticalScrollBar().setValue(self.txt_log.verticalScrollBar().maximum())
 
@@ -948,7 +960,9 @@ class DubFeatureWidget(QWidget):
                         files.append(vp)
             if files:
                 return files
-        cards = getattr(self.host, "cards", []) or []
+        cards = getattr(self.host, "_batch_cards", None) if getattr(self.host, "_batch_managed", False) else None
+        if cards is None:
+            cards = getattr(self.host, "cards", []) or []
         for c in cards:
             vp = getattr(c, "video_path", None)
             if vp and os.path.exists(vp) and vp not in files:
@@ -963,6 +977,8 @@ class DubFeatureWidget(QWidget):
         s.setValue("trans_engine", self.cb_translate_engine.currentText())
         s.setValue("ds_key", self.txt_ds_key.text().strip())
         s.setValue("trans_workers", self.spn_trans_workers.value())
+        s.setValue("address_consistency", self.chk_address_consistency.isChecked())
+        s.setValue("address_notes", self.txt_address_notes.text())
         s.setValue("auto_dub", self.chk_auto_dub.isChecked())
         s.setValue("dub_voice", self.cmb_dub_voice.currentText())
         if hasattr(self, "cmb_target_lang"):
@@ -1393,6 +1409,8 @@ class DubFeatureWidget(QWidget):
                 self._stt_done_prev = done
 
     def _on_stt_finished(self, ok, failed):
+        if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
+            return
         self.bar_stt.setValue(100)
         self._log(f"✅ Tách sub xong: {ok} ok, {failed} lỗi.")
         self._set_buttons_enabled(True)
@@ -1450,6 +1468,8 @@ class DubFeatureWidget(QWidget):
         self._dub_running = False
 
         def _on_item_done(idx, video_path, vi_path):
+            if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
+                return
             self._total_step(1, stage="Dịch")
             if getattr(self, "_chain_dub_after_translate", False) and vi_path and os.path.exists(vi_path):
                 self._log(f"✅ Dịch xong {os.path.basename(video_path)} → xếp hàng lồng tiếng.")
@@ -1505,7 +1525,9 @@ class DubFeatureWidget(QWidget):
             self._gtrans_thread = GeminiTranslateThread(
                 queue, preset, "Auto (Mặc định)", 80,
                 translate_workers=workers, show_browser=show_browser,
-                target_lang=_tgt)
+                target_lang=_tgt,
+                address_consistency=self.chk_address_consistency.isChecked(),
+                address_notes=self.txt_address_notes.text())
 
         self._set_buttons_enabled(False)
         self._start_card_poll()
@@ -1517,6 +1539,8 @@ class DubFeatureWidget(QWidget):
         self._gtrans_thread.start()
 
     def _on_translate_all_done(self, *args):
+        if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
+            return
         self._log("✅ Dịch xong toàn bộ.")
         self._refresh_host_cards()
         if not getattr(self, "_chain_dub_after_translate", False):
@@ -1582,6 +1606,8 @@ class DubFeatureWidget(QWidget):
         self._pump_dub_queue()
 
     def _pump_dub_queue(self):
+        if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
+            return
         # Chạy nhiều tập SONG SONG: giữ tối đa N thread lồng cùng lúc.
         if not hasattr(self, "_dub_threads"):
             self._dub_threads = {}   # video_path -> thread
@@ -1759,6 +1785,8 @@ class DubFeatureWidget(QWidget):
         return None
 
     def _verify_before_render(self):
+        if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
+            return
         files = self._files_from_host()
         bad = []
         for vp in files:
@@ -1768,6 +1796,11 @@ class DubFeatureWidget(QWidget):
             if reason:
                 bad.append((vp, reason))
 
+        if getattr(self.host, "_batch_managed", False) and (self._skip_from_render or (bad and self._verify_round >= self._MAX_VERIFY_RETRY)):
+            self.host._batch_complete(False, "Dịch/lồng chưa đủ tập sau retry; không render/ghép thiếu tập")
+            self._stop_card_poll()
+            self._set_buttons_enabled(True)
+            return
         if not bad:
             self._verify_round = 0
             if getattr(self, "_fix_only_mode", False):
@@ -1913,6 +1946,8 @@ class DubFeatureWidget(QWidget):
                         pass
 
     def _start_render(self):
+        if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
+            return
         fn = getattr(self.host, "_start_render_all", None)
         if callable(fn):
             self._log("🎬 Bắt đầu render bằng cấu hình tab Thiết kế...")
@@ -1921,6 +1956,11 @@ class DubFeatureWidget(QWidget):
             self._log("❌ Không tìm thấy chức năng render của tab Thiết kế.")
 
     def _run_full_pipeline(self, all_series=False):
+        if getattr(self.host, "_batch_managed", False):
+            all_series = False
+            self.chk_auto_dub.setChecked(True)
+            self.chk_auto_render.setChecked(True)
+            self._fix_only_mode = False
         files = self._files_from_host(all_series=all_series)
         if not files:
             QMessageBox.warning(self, "Không có file", "Hàng đợi Render đang trống!")
@@ -2033,6 +2073,8 @@ class DubFeatureWidget(QWidget):
             self._full_start_translate_stage()
 
     def _full_start_translate_stage(self):
+        if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
+            return
         if self._auto_dub_on and self._dub_queue:
             self._pump_dub_queue()
 
@@ -2049,7 +2091,9 @@ class DubFeatureWidget(QWidget):
                     self._verify_before_render()
 
     def _refresh_host_cards(self):
-        cards = getattr(self.host, "cards", []) or []
+        cards = getattr(self.host, "_batch_cards", None) if getattr(self.host, "_batch_managed", False) else None
+        if cards is None:
+            cards = getattr(self.host, "cards", []) or []
         for c in cards:
             if hasattr(c, "refresh_srt_from_disk"):
                 try:

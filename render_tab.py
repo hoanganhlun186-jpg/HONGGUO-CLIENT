@@ -29,6 +29,8 @@ from PyQt6.QtGui import QCursor, QTextCursor, QFont, QPixmap, QPen, QBrush, QCol
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 
+from series_queue import QueueMessageBox as QMessageBox
+
 # Tiện ích dùng chung (ffmpeg path, codec, cờ ẩn cửa sổ). Ưu tiên lấy từ
 # shared_utils của app; nếu chạy lẻ không có thì tự fallback.
 try:
@@ -1476,6 +1478,7 @@ class MergeRenderedThread(QThread):
     def __init__(self, file_list, out_file, intro_image=None, allow_single=False, part_badge=None):
         super().__init__()
         self.part_badge = part_badge
+        self.thumbnail_error = ""
         self.allow_single = allow_single
         self.file_list = file_list
         self.out_file = out_file
@@ -1626,8 +1629,10 @@ class MergeRenderedThread(QThread):
             dst = f"{stem}_thumbnail.jpg"
             shutil.copyfile(thumb_jpg, dst)
             self.log.emit(f"🖼️ Đã xuất thumbnail để up YouTube: {os.path.basename(dst)}\n")
+            return True
         except Exception as e:
             self.log.emit(f"   ⚠️ Không xuất được file thumbnail: {e}\n")
+            return False
 
     def _embed_cover_mp4(self, ffmpeg, video_in, thumb_jpg, si):
         """Nhúng thumbnail vào metadata tag 'covr' của MP4 (copy stream, rất nhanh).
@@ -1763,10 +1768,15 @@ class MergeRenderedThread(QThread):
             self.log.emit(f"✅ Gộp trọn bộ thành công ({mode}): {os.path.basename(self.out_file)}\n")
             thumb_jpg = self._prepare_thumbnail()
             if thumb_jpg:
-                self._embed_cover_mp4(ffmpeg, self.out_file, thumb_jpg, si)
-                self._export_thumbnail_beside_video(thumb_jpg)
+                embedded = self._embed_cover_mp4(ffmpeg, self.out_file, thumb_jpg, si)
+                exported = self._export_thumbnail_beside_video(thumb_jpg)
+                if not embedded or not exported:
+                    self.thumbnail_error = "Video đã ghép; " + ("nhúng Cover lỗi. " if not embedded else "") + ("lưu JPG lỗi." if not exported else "")
                 try: os.remove(thumb_jpg)
                 except Exception: pass
+            elif self.intro_image:
+                self.thumbnail_error = "Video đã ghép nhưng không tạo được thumbnail."
+            if self.thumbnail_error: self.log.emit("⚠️ " + self.thumbnail_error)
             self.done.emit(True, self.out_file)
 
         try:
@@ -2877,7 +2887,7 @@ class ProgressStep(QWidget):
 # ============================================================
 #  TAB RENDER CHÍNH
 # ============================================================
-class RenderWidget(QWidget):
+class SingleSeriesRenderWidget(QWidget):
     # Cặp file ưu tiên: *_dubbed.mp4 + *_vi.srt; không có thì dùng gốc.
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3095,6 +3105,17 @@ class RenderWidget(QWidget):
         left.setStyleSheet("QFrame { background:#171A1D; border-radius:6px; border:1px solid #2D3238; }")
         ll = QVBoxLayout(left); ll.setContentsMargins(7, 7, 7, 7); ll.setSpacing(6)
 
+        # Keep referenced controls alive inside a hidden container; omit header space.
+        compact_header = QFrame(left)
+        compact_header_layout = QVBoxLayout(compact_header)
+        compact_header.hide()
+        # Compact access to selection and clearing without restoring the removed header.
+        select_side = QPushButton("Chọn tất cả tập")
+        select_side.clicked.connect(lambda: self._toggle_select_all_visible(True))
+        sl.insertWidget(2, select_side)
+        deselect_side = QPushButton("Bỏ chọn tất cả")
+        deselect_side.clicked.connect(lambda: self._toggle_select_all_visible(False))
+        sl.insertWidget(3, deselect_side)
         # Tìm kiếm + chip lọc ngang giống app quản lý media chuyên nghiệp.
         search_row = QHBoxLayout(); search_row.setSpacing(5)
         self.txt_video_search = QLineEdit()
@@ -3116,7 +3137,7 @@ class RenderWidget(QWidget):
             _btn.clicked.connect(lambda _checked=False, k=_key: self._set_library_filter(k))
             self._filter_buttons[f"top_{_key}"] = _btn
             search_row.addWidget(_btn)
-        ll.addLayout(search_row)
+        compact_header_layout.addLayout(search_row)
 
         head_q = QHBoxLayout(); head_q.setSpacing(6)
         lbl_queue = QLabel("Danh sách video")
@@ -3138,7 +3159,7 @@ class RenderWidget(QWidget):
         b_clear = QPushButton("🗑"); b_clear.setFixedSize(34, 28); b_clear.clicked.connect(self._clear_all)
         b_clear.setStyleSheet("QPushButton { background:#2B2022; color:#F28A8A; border:1px solid #553238; border-radius:5px; } QPushButton:hover { background:#3A2528; }")
         head_q.addWidget(b_folder); head_q.addWidget(b_files); head_q.addWidget(b_clear)
-        ll.addLayout(head_q)
+        compact_header_layout.addLayout(head_q)
 
         self.scroll_grid = QScrollArea(); self.scroll_grid.setWidgetResizable(True)
         self.scroll_grid.setStyleSheet("QScrollArea { background:#141719; border:none; border-radius:4px; }")
@@ -3230,6 +3251,7 @@ class RenderWidget(QWidget):
         right.setStyleSheet("QFrame { background:#1B1E22; border-radius:6px; border:1px solid #2D3238; }")
         rl = QVBoxLayout(right); rl.setContentsMargins(6, 6, 6, 6); rl.setSpacing(6)
         rl.addWidget(fix)
+        fix.hide()  # Compact inspector: start directly at editing tabs.
 
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(
@@ -5259,8 +5281,10 @@ class RenderWidget(QWidget):
         color_ass = COLOR_PRESETS.get(color_name, {}).get("ass", "&H00FFFFFF")
         blur_list = []
         for b in self.blur_boxes:
-            r = b.sceneBoundingRect()
-            blur_list.append({"x": int(r.x()), "y": int(r.y()), "w": int(r.width()), "h": int(r.height())})
+            # boundingRect includes the pen and resize handles, not the actual mask.
+            # Saving it repeatedly inflated the mask on each design restore.
+            r = b.mapRectToScene(b.rect())
+            blur_list.append({"x": float(r.x()), "y": float(r.y()), "w": float(r.width()), "h": float(r.height())})
             
         scene = self.scene.sceneRect()
         SW = scene.width() or 1080; SH = scene.height() or 1920
@@ -5612,6 +5636,10 @@ class RenderWidget(QWidget):
                                 f"Đã xóa {removed} file rác.\nChỉ còn lại bản render cuối (*_final.mp4)"
                                 + (" và bản gộp trọn bộ." if True else "."))
 
+    def _batch_complete(self, ok, detail):
+        if getattr(self, "_batch_managed", False) and getattr(self, "_batch_result", None) is None:
+            self._batch_result = (bool(ok), str(detail))
+
     def _run_full_pipeline_external(self):
         """Nút 'LÀM TẤT CẢ' ngoài: chuyển việc cho tab con Sub→Dịch→Lồng chạy
         trọn quy trình (dùng cấu hình đã set trong tab đó)."""
@@ -5918,11 +5946,13 @@ class RenderWidget(QWidget):
             self.step_render.set_status("error", 0)
             self.lbl_big_prog.setText("Tiến độ tổng · ĐÃ DỪNG" if getattr(self, "_total_active", False) else "Tiến độ render · ĐÃ DỪNG")
             self.total_progress_end()
+            self._batch_complete(False, "Đã dừng render")
             self._log("⛔ Đã dừng render.")
             QMessageBox.information(self, "Đã dừng", "Đã dừng render theo yêu cầu.")
         else:
             failed = list(getattr(self, "_render_failed_files", []) or [])
             if failed:
+                self._batch_complete(False, f"{len(failed)} tập render lỗi; không gộp")
                 self.step_render.set_status("error", 100)
                 if getattr(self, "_total_active", False):
                     self.total_progress_end()
@@ -5950,6 +5980,7 @@ class RenderWidget(QWidget):
                     self._big_set_percent(100)
                     total = getattr(self, "_render_total", 0)
                     self.lbl_big_prog.setText(f"Tiến độ render · XONG {total}/{total} tập ✅")
+                self._batch_complete(True, "Đã xuất các tập lẻ")
                 self._log("🎉 Đã render xong tất cả!")
                 QMessageBox.information(self, "Xong", "Đã render xong tất cả các tập!")
 
@@ -5993,6 +6024,7 @@ class RenderWidget(QWidget):
         ]
         self._log(f"📚 {len(files)} tập → {len(self._merge_parts_queue)} phần, tối đa {size} tập/phần.")
         self._merge_parts_outputs = []
+        self._thumbnail_warnings = []
         self._merge_parts_badge_options = None
         if self.chk_part_thumbnail.isChecked():
             self._merge_parts_badge_options = self._part_thumbnail_options()
@@ -6035,6 +6067,8 @@ class RenderWidget(QWidget):
 
     def _on_merge_part_finished(self):
         ok, path = self._merge_part_result
+        warning = getattr(self.merge_thread, 'thumbnail_error', '')
+        if warning: self._thumbnail_warnings.append(os.path.basename(path) + ': ' + warning)
         if ok:
             self._merge_parts_outputs.append(path)
             self._log(f"✅ Đã gộp: {os.path.basename(path)}")
@@ -6043,6 +6077,9 @@ class RenderWidget(QWidget):
                 return
         self._merge_parts_queue = []
         self._merge_parts_active = False
+        warnings = "\n".join(self._thumbnail_warnings)
+        self._batch_complete(ok and not warnings, warnings or ("Ghép theo phần hoàn tất" if ok else "Ghép theo phần lỗi"))
+        if warnings: QMessageBox.warning(self, "Video đã ghép, thumbnail cần xử lý", warnings)
         self.btn_run.setEnabled(True)
         if hasattr(self, 'btn_merge_now'):
             self.btn_merge_now.setEnabled(True)
@@ -6055,10 +6092,10 @@ class RenderWidget(QWidget):
                 self._done_units = self._total_units
                 self._paint_total(self._total_units)
             self.total_progress_end()
-        if ok:
+        if ok and not warnings:
             QMessageBox.information(self, "Hoàn tất Theo phần",
                 "Đã gộp thành công:\n" + "\n".join(self._merge_parts_outputs))
-        else:
+        elif not ok:
             QMessageBox.warning(self, "Lỗi gộp theo phần",
                 "Đã dừng vì một phần gộp lỗi. Các phần đã hoàn tất được giữ lại. Hãy kiểm tra log.")
 
@@ -6100,17 +6137,25 @@ class RenderWidget(QWidget):
         self.merge_thread.start()
 
     def _on_merge_done(self, ok, final_path):
+        warning = getattr(self.merge_thread, 'thumbnail_error', '')
+        self._batch_complete(ok and not warning, warning or ("Ghép trọn bộ hoàn tất" if ok else "Ghép trọn bộ lỗi"))
+        if warning: QMessageBox.warning(self, "Video đã ghép, thumbnail cần xử lý", warning)
         self.btn_run.setEnabled(True)
         if hasattr(self, 'btn_merge_now'):
             self.btn_merge_now.setEnabled(True)
         self._update_run_label()
         
-        if ok:
+        if ok and not warning:
             self.step_render.set_status("success", 100)
             self._log(f"🎉 Đã hoàn tất gộp trọn bộ: {os.path.basename(final_path)}")
             QMessageBox.information(self, "Hoàn tất Trọn bộ", f"Đã render và gộp thành công!\\nFile được lưu tại:\\n{final_path}")
-        else:
+        elif not ok:
             self.step_render.set_status("error", 100)
             QMessageBox.warning(self, "Lỗi gộp file", "Quá trình gộp file gặp sự cố. Bạn có thể kiểm tra log hoặc gộp thủ công.")
 
 # (MergeRenderedThread đã được định nghĩa đầy đủ ở trên, không lặp lại tại đây)
+
+
+# Giữ tên public mà ứng dụng đang import; từng bộ dùng widget gốc độc lập.
+from series_queue import make_multi_series_widget
+RenderWidget = make_multi_series_widget(SingleSeriesRenderWidget)
