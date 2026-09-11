@@ -497,14 +497,14 @@ class DubFeatureWidget(QWidget):
         row_tw.addWidget(_lbl("Số tập dịch song song:"))
         self.spn_trans_workers = QSpinBox()
         self.spn_trans_workers.setRange(1, 5)
-        self.spn_trans_workers.setValue(int(self.settings.value("trans_workers", 2)))
+        self.spn_trans_workers.setValue(int(self.settings.value("trans_workers", 3)))
         self._style_num(self.spn_trans_workers)
         row_tw.addWidget(self.spn_trans_workers)
         self.chk_show_browser = QCheckBox("👁 Hiện trình duyệt")
         row_tw.addWidget(self.chk_show_browser)
-        self.chk_address_consistency = QCheckBox("Ưu tiên đúng xưng hô (dịch tuần tự)")
+        self.chk_address_consistency = QCheckBox("Đọc toàn bộ SRT → quy ước chung → dịch song song")
         self.chk_address_consistency.setChecked(self.settings.value("address_consistency", True, type=bool))
-        self.chk_address_consistency.setToolTip("Dịch lần lượt từng tập/đoạn, kèm thoại trước/sau và cập nhật bối cảnh. Chậm hơn chế độ song song.")
+        self.chk_address_consistency.setToolTip("Gemini đọc toàn bộ SRT trong một phiên; tối đa 3 phiên dịch tập dùng chung quy ước.")
         lay.addWidget(self.chk_address_consistency)
         self.txt_address_notes = QLineEdit(str(self.settings.value("address_notes", "")))
         self.txt_address_notes.setPlaceholderText("Quy ước: A gọi B là anh, xưng em; B gọi A là em, xưng anh…")
@@ -1464,8 +1464,11 @@ class DubFeatureWidget(QWidget):
     def _start_translate(self, srt_files):
         use_deepseek = self.cb_translate_engine.currentText().startswith("🚀")
         queue = [{"video": v, "srt": s} for (v, s) in srt_files]
-        self._dub_queue = []
-        self._dub_running = False
+        # Translation may start while ready episodes are already dubbing.
+        # Keep pending episodes and the actual worker state in that case.
+        if not getattr(self, "_chain_dub_after_translate", False):
+            self._dub_queue = []
+        self._dub_running = bool(getattr(self, "_dub_threads", {}))
 
         def _on_item_done(idx, video_path, vi_path):
             if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
@@ -1522,12 +1525,25 @@ class DubFeatureWidget(QWidget):
                 self._log("👁 Bật hiện trình duyệt → tạm 1 tập/lượt.")
             _tgt = self._target_lang()
             self._log(f"🌐 Dịch bằng Gemini sang {'tiếng Anh' if _tgt=='en' else 'tiếng Việt'}...")
+            context_items = None
+            if self.chk_address_consistency.isChecked():
+                context_items = []
+                for vp in self._files_from_host():
+                    stem = os.path.splitext(vp)[0]
+                    if stem.endswith("_dubbed"): stem = stem[:-7]
+                    source = stem + ".srt"
+                    if not os.path.isfile(source): source, _ = self._find_existing_srt(vp)
+                    if not source or not os.path.isfile(source):
+                        QMessageBox.warning(self,"Thiếu SRT", "Phải tách sub đủ mọi tập trước khi phân tích: " + os.path.basename(vp))
+                        self._set_buttons_enabled(True)
+                        return
+                    context_items.append({"video":vp,"srt":source})
             self._gtrans_thread = GeminiTranslateThread(
                 queue, preset, "Auto (Mặc định)", 80,
                 translate_workers=workers, show_browser=show_browser,
                 target_lang=_tgt,
                 address_consistency=self.chk_address_consistency.isChecked(),
-                address_notes=self.txt_address_notes.text())
+                address_notes=self.txt_address_notes.text(), context_items=context_items)
 
         self._set_buttons_enabled(False)
         self._start_card_poll()
@@ -1710,11 +1726,22 @@ class DubFeatureWidget(QWidget):
                             pass
                         self._total_on = False
 
+        # Only hand off after the dubbing worker has actually closed its output.
+        live_result = {"ok": False}
+        def _remember_live_result(ok, failed):
+            live_result["ok"] = bool(ok) and not bool(failed)
+        th.finished_signal.connect(_remember_live_result)
+        def _handoff_live_render():
+            if live_result["ok"] and getattr(self, "_live_pipeline", False):
+                self.host._accept_live_render(video_path, self._dubbed_for(video_path), self._vi_srt_for(video_path))
+        th.finished.connect(_handoff_live_render)
         th.finished_signal.connect(_one_done)
         self._keep_alive(th)
         th.start()
 
     def _run_only_render(self):
+        self._live_pipeline = False
+        self._live_finished = False
         self._refresh_host_cards()
         self._start_render()
 
@@ -1796,7 +1823,10 @@ class DubFeatureWidget(QWidget):
             if reason:
                 bad.append((vp, reason))
 
-        if getattr(self.host, "_batch_managed", False) and (self._skip_from_render or (bad and self._verify_round >= self._MAX_VERIFY_RETRY)):
+        if (getattr(self.host, "_batch_managed", False) or getattr(self, "_live_pipeline", False)) and (self._skip_from_render or (bad and self._verify_round >= self._MAX_VERIFY_RETRY)):
+            if getattr(self, "_live_pipeline", False):
+                self._live_pipeline = False
+                self.host._seal_live_render(failed=True)
             self.host._batch_complete(False, "Dịch/lồng chưa đủ tập sau retry; không render/ghép thiếu tập")
             self._stop_card_poll()
             self._set_buttons_enabled(True)
@@ -1945,8 +1975,28 @@ class DubFeatureWidget(QWidget):
                     except Exception:
                         pass
 
+    def _finish_live_pipeline(self):
+        if not getattr(self, "_live_pipeline", False): return
+        if any(th.isRunning() for th in getattr(self, "_threads_alive", [])):
+            QTimer.singleShot(100, self._finish_live_pipeline)
+            return
+        failed = False
+        for vp in self._live_source_files:
+            if self._episode_incomplete(vp):
+                failed = True
+            else:
+                self.host._accept_live_render(vp, self._dubbed_for(vp), self._vi_srt_for(vp))
+        self._live_pipeline = False
+        self._live_finished = True
+        self.host._seal_live_render(failed=failed)
+
     def _start_render(self):
         if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
+            return
+        if getattr(self, "_live_pipeline", False):
+            self._finish_live_pipeline()
+            return
+        if getattr(self, "_live_finished", False):
             return
         fn = getattr(self.host, "_start_render_all", None)
         if callable(fn):
@@ -2041,6 +2091,18 @@ class DubFeatureWidget(QWidget):
         except Exception:
             self._total_on = False
 
+        self._live_pipeline = bool(self._render_after_dub and hasattr(self.host, "_accept_live_render"))
+        self._live_finished = False
+        self._live_source_files = list(files)
+        if self._live_pipeline:
+            self.host._start_render_all(streaming=True)
+            if not getattr(self.host, "_live_accepting", False):
+                self._live_pipeline = False
+                return
+            self._log("⚡ Bật lồng xong từng tập → render ngay; chỉ ghép sau khi đủ tập.")
+            # Silent episodes are prepared synchronously and have no dubbing worker.
+            for vp in no_dialogue:
+                self.host._accept_live_render(vp, self._dubbed_for(vp), self._vi_srt_for(vp))
         self._full_need_translate = list(need_translate)
         self._full_ready_vi = list(ready_vi)
 

@@ -5664,7 +5664,7 @@ class SingleSeriesRenderWidget(QWidget):
         self.settings.setValue("render_merge_mode", mode)
         self.settings.setValue("merge_after_render", mode != "Tập lẻ")
 
-    def _start_render_all(self):
+    def _start_render_all(self, streaming=False):
         if self._render_running:
             QMessageBox.information(self, "Đang render", "Đang render, vui lòng đợi xong.")
             return
@@ -5691,8 +5691,14 @@ class SingleSeriesRenderWidget(QWidget):
         self.cards.sort(key=lambda c: _natural_key(os.path.basename(c.video_path)))
         self._relayout_grid()
         selected_cards = [c for c in self.cards if c in selected_cards]
-        self._render_queue = list(selected_cards)
-        self._render_total = len(self._render_queue)
+        self._live_render = bool(streaming)
+        self._live_accepting = bool(streaming)
+        self._live_cards = list(selected_cards) if streaming else []
+        self._live_inputs = {}
+        self._live_admitted = set()
+        self._live_designs = {id(c): copy.deepcopy(getattr(c, "design_config", None) or self._default_design()) for c in selected_cards} if streaming else {}
+        self._render_queue = [] if streaming else list(selected_cards)
+        self._render_total = len(selected_cards)
         self._render_done_count = 0
         self._rendered_files = [] # Lưu danh sách file xuất ra để gộp
         self._render_failed_files = []  # không tự gộp thiếu tập nếu có render lỗi
@@ -5834,6 +5840,12 @@ class SingleSeriesRenderWidget(QWidget):
         if not self._render_running:
             return
         self._stopping = True
+        self._live_accepting = False
+        pipeline = getattr(self, "dub_feature_tab", None)
+        if pipeline is not None and getattr(pipeline, "_live_pipeline", False):
+            pipeline._live_pipeline = False
+            pipeline._live_finished = True
+            pipeline._render_after_dub = False
         self._render_queue = []          # xóa các tập chưa render
         self.btn_stop.setEnabled(False)
         self._log("⛔ Đang dừng render... (đợi các tập đang chạy thoát)")
@@ -5843,6 +5855,44 @@ class SingleSeriesRenderWidget(QWidget):
                     th.cancel()
             except Exception:
                 pass
+
+        if not self._render_threads:
+            self._finish_render_all()
+
+    @staticmethod
+    def _live_key(path):
+        stem = os.path.splitext(os.path.abspath(path))[0]
+        if stem.endswith("_dubbed"): stem = stem[:-7]
+        return os.path.normcase(stem)
+
+    def _accept_live_render(self, source, dubbed, subtitle):
+        if not getattr(self, "_live_accepting", False) or self._stopping:
+            return
+        if getattr(self, "_batch_managed", False) and getattr(self, "_batch_result", None) is not None:
+            return
+        key = self._live_key(source)
+        card = next((c for c in self._live_cards if self._live_key(c.video_path) == key), None)
+        if card is None or id(card) in self._live_admitted:
+            return
+        if not os.path.isfile(dubbed) or os.path.getsize(dubbed) <= 0 or not os.path.isfile(subtitle):
+            return
+        self._live_admitted.add(id(card))
+        self._live_inputs[id(card)] = (dubbed, subtitle)
+        self._render_queue.append(card)
+        self._log(f"⚡ Lồng xong → xếp render: {os.path.basename(source)}")
+        self._pump_render_queue()
+
+    def _seal_live_render(self, failed=False):
+        if not getattr(self, "_live_accepting", False):
+            return
+        self._live_accepting = False
+        for c in self._live_cards:
+            if id(c) not in self._live_admitted:
+                self._render_failed_files.append(c.video_path)
+        if failed and not self._render_failed_files:
+            self._render_failed_files.append("Dịch/lồng chưa đạt")
+        self._log("📥 Đã nhận hết kết quả lồng; chờ render xong để kiểm tra và ghép.")
+        self._pump_render_queue()
 
     def _pump_render_queue(self):
         """Khởi động thêm tập cho tới khi đủ số song song hoặc hết hàng đợi."""
@@ -5855,20 +5905,19 @@ class SingleSeriesRenderWidget(QWidget):
             card = self._render_queue.pop(0)
             self._start_one_render(card)
         # Hết hàng đợi và không còn thread nào chạy -> xong
-        if not self._render_queue and not self._render_threads:
+        if not self._render_queue and not self._render_threads and not getattr(self, "_live_accepting", False):
             self._finish_render_all()
 
     def _start_one_render(self, card):
         card.set_status("đang render")
-        vp = card.video_path
-        sp = card.srt_path
+        vp, sp = getattr(self, "_live_inputs", {}).get(id(card), (card.video_path, card.srt_path))
         out_dir = os.path.dirname(vp)
         self._last_render_dir = out_dir
         stem = os.path.splitext(os.path.basename(vp))[0]
         if stem.endswith("_dubbed"):
             stem = stem[:-len("_dubbed")]
         out_path = os.path.join(out_dir, f"{stem}_final.mp4")
-        design = copy.deepcopy(getattr(card, "design_config", None) or self._default_design())
+        design = copy.deepcopy(getattr(self, "_live_designs", {}).get(id(card)) or getattr(card, "design_config", None) or self._default_design())
         cfg = self._build_cfg(vp, design)
 
         done_so_far = getattr(self, "_render_done_count", 0)
@@ -5928,6 +5977,8 @@ class SingleSeriesRenderWidget(QWidget):
 
     def _finish_render_all(self):
         stopped = self._stopping
+        self._live_accepting = False
+        self._live_render = False
         self._render_running = False
         self._stopping = False
         self._render_queue = []

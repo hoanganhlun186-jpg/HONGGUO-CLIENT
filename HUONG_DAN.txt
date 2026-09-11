@@ -1,63 +1,33 @@
-BẢN LƯU PHIÊN / CHẠY TIẾP / GEMINI WEB XƯNG HÔ
+BẢN LỒNG XONG TỪNG TẬP → RENDER NGAY
 
-CÀI ĐẶT
-Tắt ứng dụng, sao lưu bản đang dùng, rồi chép đủ 5 file Python trong gói này
-vào cùng thư mục ứng dụng:
-render_tab.py, render_dub_feature.py, series_queue.py, series_session.py,
-translate_tab.py.
-Nếu dùng EXE không nạp mã Python ngoài thì cần build lại, đưa cả hai module
-series_queue và series_session vào bản build.
+Được sửa từ đúng hai file bạn gửi trên Desktop.
+Tắt ứng dụng, sao lưu hai file cũ, rồi thay:
+  render_tab.py
+  render_dub_feature.py
+Giữ các module đi kèm từ bản trước: translate_tab.py, full_context.py,
+series_queue.py, series_session.py và các module TTS/STT hiện có.
 
-LƯU PHIÊN VÀ CHẠY TIẾP
-- Chuẩn bị mỗi bộ trong một tab, mỗi bộ một thư mục video riêng.
-- Bấm Lưu phiên để chọn file JSON. File giữ đường dẫn tập/sub, thiết kế,
-  Cover, vị trí chữ thumbnail, tùy chọn dịch/lồng/render và trạng thái bộ.
-- Sau lần Lưu phiên đầu tiên, trạng thái bộ được tự lưu vào file đó khi chạy.
-- Mở phiên thêm các bộ vào tab hiện có, không xóa công việc chưa lưu.
-  Nên mở phiên trong phiên ứng dụng mới để tránh trùng bộ/thư mục.
-- Bộ đang chạy khi bị tắt sẽ trở lại trạng thái chờ. Đây là tiếp tục theo bộ,
-  không phải tiếp tục chính xác giữa một câu dịch hay một khung hình render.
-- Tiếp tục các bộ chờ bỏ qua bộ đã xong và bộ lỗi.
-- Chạy tất cả bộ là chạy lại các bộ đủ điều kiện, bao gồm bộ đã xong.
-- File JSON không chép API key/mật khẩu. Đăng nhập Gemini và API vẫn dùng
-  cơ chế hiện tại của ứng dụng trên máy bạn.
-- Chi tiết / Nhật ký hiển thị log của render và dịch/lồng, có tên bộ đi kèm.
-- Có lại nút Chọn tất cả tập và Bỏ chọn tất cả ở bên trái.
+CÁCH CHẠY
+- Dùng Làm tất cả của một bộ với tự lồng và tự render được bật, hoặc
+  dùng Chạy tất cả bộ ở thanh nhiều bộ.
+- Khi worker lồng của một tập hoàn tất thật sự, video _dubbed và SRT dịch
+  của tập đó được đưa vào hàng đợi render ngay.
+- Các tập khác tiếp tục dịch/lồng; render chạy theo số song song đang đặt.
+- Mỗi tập chỉ được nhận vào render một lần trong lần chạy hiện tại.
+- Hàng đợi render trống tạm thời sẽ chờ tập mới, không tự kết thúc sớm.
+- Cuối bước dịch/lồng, kiểm tra đủ tập rồi đóng hàng đợi nhận thêm.
+- Ghép theo phần/trọn bộ và thumbnail vẫn bắt đầu sau khi render xong cả bộ.
+  Bản này chưa ghép từng phần sớm trong lúc các tập sau còn đang lồng/render.
+- Tập thiếu dịch/lồng hoặc render lỗi sẽ chặn ghép thiếu tập.
+- Giữ pipeline Gemini đọc toàn bộ SRT/quy ước chung từ bản bạn gửi.
 
-THUMBNAIL
-- Phân biệt video ghép thành công với tạo ảnh/nhúng Cover/lưu JPG thất bại.
-- Nếu một ảnh bìa lỗi, các phần video còn lại vẫn ghép; cuối bộ ghi lỗi ảnh bìa
-  để bạn xử lý, không báo bộ hoàn tất trọn vẹn.
-- Giữ mẫu chữ, kéo vị trí tự do, watermark kép và sửa lỗi vùng che sub phình.
-
-GEMINI WEB: ƯU TIÊN ĐÚNG XƯNG HÔ
-- Trong Sub → Dịch → Lồng, mặc định bật Ưu tiên đúng xưng hô.
-- Vẫn dùng Gemini web trong trình duyệt và đăng nhập hiện tại; không cần
-  Gemini API key. Có thêm lượt phân tích bối cảnh mỗi tập, nên tốn thời gian
-  và lượt sử dụng web hơn chế độ cũ.
-- Chế độ này dịch tuần tự từng tập/đoạn, tối đa 60 câu/đoạn. Số tập dịch song
-  song bạn chọn không áp dụng khi bật chế độ này; render/lồng vẫn giữ cấu hình.
-- Mỗi lượt gửi kèm tối đa 8 câu trước cùng bản dịch và 4 câu gốc phía sau,
-  yêu cầu không xuất lại các câu tham khảo.
-- Cập nhật bản ghi quan hệ nhân vật mỗi tập từ tối đa 160 câu đầu tập;
-  giữ ngữ cảnh trong lần chạy, tách theo thư mục. Không tự lưu bộ nhớ AI giữa
-  các lần dịch. Nhân vật mới xuất hiện sâu trong tập vẫn có thể bị hiểu sai.
-- Ô Quy ước cho phép ghi quan hệ đã biết, ví dụ:
-  "Lâm Phong gọi Tiểu Vũ là em, xưng anh; Tiểu Vũ gọi Lâm Phong là anh, xưng em."
-  Ô này được lưu riêng trong file phiên của từng bộ.
-- Không ghi file dịch mới nếu thiếu dòng; tránh lồng tiếng từ bản dịch dở.
-- Thay đổi chỉ giúp giảm thiếu ngữ cảnh; chưa có cặp câu sai cụ thể để xác nhận
-  chất lượng dịch thực tế. Phụ đề không ghi người nói vẫn có thể khiến AI đoán sai.
-- Các file dịch đã có không tự được dịch lại chỉ vì cài bản mới.
+LƯU Ý
+Lồng và render cùng dùng tài nguyên máy. Nếu chậm hơn hoặc thiếu VRAM,
+giảm song song render xuống 1 trước; không phải máy nào chạy chồng cũng nhanh hơn.
+Nút dừng render dừng hàng đợi render, không đồng nghĩa hủy mọi worker dịch/lồng.
 
 ĐÃ KIỂM TRA
-- Cú pháp 5 module.
-- Mô phỏng hàng đợi: chạy tuần tự, tiếp tục chỉ bộ chờ, lỗi chuyển bộ,
-  chờ worker kết thúc thật, dừng sau bộ.
-- Lưu/đọc phiên: cấu hình, ảnh Cover, vùng che sub, tọa độ, trạng thái và
-  không ghi API key; ghi file thay thế nguyên tử.
-- Mô phỏng phản hồi Gemini web: truyền câu tham khảo giữa các đoạn, giữ
-  số dòng/timecode, lỗi không xuất file dịch dở; DeepSeek giữ nguyên.
-- Chưa chạy end-to-end giao diện PyQt6, Gemini web, dịch vụ lồng tiếng và
-  FFmpeg trên video thật trong môi trường này (thiếu PyQt6/FFmpeg ở runtime).
-  Hãy thử hai bộ ngắn trước khi treo nhiều bộ dài.
+Kiểm tra cú pháp và mô phỏng hàng đợi: chờ dữ liệu mới, giới hạn song song,
+không nhận trùng tập, đúng đầu vào _dubbed, chờ render cuối, phát hiện tập thiếu,
+dừng nhận thêm sau lệnh dừng. Lớp xử lý FFmpeg/ghép được giữ nguyên.
+Chưa chạy thử toàn bộ giao diện, dịch vụ TTS và video thật trên máy bạn.
