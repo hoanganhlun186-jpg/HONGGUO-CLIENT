@@ -1,33 +1,9 @@
-BẢN LỒNG XONG TỪNG TẬP → RENDER NGAY
+SỬA QUY TẮC XƯNG HÔ GEMINI WEB
 
-Được sửa từ đúng hai file bạn gửi trên Desktop.
-Tắt ứng dụng, sao lưu hai file cũ, rồi thay:
-  render_tab.py
-  render_dub_feature.py
-Giữ các module đi kèm từ bản trước: translate_tab.py, full_context.py,
-series_queue.py, series_session.py và các module TTS/STT hiện có.
+Đóng tool, sao lưu các file cũ. Chép đủ 7 file .py trong ZIP vào thư mục chương trình chứa render_tab.py, thay các file cũ.
 
-CÁCH CHẠY
-- Dùng Làm tất cả của một bộ với tự lồng và tự render được bật, hoặc
-  dùng Chạy tất cả bộ ở thanh nhiều bộ.
-- Khi worker lồng của một tập hoàn tất thật sự, video _dubbed và SRT dịch
-  của tập đó được đưa vào hàng đợi render ngay.
-- Các tập khác tiếp tục dịch/lồng; render chạy theo số song song đang đặt.
-- Mỗi tập chỉ được nhận vào render một lần trong lần chạy hiện tại.
-- Hàng đợi render trống tạm thời sẽ chờ tập mới, không tự kết thúc sớm.
-- Cuối bước dịch/lồng, kiểm tra đủ tập rồi đóng hàng đợi nhận thêm.
-- Ghép theo phần/trọn bộ và thumbnail vẫn bắt đầu sau khi render xong cả bộ.
-  Bản này chưa ghép từng phần sớm trong lúc các tập sau còn đang lồng/render.
-- Tập thiếu dịch/lồng hoặc render lỗi sẽ chặn ghép thiếu tập.
-- Giữ pipeline Gemini đọc toàn bộ SRT/quy ước chung từ bản bạn gửi.
+Bản mới phân tích lại quy ước cũ khi chạy phân tích toàn bộ SRT. Không tự dịch lại các file đã dịch xong; để sửa bản dịch cũ cần chọn chạy dịch lại các tập đó trong ứng dụng.
 
-LƯU Ý
-Lồng và render cùng dùng tài nguyên máy. Nếu chậm hơn hoặc thiếu VRAM,
-giảm song song render xuống 1 trước; không phải máy nào chạy chồng cũng nhanh hơn.
-Nút dừng render dừng hàng đợi render, không đồng nghĩa hủy mọi worker dịch/lồng.
+Chỉ chốt tên/quan hệ có bằng chứng; không gộp tên gần âm thành một nhân vật. Xưng hô theo từng chiều, cảnh, giai đoạn; không mặc định 我 là tôi, bạn thân là mày–tao hoặc nổi giận phải đổi đại từ. Bằng chứng lời thoại hiện tại ưu tiên hơn suy đoán trong quy ước. Giữ yêu cầu rút gọn trong prompt, không thêm kiểm tra độ dài trong tool.
 
-ĐÃ KIỂM TRA
-Kiểm tra cú pháp và mô phỏng hàng đợi: chờ dữ liệu mới, giới hạn song song,
-không nhận trùng tập, đúng đầu vào _dubbed, chờ render cuối, phát hiện tập thiếu,
-dừng nhận thêm sau lệnh dừng. Lớp xử lý FFmpeg/ghép được giữ nguyên.
-Chưa chạy thử toàn bộ giao diện, dịch vụ TTS và video thật trên máy bạn.
+Đã kiểm tra cú pháp, cache và mô phỏng phục hồi phản hồi. Chưa đánh giá bản dịch thực tế trên Gemini; prompt không bảo đảm xưng hô chính xác khi SRT thiếu người nói hoặc sai nhận dạng. Bản này chưa triển khai lưu phân tích tích lũy từng nhóm SRT.

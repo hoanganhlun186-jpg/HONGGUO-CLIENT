@@ -1557,6 +1557,23 @@ class DubFeatureWidget(QWidget):
     def _on_translate_all_done(self, *args):
         if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
             return
+        fatal = getattr(getattr(self, "_gtrans_thread", None), "fatal_error", "")
+        if fatal:
+            self._log(f"❌ Dừng bước dịch: {fatal}")
+            self._chain_dub_after_translate = False
+            self._render_after_dub = False
+            self._chain_after_stt = None
+            self._dub_queue = []
+            self._total_on = False
+            self._set_buttons_enabled(True)
+            self._stop_card_poll()
+            if hasattr(self.host, "_batch_complete"):
+                self.host._batch_complete(False, fatal)
+            if getattr(self, "_live_pipeline", False):
+                self._live_pipeline = False
+                self._live_finished = True
+                self.host._seal_live_render(failed=True)
+            return
         self._log("✅ Dịch xong toàn bộ.")
         self._refresh_host_cards()
         if not getattr(self, "_chain_dub_after_translate", False):

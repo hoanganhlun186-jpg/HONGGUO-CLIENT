@@ -36,17 +36,31 @@ def packets(items, parse_srt, limit=12000):
     return result, len(seen)
 
 def decode_rules(response, count):
-    text=response.strip()
-    if text.startswith('```'): text=re.sub(r'^```(?:json)?\s*','',text);text=re.sub(r'\s*```$','',text)
-    data=json.loads(text)
-    if data.get('received_parts')!=list(range(1,count+1)): raise ValueError('Gemini chưa xác nhận đủ các lượt SRT')
-    rules=data.get('rules')
-    if not isinstance(rules,dict) or any(not rules.get(k) for k in SECTIONS):
-        raise ValueError('Bộ quy ước thiếu mục bắt buộc')
-    return rules
+    text=(response or '').strip().lstrip('\ufeff')
+    if not text: raise ValueError('Gemini trả phản hồi trống')
+    if 'LOI_THIEU_DU_LIEU' in text.replace('\\_', '_'):
+        raise ValueError('Gemini báo thiếu dữ liệu; không nhận quy ước lẫn mã lỗi')
+    decoder=json.JSONDecoder()
+    candidates=[]
+    errors=[]
+    # Allow explanatory prose/Markdown around a complete JSON object.
+    # Do not manufacture missing fields or accept an unfinished JSON object.
+    for match in re.finditer(r'\{',text):
+        try: data,_=decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError: continue
+        if not isinstance(data,dict) or 'received_parts' not in data: continue
+        if data.get('received_parts')!=list(range(1,count+1)):
+            errors.append('Gemini chưa xác nhận đủ các lượt SRT');continue
+        rules=data.get('rules')
+        if not isinstance(rules,dict) or any(not rules.get(k) or not isinstance(rules[k],(str,list,dict)) for k in SECTIONS):
+            errors.append('Bộ quy ước thiếu mục bắt buộc');continue
+        candidates.append(rules)
+    if len(candidates)==1: return candidates[0]
+    if len(candidates)>1: raise ValueError('Gemini trả nhiều bộ quy ước; cần một kết quả duy nhất')
+    raise ValueError(errors[0] if errors else 'Gemini chưa trả bộ quy ước JSON hoàn chỉnh')
 
 def fingerprint(parts,notes):
-    return hashlib.sha256(('v1\n'+notes+'\n'+''.join(parts)).encode('utf-8')).hexdigest()
+    return hashlib.sha256(('v2-address-evidence\n'+notes+'\n'+''.join(parts)).encode('utf-8')).hexdigest()
 
 def save_rules(path,signature,rules,parts,episodes):
     fd,tmp=tempfile.mkstemp(prefix='.context_',suffix='.json',dir=os.path.dirname(path))

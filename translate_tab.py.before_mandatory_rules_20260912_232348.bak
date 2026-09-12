@@ -710,18 +710,7 @@ class GeminiTranslateThread(QThread):
                 if self.address_consistency:
                     nearby += "\nBẮT BUỘC RÚT GỌN lời dịch khoảng 20–30%: bỏ từ đệm, diễn đạt gọn cho lồng tiếng; lược chủ ngữ chỉ khi rõ, không sai xưng hô. Không mất phủ định/ý chính, không gộp hoặc bỏ mã câu. Câu vốn ngắn không còn phần thừa thì giữ đủ nghĩa.\n"
                     nearby += f"TẬP ĐƯỢC GIAO: {os.path.basename(srt_path)}. Dùng tên/quan hệ đã xác minh trong quy ước chung. Nếu quy ước mâu thuẫn bằng chứng gốc ở cảnh hiện tại, dịch theo bằng chứng gốc; không tự sửa hồ sơ chung hay thêm lời giải thích vào đầu ra.\n"
-                mandatory_preset = (
-                    "YÊU CẦU DỊCH THUẬT BẮT BUỘC:\n"
-                    "Bắt buộc tuân thủ đầy đủ các yêu cầu dịch thuật dưới đây trong mọi câu dịch, "
-                    "ở mọi tập, mọi đoạn và cả khi dịch lại để sửa lỗi. "
-                    "Đây là chỉ thị dịch thuật, không phải nội dung tham khảo.\n"
-                    f"{self.preset_text}\n\n"
-                    "Áp dụng đồng thời các yêu cầu trên với quy ước chung và ngữ cảnh của tập đang dịch. "
-                    "Giữ đúng tên, quan hệ và xưng hô theo cảnh/giai đoạn; "
-                    "rút gọn không được làm mất ý chính, phủ định hoặc thay đổi sắc thái. "
-                    "Tuân thủ ngôn ngữ đích, số dòng và mã câu được yêu cầu bên dưới.\n"
-                )
-                final_prompt = f"{mandatory_preset}\n{strict_rules}\n{nearby}\n{_ask}\n{text_payload}"
+                final_prompt = f"{self.preset_text}\n\n{strict_rules}\n{nearby}\n{_ask}\n{text_payload}"
                 if force_accent_reminder and self.target_lang != "en":
                     final_prompt = (
                         "‼️ LƯU Ý CỰC KỲ QUAN TRỌNG: Bản dịch trước của bạn bị "
