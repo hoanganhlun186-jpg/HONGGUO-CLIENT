@@ -1894,6 +1894,16 @@ def _probe_duration_sec(video_path):
     return 0.0
 
 
+def _valid_finished_video(video_path):
+    """Reject missing/tiny/truncated outputs left behind by a hard reset."""
+    try:
+        return (bool(video_path) and os.path.isfile(video_path)
+                and os.path.getsize(video_path) > 1024
+                and _probe_duration_sec(video_path) > 0)
+    except Exception:
+        return False
+
+
 class SingleRenderThread(QThread):
     log = pyqtSignal(str); done = pyqtSignal(bool)
     progress = pyqtSignal(int)   # % thật của tập đang render (0..100)
@@ -5691,16 +5701,41 @@ class SingleSeriesRenderWidget(QWidget):
         self.cards.sort(key=lambda c: _natural_key(os.path.basename(c.video_path)))
         self._relayout_grid()
         selected_cards = [c for c in self.cards if c in selected_cards]
+        # Resume per episode. Preserve valid final files and render only the rest.
+        completed_outputs = []
+        pending_cards = []
+        for card in selected_cards:
+            vp = card.video_path
+            stem, _ext = os.path.splitext(vp)
+            if stem.lower().endswith("_final"):
+                final_path = vp
+            else:
+                if stem.lower().endswith("_dubbed"):
+                    stem = stem[:-len("_dubbed")]
+                final_path = stem + "_final.mp4"
+            if _valid_finished_video(final_path):
+                completed_outputs.append(final_path)
+                card.set_status("xong")
+                self._log(f"⏭ Đã render hợp lệ, bỏ qua: {os.path.basename(final_path)}")
+            else:
+                if os.path.exists(final_path):
+                    try:
+                        os.remove(final_path)
+                        self._log(f"♻️ File render dở do gián đoạn, làm lại: {os.path.basename(final_path)}")
+                    except Exception as exc:
+                        self._log(f"⚠️ Không xóa được file render dở {os.path.basename(final_path)}: {exc}")
+                pending_cards.append(card)
+
         self._live_render = bool(streaming)
         self._live_accepting = bool(streaming)
-        self._live_cards = list(selected_cards) if streaming else []
+        self._live_cards = list(pending_cards) if streaming else []
         self._live_inputs = {}
         self._live_admitted = set()
         self._live_designs = {id(c): copy.deepcopy(getattr(c, "design_config", None) or self._default_design()) for c in selected_cards} if streaming else {}
-        self._render_queue = [] if streaming else list(selected_cards)
-        self._render_total = len(selected_cards)
+        self._render_queue = [] if streaming else list(pending_cards)
+        self._render_total = len(pending_cards)
         self._render_done_count = 0
-        self._rendered_files = [] # Lưu danh sách file xuất ra để gộp
+        self._rendered_files = list(completed_outputs) # gồm cả file resume để gộp đủ tập
         self._render_failed_files = []  # không tự gộp thiếu tập nếu có render lỗi
         self._render_running = True
         self._stopping = False

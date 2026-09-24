@@ -9,12 +9,14 @@ import os
 import subprocess
 
 try:
-    from shared_utils import get_ffmpeg_path, CREATE_NO_WINDOW
+    from shared_utils import get_ffmpeg_path, get_ffprobe_path, CREATE_NO_WINDOW
 except Exception:
     import shutil as _shutil
     CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
     def get_ffmpeg_path():
         return _shutil.which("ffmpeg") or "ffmpeg"
+    def get_ffprobe_path():
+        return _shutil.which("ffprobe") or "ffprobe"
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
@@ -24,6 +26,22 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSettings, QTimer, QThread, pyqtSignal
 
 from series_queue import QueueMessageBox as QMessageBox
+
+
+def _valid_video_output(path):
+    """True only for a finished, probeable video (not a crash-truncated MP4)."""
+    try:
+        if not path or not os.path.isfile(path) or os.path.getsize(path) <= 1024:
+            return False
+        proc = subprocess.run(
+            [get_ffprobe_path(), "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            errors="ignore", timeout=15,
+            creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
+        return proc.returncode == 0 and float((proc.stdout or "0").strip()) > 0
+    except Exception:
+        return False
 
 # ── Whisper STT ────
 try:
@@ -59,6 +77,31 @@ except Exception as e:
     _GEMINI_AVAILABLE = False
 
 CUSTOM_PROMPT_KEY = "✏️ Tự nhập prompt"
+
+def _pekka_voice_matches_language(voice, lang):
+    """Pekka labels community voice languages in tags, e.g. 🇻🇳 Tiếng Việt."""
+    import re
+    values = []
+    for field in ("tags", "languages", "language", "languageCode", "locale"):
+        value = voice.get(field)
+        if value:
+            values.extend(value if isinstance(value, (list, tuple)) else [value])
+    aliases = {"vi": {"vi", "vie", "vn", "vietnamese", "tiếng việt"},
+               "en": {"en", "eng", "english", "tiếng anh"}}
+    for value in values:
+        if isinstance(value, dict):
+            value = value.get("code") or value.get("name") or ""
+        value = str(value).strip().lower().replace("_", "-")
+        # Remove the flag emoji without guessing from the voice's name.
+        value = re.sub(r"^[^\w]+", "", value).strip()
+        if value in aliases.get(lang, {lang}):
+            return True
+        if re.match(r"^" + re.escape(lang) + r"-[a-z]{2}(?:-|$)", value):
+            return True
+    # Standard locale-prefixed IDs are also explicit language metadata.
+    return bool(re.match(r"^" + re.escape(lang) + r"-[a-z]{2}-",
+                         str(voice.get("id", "")).lower()))
+
 
 def _load_dub_voices(lang="vi", source="capcut"):
     """Nạp danh sách giọng theo nguồn. Trả về list các cặp (tên_hiển_thị, giá_trị_đầy_đủ):
@@ -184,8 +227,9 @@ class PekkaVoicesWorker(QThread):
                 if not data.get("hasNext"):
                     break
                 page += 1
-                if page > 50:  # Chống lặp vô hạn
-                    break
+                if page > 50:  # Không báo thành công với danh sách bị cắt.
+                    self.error.emit("Danh sách vượt 50 trang; chưa tải đủ giọng Pekka.")
+                    return
             self.done.emit(items)
         except Exception as e:
             self.error.emit(str(e))
@@ -794,6 +838,8 @@ class DubFeatureWidget(QWidget):
 
     def _fetch_pekka_voices(self):
         """Xử lý sự kiện bấm nút Tải danh sách giọng Pekka"""
+        if getattr(self, "_voices_worker", None) is not None and self._voices_worker.isRunning():
+            return
         api_key = self.txt_pekka_apikey.text().strip()
         if not api_key:
             QMessageBox.warning(self, "Lỗi", "Vui lòng nhập API Key trước khi tải danh sách giọng!")
@@ -813,39 +859,43 @@ class DubFeatureWidget(QWidget):
 
         # Lưu lại toàn bộ để lọc mà không cần gọi API lại
         self._all_pekka_items = items or []
-        self.wdg_voice_filter.setVisible(True)
+        self.wdg_voice_filter.setVisible(self._voice_source() == "pekka")
         self.txt_voice_filter.blockSignals(True)
         self.txt_voice_filter.clear()
         self.txt_voice_filter.blockSignals(False)
         self._apply_voice_filter("")   # đổ đầy lần đầu
 
-        QMessageBox.information(self, "Thành công", f"Đã tải thành công {len(items)} giọng từ Pekka!")
+        count = self.cmb_dub_voice.count() if self._voice_source() == "pekka" else 0
+        QMessageBox.information(
+            self, "Thành công",
+            f"Đã tải {len(items)} giọng từ Pekka. Đang hiển thị {count} giọng.\n"
+            "Chỉ hiển thị giọng có thông tin ngôn ngữ khớp với ngôn ngữ đích.")
 
     def _apply_voice_filter(self, kw):
+        if self._voice_source() != "pekka":
+            return
         kw = (kw or "").strip().lower()
         cur = self.cmb_dub_voice.currentText()
 
         self.cmb_dub_voice.blockSignals(True)
         self.cmb_dub_voice.clear()
 
-        # 1. Giọng Pekka từ API.
-        #    - Không gõ lọc: chỉ hiện 10 giọng đầu cho gọn.
-        #    - Có gõ lọc: hiện tất cả giọng khớp từ khoá.
-        added = 0
+        # Hiển thị toàn bộ giọng phù hợp, không cắt danh sách đầu.
+        seen = set()
         for v in self._all_pekka_items:
-            name = v.get('name', 'Unknown')
-            vid = v.get('id', '')
-            if kw:
-                if kw not in name.lower():
-                    continue
-            else:
-                if added >= 10:
-                    break
+            name = str(v.get("name") or "Unknown")
+            vid = v.get("id")
+            if not vid or vid in seen:
+                continue
+            if not _pekka_voice_matches_language(v, self._target_lang()):
+                continue
+            if kw and kw not in name.lower():
+                continue
+            seen.add(vid)
             self.cmb_dub_voice.addItem(f"🔊 {name}")
             idx = self.cmb_dub_voice.count() - 1
             self.cmb_dub_voice.setItemData(
                 idx, f"🔊 {name} (Pekka) [pekka:{vid}]", Qt.ItemDataRole.UserRole)
-            added += 1
 
         self.cmb_dub_voice.blockSignals(False)
 
@@ -951,13 +1001,25 @@ class DubFeatureWidget(QWidget):
         th.finished.connect(lambda: self._threads_alive.remove(th) if th in self._threads_alive else None)
 
     def _files_from_host(self, all_series=False):
+        def _resume_source(path):
+            # A hard reset can leave a truncated *_dubbed file. Do not use that
+            # broken file as both input and output; fall back to the original.
+            stem, ext = os.path.splitext(path)
+            if stem.endswith("_dubbed") and not _valid_video_output(path):
+                original = stem[:-len("_dubbed")] + ext
+                if os.path.isfile(original):
+                    return original
+            return path
+
         files = []
         if all_series and getattr(self.host, "_folder_tabs", None):
             for t in self.host._folder_tabs:
                 for c in t.get("cards", []):
                     vp = getattr(c, "video_path", None)
-                    if vp and os.path.exists(vp) and vp not in files:
-                        files.append(vp)
+                    if vp and os.path.exists(vp):
+                        vp = _resume_source(vp)
+                        if vp not in files:
+                            files.append(vp)
             if files:
                 return files
         cards = getattr(self.host, "_batch_cards", None) if getattr(self.host, "_batch_managed", False) else None
@@ -965,8 +1027,10 @@ class DubFeatureWidget(QWidget):
             cards = getattr(self.host, "cards", []) or []
         for c in cards:
             vp = getattr(c, "video_path", None)
-            if vp and os.path.exists(vp) and vp not in files:
-                files.append(vp)
+            if vp and os.path.exists(vp):
+                vp = _resume_source(vp)
+                if vp not in files:
+                    files.append(vp)
         return files
 
     def _save_settings(self):
@@ -1025,6 +1089,9 @@ class DubFeatureWidget(QWidget):
     def _populate_voice_combo(self, lang):
         from PyQt6.QtGui import QColor
         source = self._voice_source()
+        if source == "pekka" and getattr(self, "_all_pekka_items", []):
+            self._apply_voice_filter(self.txt_voice_filter.text())
+            return
         self.cmb_dub_voice.clear()
         items = _load_dub_voices(lang, source)
         if not items and source == "pekka" and lang == "en":
@@ -1810,7 +1877,17 @@ class DubFeatureWidget(QWidget):
             return video_path
         return stem + "_dubbed" + ext
 
+    def _final_for(self, video_path):
+        stem, _ext = os.path.splitext(video_path)
+        if stem.endswith("_final"):
+            return video_path
+        if stem.endswith("_dubbed"):
+            stem = stem[:-len("_dubbed")]
+        return stem + "_final.mp4"
+
     def _episode_incomplete(self, video_path):
+        if _valid_video_output(self._final_for(video_path)):
+            return None
         vi = self._vi_srt_for(video_path)
         if not os.path.exists(vi):
             srt, _lang = self._find_existing_srt(video_path)
@@ -1820,11 +1897,11 @@ class DubFeatureWidget(QWidget):
                 return "chưa có sub Việt (dịch lỗi/chưa dịch)"
         if getattr(self, "_auto_dub_on", False):
             dub = self._dubbed_for(video_path)
-            if not os.path.exists(dub):
+            if not _valid_video_output(dub):
                 if self._srt_is_empty(vi):
                     self._prepare_no_dialogue(video_path, vi)
                     dub = self._dubbed_for(video_path)
-                if not os.path.exists(dub):
+                if not _valid_video_output(dub):
                     return "chưa lồng tiếng"
         return None
 
@@ -2046,8 +2123,14 @@ class DubFeatureWidget(QWidget):
         need_translate = []
         ready_vi = []
         no_dialogue = []
+        already_final = []
+        already_dubbed = []
 
         for vp in files:
+            final_path = self._final_for(vp)
+            if _valid_video_output(final_path):
+                already_final.append(vp)
+                continue
             srt, lang = self._find_existing_srt(vp)
             if not srt:
                 need_stt.append(vp)
@@ -2068,8 +2151,18 @@ class DubFeatureWidget(QWidget):
             else:
                 need_translate.append((vp, srt))
 
-        self._log(f"   • Cần tách sub: {len(need_stt)}  |  cần dịch: {len(need_translate)}  "
-                  f"|  đã có sub Việt: {len(ready_vi)}  |  không thoại: {len(no_dialogue)}")
+        if self._auto_dub_on:
+            pending_ready_vi = []
+            for vp in ready_vi:
+                if _valid_video_output(self._dubbed_for(vp)):
+                    already_dubbed.append(vp)
+                else:
+                    pending_ready_vi.append(vp)
+            ready_vi = pending_ready_vi
+
+        self._log(f"   • Đã render: {len(already_final)}  |  đã lồng: {len(already_dubbed)}  "
+                  f"|  cần tách sub: {len(need_stt)}  |  cần dịch: {len(need_translate)}  "
+                  f"|  chờ lồng: {len(ready_vi)}  |  không thoại: {len(no_dialogue)}")
 
         self._auto_dub_on = self.chk_auto_dub.isChecked()
         self._chain_dub_after_translate = self._auto_dub_on
@@ -2094,9 +2187,9 @@ class DubFeatureWidget(QWidget):
         n_all = len(files)
         units = len(need_stt) + len(need_translate)
         if self._auto_dub_on:
-            units += n_all                    # lồng: mỗi tập 1 việc
+            units += max(0, n_all - len(already_final) - len(already_dubbed))
         if self._render_after_dub:
-            units += n_all                    # render: mỗi tập 1 việc
+            units += max(0, n_all - len(already_final))
         self._host = self.host
         try:
             if hasattr(self.host, "total_progress_begin") and units > 0:
@@ -2119,6 +2212,9 @@ class DubFeatureWidget(QWidget):
             self._log("⚡ Bật lồng xong từng tập → render ngay; chỉ ghép sau khi đủ tập.")
             # Silent episodes are prepared synchronously and have no dubbing worker.
             for vp in no_dialogue:
+                self.host._accept_live_render(vp, self._dubbed_for(vp), self._vi_srt_for(vp))
+            # Resume after a reboot: already dubbed episodes go straight to render.
+            for vp in already_dubbed:
                 self.host._accept_live_render(vp, self._dubbed_for(vp), self._vi_srt_for(vp))
         self._full_need_translate = list(need_translate)
         self._full_ready_vi = list(ready_vi)

@@ -303,7 +303,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.77"
+APP_VERSION = "1.0.78"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -1333,6 +1333,92 @@ class DujuScheduleThread(QThread):
         except Exception:
             self.finished_signal.emit()
 
+_DUJU_DETAIL_CACHE = {}
+
+
+def _duju_parse_info(html, series_id):
+    """Đọc nội dung phim chính; không lấy tên/tóm tắt từ phim liên quan."""
+    from html import unescape
+    from html.parser import HTMLParser
+    class DetailParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.info = {'series_id': str(series_id)}
+            self.capture = None
+            self.end_tag = None
+            self.parts = []
+            self.meta = {}
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            cls = attrs.get('class', '')
+            if tag == 'meta':
+                self.meta[attrs.get('property') or attrs.get('name')] = attrs.get('content', '')
+            if tag == 'h1' and 'title' not in self.info:
+                self.capture, self.end_tag, self.parts = 'title', tag, []
+            elif 'descText' in cls and 'intro' not in self.info:
+                self.capture, self.end_tag, self.parts = 'intro', tag, []
+            elif tag == 'br' and self.capture:
+                self.parts.append('\n')
+            if tag == 'img' and 'posterImg' in cls and 'cover_url' not in self.info:
+                self.info['cover_url'] = unescape(attrs.get('src', ''))
+            label = attrs.get('aria-label', '')
+            if label.startswith('Bấm để chép tên tiếng Trung:'):
+                self.info['original_title'] = label.split(':', 1)[1].strip()
+
+        def handle_data(self, data):
+            if self.capture:
+                self.parts.append(data)
+
+        def handle_endtag(self, tag):
+            if self.capture and tag == self.end_tag:
+                self.info[self.capture] = ''.join(self.parts).strip()
+                self.capture = None
+
+    parser = DetailParser()
+    parser.feed(html)
+    info = parser.info
+    # H1 xác nhận đây là trang phim, không dùng tiêu đề của trang lỗi/đăng nhập.
+    if not info.get('title') or not (info.get('cover_url') or info.get('intro')):
+        return {}
+    info['intro'] = info.get('intro') or parser.meta.get('description') or parser.meta.get('og:description') or ''
+    info['summary_source'] = f'https://duju.info/series/{series_id}'
+    return info
+
+
+def _duju_get_info(series_id):
+    sid = str(series_id)
+    if not sid.isdigit():
+        return {}
+    cached = _DUJU_DETAIL_CACHE.get(sid)
+    if cached and time.time() - cached[0] < 1800:
+        return dict(cached[1])
+    try:
+        response = requests.get(f'https://duju.info/series/{sid}',
+                                headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+        response.raise_for_status()
+        info = _duju_parse_info(response.text, sid)
+        if info:
+            _DUJU_DETAIL_CACHE[sid] = (time.time(), dict(info))
+        return info
+    except Exception:
+        return {}
+
+
+class MovieMetadataThread(QThread):
+    ready = pyqtSignal(dict)
+
+    def __init__(self, data):
+        super().__init__()
+        self.data = dict(data)
+
+    def run(self):
+        data = dict(self.data)
+        info = _duju_get_info(data.get('series_id', ''))
+        data.update({key: value for key, value in info.items() if value})
+        self.ready.emit(data)
+
+
 class DujuDetailThread(QThread):
     """Lấy thông tin chi tiết 1 phim từ duju.info/series/<id> (SSR trong HTML).
     Ngày phát hành: aria-label="Lên sóng ngày DD/MM/YYYY".
@@ -1366,6 +1452,11 @@ class DujuDetailThread(QThread):
                 # Mô tả (meta description)
                 mdesc = re.search(r'<meta name="description" content="([^"]+)"', t)
                 if mdesc: info["intro"] = mdesc.group(1).strip()
+                # Ưu tiên tóm tắt đầy đủ trong descText thay vì meta bị rút gọn.
+                parsed_info = _duju_parse_info(t, self.series_id)
+                info.update(parsed_info)
+                if parsed_info:
+                    _DUJU_DETAIL_CACHE[self.series_id] = (time.time(), dict(parsed_info))
                 # Thể loại: các tag trong detail
                 tags = re.findall(r'(?:tag|genre|category)[^"]*"[^>]*>([^<]{2,20})<', t, re.I)
                 # dự phòng: lấy các chip thể loại phổ biến
@@ -1819,6 +1910,150 @@ def _hg_episode_count(detail):
     return len(videos) if isinstance(videos, list) else 0
 
 
+def _hg_safe_name(value, fallback="Phim"):
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', str(value or '')).strip().rstrip('. ')
+    name = name[:120].rstrip('. ') or fallback
+    if re.match(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)', name, re.I):
+        name = '_' + name
+    return name
+
+
+def _hg_movie_folder(root, series_id, title):
+    sid = _hg_safe_name(series_id, 'unknown')
+    return os.path.join(root, sid)
+
+
+def _hg_episode_filename(folder, title, episode_number):
+    number = int(episode_number)
+    name = f"{_hg_safe_name(title)} - Tập {number:02d}.mp4"
+    # Nhận diện tập cũ để không tải trùng hoặc làm hỏng quy trình xử lý tiếp.
+    legacy = f"Tap_{number:02d}.mp4"
+    legacy_path = os.path.join(folder, legacy)
+    if not os.path.exists(os.path.join(folder, name)) and os.path.isfile(legacy_path) and os.path.getsize(legacy_path) > 1024:
+        return legacy
+    return name
+
+
+def _hg_summary(detail):
+    from html import unescape
+    for key in ('series_intro', 'series_description', 'series_desc', 'description',
+                'intro', 'abstract', 'summary', 'synopsis'):
+        value = detail.get(key)
+        if isinstance(value, str) and value.strip():
+            value = re.sub(r'<br\s*/?>|</p>', '\n', value, flags=re.I)
+            return unescape(re.sub(r'<[^>]+>', '', value)).strip()
+    return ''
+
+
+class MovieAssetsThread(QThread):
+    message = pyqtSignal(str)
+
+    def __init__(self, folder, data, save_cover=True, save_summary=True, covers_dir=''):
+        super().__init__()
+        self.folder = folder
+        self.data = dict(data)  # Không phụ thuộc tab đang xem khi chuyển phim.
+        self.save_cover = save_cover
+        self.save_summary = save_summary
+        self.covers_dir = covers_dir
+
+    def run(self):
+        data = self.data
+        title = data.get('title') or data.get('series_id') or 'Phim'
+        sid = str(data.get('series_id') or '')
+        safe_title = _hg_safe_name(title)
+        headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://hongguoduanju.com/'}
+        try:
+            os.makedirs(self.folder, exist_ok=True)
+            summary = _hg_summary(data)
+            cover_url = data.get('cover_url') or ''
+            if sid.isdigit() and ((self.save_summary and not summary) or (self.save_cover and not cover_url)):
+                try:
+                    response = requests.get('https://hongguoduanju.com/detail',
+                        params={'series_id': sid}, headers=headers, timeout=20)
+                    response.raise_for_status()
+                    detail = _hg_parse_html(response.text, sid) or {}
+                    summary = summary or _hg_summary(detail)
+                    cover_url = cover_url or detail.get('series_cover') or ''
+                except Exception:
+                    pass
+            if self.save_summary:
+                try:
+                    if not summary and sid.isdigit():
+                        info = _duju_get_info(sid)
+                        summary = info.get('intro') or ''
+                        if summary:
+                            data['summary_source'] = info.get('summary_source', '')
+                    if summary:
+                        path = os.path.join(self.folder, f'{safe_title} - Tom tat.txt')
+                        with open(path, 'w', encoding='utf-8-sig') as out:
+                            origin = data.get('original_title') or title
+                            source_url = data.get('summary_source') or f'https://hongguoduanju.com/detail?series_id={sid}'
+                            out.write(f'{title}\nTên gốc: {origin}\nID: {sid}\nNguồn: {source_url}\n\n{summary}\n')
+                        self.message.emit(f'📝 {title}: đã lưu tóm tắt.')
+                    else:
+                        self.message.emit(f'⚠️ {title}: nguồn chưa có nội dung tóm tắt.')
+                except Exception as exc:
+                    self.message.emit(f'⚠️ {title}: chưa lưu được tóm tắt ({exc}).')
+            if self.save_cover:
+                try:
+                    for ext in ('.jpg', '.jpeg', '.png', '.webp', '.gif'):
+                        path = os.path.join(self.folder, safe_title + ext)
+                        if os.path.isfile(path) and os.path.getsize(path) > 0:
+                            return
+                    content = data.get('cover_bytes')
+                    if not content and self.covers_dir:
+                        cache = os.path.join(self.covers_dir, _hg_safe_name(sid) + '.img')
+                        if os.path.isfile(cache):
+                            with open(cache, 'rb') as cached:
+                                content = cached.read()
+                    if not content:
+                        if not cover_url:
+                            raise ValueError('nguồn chưa có ảnh bìa')
+                        if cover_url.startswith('//'):
+                            cover_url = 'https:' + cover_url
+                        for attempt in range(3):
+                            try:
+                                response = requests.get(cover_url, headers=headers, timeout=15)
+                                response.raise_for_status()
+                                content = response.content
+                                break
+                            except requests.RequestException:
+                                if attempt == 2:
+                                    raise
+                                time.sleep(attempt + 1)
+                    if content[4:8] == b'ftyp' or content[:4] == b'\x1a\x45\xdf\xa3':
+                        ffmpeg = get_ffmpeg_path()
+                        if not ffmpeg:
+                            raise ValueError('không tìm thấy ffmpeg để lấy ảnh từ bìa động')
+                        with tempfile.TemporaryDirectory(prefix='hongguo_cover_') as temp:
+                            video = os.path.join(temp, 'cover.mp4')
+                            frame = os.path.join(temp, 'cover.jpg')
+                            with open(video, 'wb') as out:
+                                out.write(content)
+                            subprocess.run([ffmpeg, '-y', '-i', video, '-vframes', '1', '-q:v', '2', frame],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           check=True, timeout=60)
+                            with open(frame, 'rb') as out:
+                                content = out.read()
+                    if content[:8] == b'\x89PNG\r\n\x1a\n': ext = '.png'
+                    elif content[:4] == b'RIFF' and content[8:12] == b'WEBP': ext = '.webp'
+                    elif content[:6] in (b'GIF87a', b'GIF89a'): ext = '.gif'
+                    elif content[:3] == b'\xff\xd8\xff': ext = '.jpg'
+                    else: raise ValueError('dữ liệu trả về không phải ảnh hợp lệ')
+                    path = os.path.join(self.folder, safe_title + ext)
+                    fd, pending = tempfile.mkstemp(prefix='.cover_', dir=self.folder)
+                    try:
+                        with os.fdopen(fd, 'wb') as out:
+                            out.write(content)
+                        os.replace(pending, path)
+                    finally:
+                        if os.path.exists(pending): os.remove(pending)
+                    self.message.emit(f'🖼️ {title}: đã lưu ảnh bìa.')
+                except Exception as exc:
+                    self.message.emit(f'⚠️ {title}: chưa tải được ảnh bìa ({exc}). Bấm tải lại để thử lại.')
+        except Exception as exc:
+            self.message.emit(f'⚠️ {title}: không lưu được thông tin phim ({exc}).')
+
 class HonggouScanThread(QThread):
     scan_result = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
@@ -1830,6 +2065,9 @@ class HonggouScanThread(QThread):
         self.auth_token = auth_token  
 
     def _resolve_to_detail_url(self, url):
+        match = re.search(r"(?:https?://)?(?:www\.)?duju\.info/series/(\d+)", url)
+        if match:
+            return f"https://hongguoduanju.com/detail?series_id={match.group(1)}"
         if "hongguoduanju.com/detail" in url or "hongguoduanju.com/player" in url: return url
         if re.search(r'novelquickapp\.com/s/', url):
             try:
@@ -1919,6 +2157,10 @@ class HonggouScanThread(QThread):
             series_id = str(detail.get("series_id") or "")
             title = detail.get("series_name") or "Phim không rõ tên"
             cover_url = detail.get("series_cover") or ""
+            duju_info = _duju_get_info(series_id)
+            original_title = title
+            title = duju_info.get("title") or title
+            cover_url = duju_info.get("cover_url") or cover_url
 
             total_episodes = _hg_episode_count(detail)
 
@@ -1942,6 +2184,9 @@ class HonggouScanThread(QThread):
                 data = res.json()
                 data["title"] = title
                 data["cover_url"] = cover_url
+                data["intro"] = duju_info.get("intro") or _hg_summary(detail) or _hg_summary(data)
+                data["original_title"] = original_title
+                data["summary_source"] = (duju_info.get("summary_source") if duju_info.get("intro") else self.url)
                 data["total_episodes"] = total_episodes
                 self.scan_result.emit(data)
             else:
@@ -2322,9 +2567,14 @@ class SingleDriveDownloadThread(QThread):
         
         max_retries = 3
         for attempt in range(max_retries):
-            if os.path.exists(file_path) and os.path.getsize(file_path) > 1024:
+            if (os.path.exists(file_path) and os.path.getsize(file_path) > 1024
+                    and self._looks_like_mp4(file_path)):
                 self.done_signal.emit(ep_num, file_path)
                 return
+            elif os.path.exists(file_path):
+                # File cũ bị cụt/hỏng không được tính là đã tải thành công.
+                try: os.remove(file_path)
+                except Exception: pass
 
             try:
                 if attempt > 0:
@@ -2352,12 +2602,20 @@ class SingleDriveDownloadThread(QThread):
                             decrypt_file(enc_path, aes_key, file_path)
                             if os.path.exists(enc_path):
                                 os.remove(enc_path)
+                            if not self._looks_like_mp4(file_path):
+                                try: os.remove(file_path)
+                                except Exception: pass
+                                raise Exception("File sau giải mã không phải MP4 hợp lệ")
                             self.done_signal.emit(ep_num, file_path)
                             return
                         except Exception as dec_e:
                             raise Exception(f"Lỗi bẻ khóa video: {str(dec_e)}")
                     else:
                         os.rename(part_path, file_path)
+                        if not self._looks_like_mp4(file_path):
+                            try: os.remove(file_path)
+                            except Exception: pass
+                            raise Exception("File tải về không phải MP4 hợp lệ")
                         self.done_signal.emit(ep_num, file_path)
                         return
                 else:
@@ -2388,7 +2646,8 @@ class DriveDownloadManager(QObject):
     all_done_signal = pyqtSignal(int)               
     dead_link_signal = pyqtSignal(int)
 
-    def __init__(self, episodes, save_folder, auth_token, parent=None, max_concurrent=None, expected_total=0):
+    def __init__(self, episodes, save_folder, auth_token, parent=None, max_concurrent=None,
+                 expected_total=0, external_retry=False):
         super().__init__(parent)
         self._pending = list(episodes)
         self.save_folder = save_folder
@@ -2396,6 +2655,10 @@ class DriveDownloadManager(QObject):
         self._workers = []         
         self._success_count = 0
         self._finished_count = 0
+        self._successful_eps = set()
+        self._failed_eps = set()
+        self._all_done_emitted = False
+        self.external_retry = bool(external_retry)
         self._paused = False       # cờ tạm dừng: True = không tung worker mới
         self.expected_total = expected_total  
         self.max_concurrent = max_concurrent or MAX_CONCURRENT_DOWNLOADS
@@ -2430,6 +2693,9 @@ class DriveDownloadManager(QObject):
         return self._paused
 
     def add_and_run_episode(self, ep_data):
+        ep_num = ep_data.get("episode_number")
+        if ep_num in self._successful_eps or ep_num in self._failed_eps:
+            return
         self._pending.append(ep_data)
         if self._paused:
             return  # đang tạm dừng thì chỉ xếp hàng, không tải
@@ -2449,25 +2715,45 @@ class DriveDownloadManager(QObject):
         worker.start()
 
     def _check_all_done(self):
-        if self._finished_count >= self.expected_total:
+        terminal_count = len(self._successful_eps) + len(self._failed_eps)
+        self._finished_count = terminal_count
+        self._success_count = len(self._successful_eps)
+        if (not self._all_done_emitted
+                and terminal_count >= self.expected_total):
+            self._all_done_emitted = True
             self.all_done_signal.emit(self._success_count)
 
     def _on_worker_done(self, ep_num, file_path):
-        self._success_count += 1
-        self._finished_count += 1
+        if ep_num in self._successful_eps or ep_num in self._failed_eps:
+            return
+        self._successful_eps.add(ep_num)
         self.done_signal.emit(ep_num, file_path)
         self._launch_next()
         self._check_all_done()
 
     def _on_worker_error(self, ep_num, error_msg):
-        self._finished_count += 1
+        # Widget sẽ xin link mới và xếp lại đúng tập này. Chỉ mark_failed khi
+        # đã dùng hết số lần retry, tránh kết thúc cả phiên tải quá sớm.
         self.error_signal.emit(ep_num, error_msg)
-        self._launch_next()
-        self._check_all_done()
+        if self.external_retry:
+            self._launch_next()
+        else:
+            self.mark_failed(ep_num)
 
     def _on_worker_dead_link(self, ep_num):
         self.dead_link_signal.emit(ep_num)
-        self._launch_next() 
+        if self.external_retry:
+            self._launch_next()
+        else:
+            self.mark_failed(ep_num)
+
+    def mark_failed(self, ep_num):
+        """Đánh dấu thất bại cuối cùng sau khi đã retry hết link mới."""
+        if ep_num in self._successful_eps or ep_num in self._failed_eps:
+            return
+        self._failed_eps.add(ep_num)
+        self._launch_next()
+        self._check_all_done()
 
 # ==========================================
 # STT BATCH THREAD — Tách sub từ file video
@@ -3681,6 +3967,7 @@ class HonggouWidget(QWidget):
 
         self._bulk_queue = list(result)
         self._bulk_done_count = 0
+        self._bulk_failed_series = 0
         self._bulk_total = len(result)
         self._bulk_total_eps = sum(len(s.get("episodes", [])) for s in result)
         self._bulk_eps_done = 0
@@ -3714,25 +4001,38 @@ class HonggouWidget(QWidget):
         if not getattr(self, '_bulk_queue', None):
             try:
                 if getattr(self, '_bulk_dlg', None): self._bulk_dlg.close()
-                QMessageBox.information(self, "Hoàn tất", f"Đã tải xong {self._bulk_done_count}/{self._bulk_total} bộ ({self._bulk_eps_done} tập).")
+                if self._bulk_eps_done == self._bulk_total_eps:
+                    QMessageBox.information(self, "Hoàn tất",
+                        f"Đã tải đủ {self._bulk_done_count}/{self._bulk_total} bộ ({self._bulk_eps_done}/{self._bulk_total_eps} tập).")
+                else:
+                    QMessageBox.warning(self, "Tải chưa đủ",
+                        f"Đã tải thực tế {self._bulk_eps_done}/{self._bulk_total_eps} tập.\n"
+                        f"Có {self._bulk_failed_series} bộ bị thiếu tập hoặc lỗi file.")
             except Exception: pass
             return
         s = self._bulk_queue.pop(0)
+        worker = MovieMetadataThread(s)
+        worker.ready.connect(self._start_bulk_series)
+        self._keep_thread_alive(worker)
+        worker.start()
+
+    def _start_bulk_series(self, s):
         sid = str(s.get("series_id")); title = s.get("title") or sid
         eps = s.get("episodes", [])
         if not eps:
             self._bulk_done_count += 1
             self._start_next_bulk_series(); return
-        sub = os.path.join(self.save_folder, sid)
+        sub = _hg_movie_folder(self.save_folder, sid, title)
         try: os.makedirs(sub, exist_ok=True)
         except Exception: pass
+        self._start_movie_assets(sub, dict(s, series_id=sid, title=title))
 
         eps = [{
             "episode_number": e.get("episode_number"),
             "drive_link": e.get("url") or e.get("drive_link"),
             "aes_key": e.get("aes_key", ""),
             "source": e.get("source", ""),
-            "file_name": e.get("file_name"),
+            "file_name": _hg_episode_filename(sub, title, e.get("episode_number")),
         } for e in eps]
 
         cur_idx = self._bulk_done_count + 1
@@ -3754,6 +4054,8 @@ class HonggouWidget(QWidget):
             except Exception: pass
         def _series_done(_succ=0):
             self._bulk_done_count += 1
+            if int(_succ) != len(eps):
+                self._bulk_failed_series += 1
             try: self._save_to_history(sid, title, "", total_eps=s.get("total_episodes", len(eps)), downloaded=True)
             except Exception: pass
             self._start_next_bulk_series()
@@ -4250,13 +4552,13 @@ class HonggouWidget(QWidget):
 
         self.chk_auto_cover = QCheckBox("🖼️ Tự động tải ảnh bìa")
         self.chk_auto_cover.setChecked(False)
-        self.chk_auto_cover.setToolTip("Bật = tự động lưu ảnh bìa phim vào thư mục phim mỗi khi bắt đầu tải.")
+        self.chk_auto_cover.setToolTip("Bật một lần để tải ảnh bìa cho mọi phim, kể cả tải hàng loạt. Tóm tắt luôn được lưu nếu nguồn có.")
         self.chk_auto_cover.setStyleSheet("""
             QCheckBox { color: #fcd34d; font-weight: bold; font-size: 13px; padding: 2px; }
             QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #d97706; border-radius: 4px; background: #1f2937; }
             QCheckBox::indicator:checked { background: #d97706; }
         """)
-        try: self.chk_auto_cover.setChecked(self.settings.value("auto_cover", "false") == "true")
+        try: self.chk_auto_cover.setChecked(str(self.settings.value("auto_cover", "false")).lower() in ("true", "1"))
         except Exception: pass
         self.chk_auto_cover.stateChanged.connect(
             lambda v: self.settings.setValue("auto_cover", "true" if v else "false")
@@ -5553,6 +5855,9 @@ class HonggouWidget(QWidget):
         self.content_stack.setCurrentWidget(self.page_grid)
 
     def _normalize_url(self, raw_url):
+        match = re.search(r"(?:https?://)?(?:www\.)?duju\.info/series/(\d+)", raw_url)
+        if match:
+            return f"https://hongguoduanju.com/detail?series_id={match.group(1)}"
         if "hongguoduanju.com/detail" in raw_url or "hongguoduanju.com/player" in raw_url: return raw_url
         video_series_id = None
         decoded = raw_url
@@ -5667,7 +5972,7 @@ class HonggouWidget(QWidget):
         """Danh sách (tên, widget, kiểu) các widget cấu hình cần nhớ theo tab.
         kiểu: 'chk' (checkbox), 'cbo' (combo - lưu index), 'int'/'dbl' (spin)."""
         specs = [
-            ("chk_auto_cover", "chk"), ("chk_auto_stt", "chk"), ("chk_do_translate", "chk"),
+            ("chk_auto_stt", "chk"), ("chk_do_translate", "chk"),
             ("chk_auto_dub", "chk"), ("chk_remove_bgm", "chk"), ("chk_bgm_del_original", "chk"),
             ("chk_del_original", "chk"), ("chk_mute_original", "chk"), ("chk_show_browser", "chk"),
             ("chk_use_gpu", "chk"),
@@ -5775,6 +6080,11 @@ class HonggouWidget(QWidget):
             "title": getattr(self, 'current_title', ''),
             "episodes": getattr(self, 'current_episodes', []),
             "cover_url": getattr(self, 'current_cover_url', ''),
+            "intro": getattr(self, 'current_intro', ''),
+            "original_title": getattr(self, 'current_original_title', ''),
+            "summary_source": getattr(self, 'current_summary_source', ''),
+            "cover_bytes": getattr(self, 'current_cover_bytes', None),
+            "cover_pixmap": getattr(self, 'current_cover_pixmap', None),
             "total_eps": getattr(self, 'current_total_eps', 0),
             "job_id": getattr(self, 'current_job_id', None),
         })
@@ -5795,6 +6105,11 @@ class HonggouWidget(QWidget):
         self.current_title = d.get("title", "")
         self.current_episodes = d.get("episodes", [])
         self.current_cover_url = d.get("cover_url", "")
+        self.current_intro = d.get("intro", "")
+        self.current_original_title = d.get("original_title", "")
+        self.current_summary_source = d.get("summary_source", "")
+        self.current_cover_bytes = d.get("cover_bytes")
+        self.current_cover_pixmap = d.get("cover_pixmap")
         self.current_total_eps = d.get("total_eps", 0)
         self.current_job_id = d.get("job_id", None)
         # nạp cấu hình riêng của tab này (nếu đã lưu)
@@ -5833,7 +6148,7 @@ class HonggouWidget(QWidget):
             return
             
         is_url = False
-        if re.search(r'https?://', raw_text) or "hongguoduanju.com" in raw_text: is_url = True
+        if re.search(r'https?://', raw_text) or "hongguoduanju.com" in raw_text or "duju.info/series/" in raw_text: is_url = True
 
         if not is_url:
             self._search_keyword(raw_text)
@@ -5986,6 +6301,12 @@ class HonggouWidget(QWidget):
         self.current_series_id = str(data.get("series_id", "")) 
         self.current_title = data.get("title", "Không rõ tên")
         self.current_cover_url = data.get("cover_url", "")
+        self.current_intro = _hg_summary(data)
+        self.current_original_title = data.get("original_title", "")
+        self.current_summary_source = data.get("summary_source", "")
+        self.current_cover_bytes = None
+        self.current_cover_pixmap = None
+        self.current_total_eps = data.get("total_episodes", 0)
         total_eps = data.get("total_episodes", 0)
         self.current_episodes = data.get("episodes", [])
 
@@ -6014,6 +6335,8 @@ class HonggouWidget(QWidget):
                         self.current_cover_pixmap = pix.scaled(40, 50, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             except: pass
         
+        self._save_current_tab_state()
+
         if hasattr(self, 'lbl_downloaded_badge'):
             if str(self.current_series_id) in getattr(self, '_cached_history_ids', set()): self.lbl_downloaded_badge.show()
             else: self.lbl_downloaded_badge.hide()
@@ -6075,13 +6398,13 @@ class HonggouWidget(QWidget):
 
         if self.table.rowCount() != total_eps: self.table.setRowCount(total_eps)
         readonly_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        movie_folder = os.path.join(self.save_folder, str(getattr(self, 'current_series_id', '') or ''))
+        movie_folder = self._movie_folder()
             
         for i in range(total_eps):
             ep_num = i + 1
             ep_data = next((e for e in episodes if e.get("episode_number") == ep_num), None)
             
-            file_name = f"Tap_{ep_num:02d}.mp4"
+            file_name = _hg_episode_filename(movie_folder, self.current_title, ep_num)
             
             ep_item = QTableWidgetItem(f" Tập {ep_num}")
             ep_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
@@ -6183,9 +6506,8 @@ class HonggouWidget(QWidget):
         # người dùng chuyển tab xem bộ khác trong lúc tải cũng không bị loạn.
         self._active_dl_table = self.table
         self._active_dl_series_id = self.current_series_id
-
-        if getattr(self, 'chk_auto_cover', None) and self.chk_auto_cover.isChecked():
-            self._save_cover_image(silent=True)
+        self._active_dl_title = self.current_title
+        self._active_dl_job_id = self.current_job_id
 
         if getattr(self, 'monitor_thread', None):
             self.monitor_thread.stop()
@@ -6198,9 +6520,9 @@ class HonggouWidget(QWidget):
         self.btn_pause.show()
         self.lbl_status.setText("⏳ Đang xử lý...")
 
-        folder_name = self.current_series_id if self.current_series_id else "Phim_Khong_Ro_ID"
-        final_save_path = os.path.join(self.save_folder, folder_name)
+        final_save_path = self._movie_folder()
         os.makedirs(final_save_path, exist_ok=True)
+        self._start_movie_assets(final_save_path)
 
         self._save_to_history(self.current_series_id, self.current_title, self.current_cover_url,
                               total_eps=len(self.current_episodes) or getattr(self, 'current_total_eps', 0),
@@ -6208,13 +6530,18 @@ class HonggouWidget(QWidget):
                               downloaded=True)
 
         num_eps = len(selected_eps_nums)
+        self._active_dl_selected_eps = {int(x) for x in selected_eps_nums}
+        self._link_received_eps = set()
         self._dl_finished = 0
         self.total_progress.setMaximum(num_eps); self.total_progress.setValue(0); self.total_progress.show()
 
         self.downloaded_file_paths = []
+        self._active_dl_expected_files = {}
         for ep_num in selected_eps_nums:
-            fname = f"Tap_{int(ep_num):02d}.mp4"
-            self.downloaded_file_paths.append(os.path.join(final_save_path, fname))
+            fname = _hg_episode_filename(final_save_path, self._active_dl_title, ep_num)
+            expected_path = os.path.join(final_save_path, fname)
+            self.downloaded_file_paths.append(expected_path)
+            self._active_dl_expected_files[int(ep_num)] = expected_path
 
         try: max_threads = int(self.threads_combo.currentText())
         except Exception: max_threads = 3
@@ -6227,7 +6554,8 @@ class HonggouWidget(QWidget):
             self.auth_token, 
             parent=self, 
             max_concurrent=max_threads, 
-            expected_total=num_eps
+            expected_total=num_eps,
+            external_retry=True
         )
         self.download_manager.progress_signal.connect(self._on_download_progress)
         self.download_manager.done_signal.connect(self._on_episode_downloaded)
@@ -6249,11 +6577,14 @@ class HonggouWidget(QWidget):
         self._keep_thread_alive(self.stream_thread)
         self.stream_thread.link_ready_signal.connect(self._on_stream_link_ready)
         self.stream_thread.error_signal.connect(self._on_pay_error)
+        self.stream_thread.all_done_signal.connect(self._on_stream_links_finished)
         self.stream_thread.start()
 
     def _on_stream_link_ready(self, data):
         ep_num = data.get("episode_number")
         url = data.get("url")
+        if ep_num:
+            self._link_received_eps.add(int(ep_num))
         
         if ep_num and url:
             # Chỉ trừ lượt khi THỰC SỰ có link tải về (tập đầu tiên hợp lệ). Trừ
@@ -6265,12 +6596,12 @@ class HonggouWidget(QWidget):
 
             ep_item_data = {
                 "episode_number": ep_num,
-                "file_name": f"Tap_{int(ep_num):02d}.mp4",
+                "file_name": self._active_episode_filename(ep_num),
                 "drive_link": url,
                 "aes_key": data.get("aes_key", ""),
                 "source": data.get("source", ""),
-                "series_id": self.current_series_id,
-                "job_id": self.current_job_id
+                "series_id": self._active_dl_series_id,
+                "job_id": self._active_dl_job_id
             }
             self.download_manager.add_and_run_episode(ep_item_data)
             
@@ -6279,50 +6610,71 @@ class HonggouWidget(QWidget):
                 self.lbl_status.setText("⏳ Đang tải và bẻ khóa các tập phim về máy...")
                 
         elif ep_num and data.get("status") == "error":
-            self.download_manager._finished_count += 1
-            self.download_manager.error_signal.emit(int(ep_num), data.get("message", "Tải thất bại"))
-            self.download_manager._check_all_done()
+            self._retry_failed_episode(int(ep_num), data.get("message", "Không lấy được link tải"))
             self._refresh_balance()
 
+    def _on_stream_links_finished(self):
+        """Retry cả trường hợp server kết thúc luồng nhưng bỏ sót một tập."""
+        selected = getattr(self, '_active_dl_selected_eps', set())
+        received = getattr(self, '_link_received_eps', set())
+        for ep_num in sorted(selected - received):
+            self._retry_failed_episode(ep_num, "Máy chủ chưa trả link cho tập này")
+
     def _on_dead_link(self, ep_num):
+        self._retry_failed_episode(ep_num, "Link tải lỗi hoặc đã hết hạn")
+
+    def _active_episode_filename(self, ep_num):
+        """Giữ nguyên tên file đã chốt đầu phiên, kể cả khi retry file cũ."""
+        path = getattr(self, '_active_dl_expected_files', {}).get(int(ep_num))
+        if path:
+            return os.path.basename(path)
+        return _hg_episode_filename(
+            self.download_manager.save_folder, self._active_dl_title, ep_num)
+
+    def _retry_failed_episode(self, ep_num, error_msg="Tải thất bại"):
+        """Xin link mới rồi tải lại mọi lỗi tải/link, tối đa 3 lần mỗi tập."""
+        ep_num = int(ep_num)
         retry_count = self.server_retries.get(ep_num, 0)
-        if retry_count >= 2:
-            self.download_manager._finished_count += 1
-            self.download_manager.error_signal.emit(ep_num, "Tải thất bại.")
-            self.download_manager._check_all_done()
+        max_link_retries = 3
+        if retry_count >= max_link_retries:
+            self._mark_episode_failed(ep_num,
+                f"{error_msg} (đã thử lại {max_link_retries} lần)")
+            self.download_manager.mark_failed(ep_num)
             return
-            
+
         self.server_retries[ep_num] = retry_count + 1
-        
         row = ep_num - 1
         if row < self._dl_table().rowCount():
-            status_item = QTableWidgetItem(f"🔄 Đang thử lại...")
+            status_item = QTableWidgetItem(
+                f"🔄 Lấy link mới lần {self.server_retries[ep_num]}/{max_link_retries}...")
             status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             status_item.setForeground(QColor("#f59e0b"))
+            status_item.setToolTip(str(error_msg))
             self._dl_table().setItem(row, 3, status_item)
-            
-        thread = RetryDeadLinkThread(self.username, self.current_job_id, self.current_series_id, ep_num, self.auth_token)
+
+        thread = RetryDeadLinkThread(
+            self.username, self._active_dl_job_id, self._active_dl_series_id,
+            ep_num, self.auth_token)
         self._keep_thread_alive(thread)
-        thread.new_link_signal.connect(self._on_new_link_received)
+        thread.new_link_signal.connect(
+            lambda data, requested_ep=ep_num: self._on_new_link_received(data, requested_ep))
         thread.start()
 
-    def _on_new_link_received(self, data):
-        ep_num = data.get("episode_number")
+    def _on_new_link_received(self, data, requested_ep=None):
+        ep_num = data.get("episode_number") or requested_ep
         if data.get("status") == "success":
             ep_item_data = {
                 "episode_number": ep_num,
-                "file_name": f"Tap_{int(ep_num):02d}.mp4",
+                "file_name": self._active_episode_filename(ep_num),
                 "drive_link": data["url"],
                 "aes_key": data.get("aes_key", ""),
                 "source": data.get("source", "momigo_raw"),
-                "series_id": self.current_series_id,
-                "job_id": self.current_job_id
+                "series_id": self._active_dl_series_id,
+                "job_id": self._active_dl_job_id
             }
             self.download_manager.add_and_run_episode(ep_item_data)
         else:
-            self.download_manager._finished_count += 1
-            self.download_manager.error_signal.emit(ep_num, data.get("message", "Tải thất bại"))
-            self.download_manager._check_all_done()
+            self._retry_failed_episode(ep_num, data.get("message", "Không lấy được link mới"))
 
     def _hide_pause_btn(self):
         if hasattr(self, 'btn_pause'):
@@ -6338,7 +6690,7 @@ class HonggouWidget(QWidget):
         QMessageBox.critical(self, "Lỗi Xử Lý", error_msg)
 
     def _open_movie_folder(self):
-        folder = os.path.join(self.save_folder, str(getattr(self, 'current_series_id', '') or ''))
+        folder = self._movie_folder()
         if not os.path.isdir(folder): folder = self.save_folder
         try: os.startfile(folder)
         except Exception as e: QMessageBox.warning(self, "Lỗi", f"Không mở được thư mục: {e}")
@@ -6371,77 +6723,36 @@ class HonggouWidget(QWidget):
                 return True
         return False
 
+    def _movie_folder(self):
+        return _hg_movie_folder(self.save_folder,
+                                getattr(self, 'current_series_id', ''),
+                                getattr(self, 'current_title', ''))
+
+    def _start_movie_assets(self, folder, data=None, save_cover=None, save_summary=True):
+        if data is None:
+            data = {
+                'series_id': self.current_series_id,
+                'title': self.current_title,
+                'cover_url': getattr(self, 'current_cover_url', ''),
+                'cover_bytes': getattr(self, 'current_cover_bytes', None),
+                'intro': getattr(self, 'current_intro', ''),
+                'original_title': getattr(self, 'current_original_title', ''),
+                'summary_source': getattr(self, 'current_summary_source', ''),
+            }
+        if save_cover is None:
+            save_cover = self.chk_auto_cover.isChecked()
+        worker = MovieAssetsThread(folder, data, save_cover, save_summary, self._get_covers_dir())
+        worker.message.connect(self._on_movie_asset_message)
+        self._keep_thread_alive(worker)
+        worker.start()
+
+    def _on_movie_asset_message(self, message):
+        if hasattr(self, 'txt_stt_log'):
+            self.txt_stt_log.show()
+            self.txt_stt_log.append(message)
+
     def _save_cover_image(self, silent=False):
-        cover_url = (getattr(self, 'current_cover_url', '') or '').strip()
-        if not cover_url:
-            if not silent:
-                QMessageBox.warning(self, "Chưa có ảnh bìa",
-                    "Chưa quét phim nào hoặc phim này không có ảnh bìa.\n"
-                    "Hãy quét 1 phim trước khi tải ảnh bìa.")
-            return
-        if cover_url.startswith('//'):
-            cover_url = 'https:' + cover_url
-
-        folder = os.path.join(self.save_folder, str(getattr(self, 'current_series_id', '') or ''))
-        os.makedirs(folder, exist_ok=True)
-
-        safe_title = re.sub(r'[\\/:*?"<>|]', '_', getattr(self, 'current_title', '') or 'poster').strip() or 'poster'
-
-        # KHÔNG đoán đuôi file từ chuỗi URL (dễ sai nếu URL không có đuôi rõ
-        # ràng hoặc dùng link ký số phức tạp) - tải về trước, rồi xác định
-        # đúng định dạng THẬT dựa vào Content-Type / magic bytes của dữ liệu
-        # tải được, tránh lưu nhầm .jpg cho ảnh WEBP/PNG/... hoặc video khác.
-        if silent:
-            for _ext_check in ('.jpg', '.jpeg', '.png', '.webp', '.gif'):
-                if os.path.exists(os.path.join(folder, f"{safe_title}{_ext_check}")):
-                    return  # Đã có sẵn, khỏi tải lại
-
-        try:
-            resp = requests.get(cover_url, timeout=15)
-            resp.raise_for_status()
-            content = resp.content
-            content_type = resp.headers.get('Content-Type', '')
-
-            if self._looks_like_video(content_type, content):
-                # "Bìa động" dạng video (VD MP4 ngắn) chứ không phải ảnh tĩnh
-                # - trích 1 khung hình bằng ffmpeg làm ảnh bìa TĨNH thật, đúng
-                # ý người dùng ("tải ảnh bìa" chứ không phải tải video).
-                import tempfile as _tempfile, subprocess as _subprocess
-                tmp_video = os.path.join(_tempfile.gettempdir(), f"_cover_tmp_{int(time.time())}.mp4")
-                with open(tmp_video, 'wb') as f:
-                    f.write(content)
-
-                dest_path = os.path.join(folder, f"{safe_title}.jpg")
-                ffmpeg = get_ffmpeg_path()
-                si = None
-                if sys.platform == "win32":
-                    si = _subprocess.STARTUPINFO()
-                    si.dwFlags |= _subprocess.STARTF_USESHOWWINDOW
-                _subprocess.run(
-                    [ffmpeg, "-y", "-i", tmp_video, "-vframes", "1", "-q:v", "2", dest_path],
-                    startupinfo=si, stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL
-                )
-                try: os.remove(tmp_video)
-                except Exception: pass
-
-                if not os.path.exists(dest_path):
-                    raise RuntimeError("Không trích được khung hình từ bìa động (video).")
-            else:
-                ext = self._detect_image_ext(content_type, content)
-                dest_path = os.path.join(folder, f"{safe_title}{ext}")
-                with open(dest_path, 'wb') as f:
-                    f.write(content)
-
-            if not silent:
-                QMessageBox.information(self, "Đã lưu ảnh bìa",
-                    f"Đã lưu ảnh bìa vào:\n{dest_path}")
-                try: os.startfile(folder)
-                except Exception: pass
-        except Exception as e:
-            if not silent:
-                QMessageBox.warning(self, "Máy chủ đang bận",
-                                    "Máy chủ đang quá tải.\nVui lòng chờ 1-2 phút rồi thử lại nhé!")
-            # silent mode: lỗi thì bỏ qua, không làm gián đoạn tiến trình tải phim
+        self._start_movie_assets(self._movie_folder(), save_cover=True, save_summary=False)
 
     def _bump_total_progress(self):
         if not hasattr(self, 'total_progress'): return
@@ -6553,6 +6864,11 @@ class HonggouWidget(QWidget):
             self.btn_stt_now.setEnabled(True)
 
     def _on_download_error(self, ep_num, error_msg):
+        # Lỗi tải/giải mã cũng có thể do link CDN đã hết hạn. Xin link mới và
+        # tải lại thay vì kết luận thất bại ngay ở worker đầu tiên.
+        self._retry_failed_episode(ep_num, error_msg)
+
+    def _mark_episode_failed(self, ep_num, error_msg):
         row = ep_num - 1
         if row < self._dl_table().rowCount():
             short_msg = error_msg[:25] + "..." if len(error_msg) > 25 else error_msg
@@ -6565,8 +6881,51 @@ class HonggouWidget(QWidget):
         self._refresh_balance()
         self._hide_pause_btn()
 
+        expected_files = getattr(self, '_active_dl_expected_files', {})
+        valid_files = []
+        missing_eps = []
+        for ep_num, path in sorted(expected_files.items()):
+            try:
+                valid = (os.path.isfile(path) and os.path.getsize(path) > 1024
+                         and SingleDriveDownloadThread._looks_like_mp4(path))
+            except Exception:
+                valid = False
+            if valid:
+                valid_files.append(path)
+            else:
+                missing_eps.append(ep_num)
+
+        # Nguồn sự thật là file MP4 thực tế, không phải số worker đã kết thúc.
+        total_downloaded = len(valid_files)
+        self.downloaded_file_paths = valid_files
+        expected_total = len(expected_files)
+
+        if missing_eps or total_downloaded != expected_total:
+            self.btn_download.setEnabled(True)
+            self.btn_download.setText("📥 Tải lại tập lỗi")
+            missing_text = ", ".join(str(x) for x in missing_eps)
+            message = (f"Chỉ tải đủ {total_downloaded}/{expected_total} tập.\n"
+                       f"Thiếu hoặc file hỏng: Tập {missing_text}.\n\n"
+                       "Các tập lỗi vẫn được giữ dấu chọn để bạn bấm tải lại.")
+            self.lbl_status.setText(
+                f"⚠️ Tải thiếu {expected_total - total_downloaded} tập: {missing_text}")
+            table = self._dl_table()
+            for ep_num in missing_eps:
+                row = ep_num - 1
+                if row < table.rowCount():
+                    item = table.item(row, 0)
+                    if item:
+                        item.setCheckState(Qt.CheckState.Checked)
+            if getattr(self, '_batch_running', False):
+                if hasattr(self, 'txt_stt_log'):
+                    self.txt_stt_log.append(f"⚠️ {self._active_dl_title}: {message.splitlines()[0]} Tập lỗi: {missing_text}")
+                self._batch_tab_finished()
+            else:
+                QMessageBox.warning(self, "Tải chưa đủ", message)
+            return
+
         mode = self.merge_mode_combo.currentIndex()
-        files_to_merge = getattr(self, 'downloaded_file_paths', [])
+        files_to_merge = valid_files
         auto_stt = hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked()
 
         # Nếu tick "Tách nhạc nền" -> xử lý theo 2 trường hợp:
@@ -6674,8 +7033,7 @@ class HonggouWidget(QWidget):
             movie_folder = None
         if not movie_folder or not os.path.isdir(movie_folder):
             # Dự phòng: quay về cách cũ nếu không suy ra được từ file.
-            folder_name = self.current_series_id if self.current_series_id else "Phim_Khong_Ro_ID"
-            movie_folder = os.path.join(self.save_folder, folder_name)
+            movie_folder = self._movie_folder()
 
         # LƯU Ý: gộp SRT được dời xuống _on_merge_finished (chạy SAU khi
         # MergeThread xong) vì nó cần bảng <out>.durations.json — độ dài THẬT
