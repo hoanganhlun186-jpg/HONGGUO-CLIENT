@@ -1909,8 +1909,21 @@ class SingleRenderThread(QThread):
     progress = pyqtSignal(int)   # % thật của tập đang render (0..100)
     def __init__(self, vp, vi_srt_path, tts_path, out_path, render_cfg):
         super().__init__(); self.vp = vp; self.sp = vi_srt_path; self.tts_path = tts_path; self.op = out_path; self.cfg = render_cfg; self._cancel = False
-        self._total_dur = 0.0
-    def cancel(self): self._cancel = True
+        self._total_dur = 0.0; self._proc = None
+    def cancel(self):
+        self._cancel = True
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try: proc.terminate()
+            except Exception: pass
+
+    @staticmethod
+    def _close_process_streams(proc):
+        for stream_name in ('stdout', 'stderr', 'stdin'):
+            stream = getattr(proc, stream_name, None)
+            if stream is not None:
+                try: stream.close()
+                except Exception: pass
 
     def _emit_progress_from_line(self, line, last_pct):
         """Từ 1 dòng ffmpeg (out_time_ms=... hoặc time=HH:MM:SS), tính % và phát signal.
@@ -2213,6 +2226,7 @@ class SingleRenderThread(QThread):
             self.log.emit(f"  ⚙️ Đang xử lý FFmpeg, vui lòng đợi...\n")
             kw = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", **kw)
+            self._proc = proc
             from collections import deque
             stderr_lines = deque(maxlen=40)
             def _drain_stderr(p=proc, buf=stderr_lines):
@@ -2237,7 +2251,8 @@ class SingleRenderThread(QThread):
                     except Exception: pass
                     break
             proc.wait()
-            _t_err.join(timeout=2) 
+            _t_err.join(timeout=2)
+            self._close_process_streams(proc); self._proc = None
             elapsed = time.time() - start_t
             if self._cancel:
                 self.log.emit(f"⛔ Đã hủy render.\n")
@@ -2288,6 +2303,7 @@ class SingleRenderThread(QThread):
                     kw = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
                     proc = subprocess.Popen(cmd_cpu, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                             text=True, encoding="utf-8", errors="replace", **kw)
+                    self._proc = proc
                     stderr_lines2 = deque(maxlen=40)
                     def _drain_stderr2(p=proc, buf=stderr_lines2):
                         try:
@@ -2313,6 +2329,7 @@ class SingleRenderThread(QThread):
                             break
                     proc.wait()
                     _t_err2.join(timeout=2)
+                    self._close_process_streams(proc); self._proc = None
                     if self._cancel:
                         self.log.emit("⛔ Đã hủy render.\n"); self.done.emit(False)
                     elif proc.returncode == 0:
@@ -2328,6 +2345,15 @@ class SingleRenderThread(QThread):
         except Exception as e:
             self.log.emit(f"❌ Lỗi: {e}\n"); self.done.emit(False)
         finally:
+            proc = self._proc
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        proc.terminate(); proc.wait(timeout=3)
+                except Exception:
+                    try: proc.kill(); proc.wait(timeout=2)
+                    except Exception: pass
+                self._close_process_streams(proc); self._proc = None
             for tmp in [temp_filter, temp_srt, temp_watermark, temp_name_watermark]:
                 try:
                     if tmp and os.path.exists(tmp): os.remove(tmp)
@@ -4737,6 +4763,7 @@ class SingleSeriesRenderWidget(QWidget):
         except Exception:
             pass
         self.media_player.stop()
+        self.media_player.setSource(QUrl())
         # QUAN TRỌNG: preview là widget dùng chung. Remove khỏi layout thôi chưa đủ,
         # vì parent Qt vẫn là EpisodeCard cũ. Phải re-parent về RenderWidget trước
         # khi deleteLater() các card, nếu không preview sẽ bị xoá theo card.
@@ -5101,6 +5128,27 @@ class SingleSeriesRenderWidget(QWidget):
                 self.selected_card.set_media_position(0, 0)
         except Exception as e:
             self._log(f"⚠️ Không mở được preview: {e}")
+
+    def release_completed_series_files(self):
+        """Nhả mọi handle của bộ đã hoàn tất để thư mục có thể được xóa."""
+        try:
+            self.media_player.stop()
+            self.media_player.setSource(QUrl())
+        except Exception:
+            pass
+        try:
+            self._rt_refresh_timer.stop()
+            watched = list(self._rt_fs_watcher.directories())
+            if watched:
+                self._rt_fs_watcher.removePaths(watched)
+            self._rt_watch_dirs.clear()
+        except Exception:
+            pass
+        self._preview_card = None
+        for card in list(getattr(self, 'cards', [])):
+            try: card.btn_card_play.setText('▶')
+            except Exception: pass
+        self._log('🔓 Bộ đã xác nhận xong: đã nhả preview, watcher và handle file.')
 
     def _toggle_play(self):
         from PyQt6.QtMultimedia import QMediaPlayer as _QMP

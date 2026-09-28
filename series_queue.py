@@ -1,7 +1,8 @@
 """Independent series tabs and a sequential full-pipeline queue for BOOM Studio."""
 import os
 import time
-from PyQt6.QtWidgets import QFileDialog, QTextEdit
+from PyQt6.QtWidgets import (QFileDialog, QTextEdit, QListView, QTreeView,
+    QAbstractItemView)
 from series_session import save_session, read_session, restore_controls
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
@@ -21,7 +22,9 @@ class QueueMessageBox(QMessageBox):
         if host is None:
             return getattr(QMessageBox, kind)(parent, title, text, *args, **kwargs)
         host._log(f'[{title}] {text}')
-        if kind in ('warning', 'critical', 'question'):
+        if kind == 'warning':
+            host._batch_last_warning = f'{title}: {text}'
+        if kind in ('critical', 'question'):
             host._batch_complete(False, f'{title}: {text}')
         return QMessageBox.StandardButton.No if kind == 'question' else QMessageBox.StandardButton.Ok
 
@@ -125,22 +128,26 @@ def make_multi_series_widget(series_class):
             layout.setContentsMargins(0, 0, 0, 0)
             row = QHBoxLayout()
             self.btn_add_series = QPushButton('+ Thêm bộ')
+            self.btn_add_folders = QPushButton('📁 Chọn nhiều thư mục')
             self.btn_run_series = QPushButton('▶ CHẠY TẤT CẢ BỘ · Tách → Dịch → Lồng → Xuất')
             self.btn_pause_series = QPushButton('Dừng sau bộ này')
             self.btn_add_series.setObjectName('SeriesAdd')
+            self.btn_add_folders.setObjectName('SeriesAdd')
             self.btn_run_series.setObjectName('SeriesRun')
             self.btn_pause_series.setObjectName('SeriesPause')
-            for button in (self.btn_add_series, self.btn_run_series, self.btn_pause_series):
+            for button in (self.btn_add_series, self.btn_add_folders,
+                           self.btn_run_series, self.btn_pause_series):
                 button.setMinimumHeight(36)
             self.btn_pause_series.setEnabled(False)
             row.addWidget(self.btn_add_series)
+            row.addWidget(self.btn_add_folders)
             row.addWidget(self.btn_run_series, 1)
             row.addWidget(self.btn_pause_series)
             layout.addLayout(row)
             session_row = QHBoxLayout()
             self.btn_save_session = QPushButton("Lưu phiên")
             self.btn_open_session = QPushButton("Mở phiên")
-            self.btn_resume_series = QPushButton("Tiếp tục các bộ chờ")
+            self.btn_resume_series = QPushButton("Tiếp tục bộ chờ / thử lại bộ lỗi")
             self.btn_details = QPushButton("Chi tiết / Nhật ký")
             for b in (self.btn_save_session, self.btn_open_session, self.btn_resume_series, self.btn_details):
                 b.setStyleSheet("background:#345574;color:white;padding:6px;border:1px solid #7093B8;border-radius:4px;")
@@ -166,6 +173,7 @@ def make_multi_series_widget(series_class):
             self.series_tabs.setMovable(False)
             layout.addWidget(self.series_tabs, 1)
             self.btn_add_series.clicked.connect(self._add_series)
+            self.btn_add_folders.clicked.connect(self._pick_series_folders)
             self.btn_run_series.clicked.connect(self._start_series_queue)
             self.btn_pause_series.clicked.connect(self._stop_queue_after_current)
             self.series_tabs.tabCloseRequested.connect(self._close_series)
@@ -188,8 +196,12 @@ def make_multi_series_widget(series_class):
         def _add_series(self):
             if self._queue_running:
                 return
+            return self._create_series()
+
+        def _create_series(self, name=None, make_current=True):
+            """Create one independent series page and return it."""
             page = series_class(self)
-            page._series_name = f'Bộ {len(self._pages) + 1}'
+            page._series_name = str(name or f'Bộ {len(self._pages) + 1}')
             page._batch_managed = False
             page._batch_result = None
             page._queue_state = 'waiting'
@@ -201,7 +213,84 @@ def make_multi_series_widget(series_class):
             page._queue_log_sink = lambda message, p=page: self.queue_details.append(f"[{p._series_name}] {message}")
             self._pages.append(page)
             index = self.series_tabs.addTab(page, page._series_name)
-            self.series_tabs.setCurrentIndex(index)
+            if make_current:
+                self.series_tabs.setCurrentIndex(index)
+            return page
+
+        def _pick_series_folders(self):
+            """Select several folders; each valid folder becomes one series tab."""
+            if self._queue_running or self._session_loading:
+                return
+            if any(getattr(p, '_bulk_loading', False) for p in self._pages):
+                self.queue_status.setText('Hãy chờ các thư mục hiện tại nạp xong rồi chọn thêm.')
+                return
+
+            dialog = QFileDialog(self, 'Chọn nhiều thư mục — mỗi thư mục là một Bộ')
+            dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+            dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+            dialog.setFileMode(QFileDialog.FileMode.Directory)
+            dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+            dialog.setLabelText(QFileDialog.DialogLabel.Accept, 'Thêm các thư mục đã chọn')
+            dialog.setLabelText(QFileDialog.DialogLabel.FileName, 'Các thư mục:')
+            for view_type in (QListView, QTreeView):
+                for view in dialog.findChildren(view_type):
+                    view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+            if not dialog.exec():
+                return
+
+            folders = []
+            seen = set()
+            for folder in dialog.selectedFiles():
+                if not os.path.isdir(folder):
+                    continue
+                absolute = os.path.abspath(folder)
+                key = os.path.normcase(absolute)
+                if key not in seen:
+                    seen.add(key)
+                    folders.append(absolute)
+            if not folders:
+                QMessageBox.information(self, 'Chưa chọn thư mục',
+                    'Hãy giữ Ctrl hoặc Shift để chọn nhiều thư mục.')
+                return
+
+            prepared = []
+            skipped = []
+            scanner = self.series_tabs.currentWidget() or (self._pages[0] if self._pages else None)
+            if scanner is None:
+                scanner = self._create_series(make_current=False)
+            for folder in folders:
+                pairs = scanner._auto_pair(folder)
+                if pairs:
+                    prepared.append((folder, pairs))
+                else:
+                    skipped.append(os.path.basename(folder) or folder)
+            if not prepared:
+                QMessageBox.information(self, 'Không thấy video',
+                    'Các thư mục đã chọn không có video hỗ trợ (.mp4, .mkv, .mov, .avi).')
+                return
+
+            reusable = self.series_tabs.currentWidget()
+            if reusable is not None and (getattr(reusable, 'cards', None) or
+                                         getattr(reusable, '_bulk_loading', False)):
+                reusable = None
+            made = []
+            for folder, pairs in prepared:
+                name = os.path.basename(os.path.normpath(folder)) or f'Bộ {len(self._pages) + 1}'
+                if reusable is not None:
+                    page, reusable = reusable, None
+                    page._series_name = name
+                    self.series_tabs.setTabText(self.series_tabs.indexOf(page), name)
+                else:
+                    page = self._create_series(name=name, make_current=False)
+                page._source_folder = folder
+                page._start_bulk_card_import(pairs, name)
+                made.append(page)
+            self.series_tabs.setCurrentWidget(made[0])
+            message = f'Đã tách {len(made)} thư mục thành {len(made)} Bộ riêng; đang nạp video.'
+            if skipped:
+                message += f' Bỏ qua {len(skipped)} thư mục không có video.'
+                self.queue_details.append('Bỏ qua không có video: ' + ', '.join(skipped))
+            self.queue_status.setText(message)
 
         def _rename_series(self, index):
             if self._queue_running or index < 0:
@@ -230,7 +319,7 @@ def make_multi_series_widget(series_class):
             if any(live_workers(p) or getattr(p, '_render_running', False) or getattr(p, '_bulk_loading', False) for p in self._pages):
                 self.queue_status.setText('Đang có tác vụ thủ công/nạp video. Hãy chờ xong rồi chạy tất cả bộ.')
                 return
-            pages = [p for p in self._pages if p.cards and (not resume or getattr(p, "_queue_state", "waiting") == "waiting")]
+            pages = [p for p in self._pages if p.cards and (not resume or getattr(p, "_queue_state", "waiting") in ("waiting", "failed"))]
             if not pages:
                 self.queue_status.setText('Không có bộ đang chờ.' if resume else 'Chưa có bộ phim. Thêm video vào từng tab trước.')
                 return
@@ -260,6 +349,7 @@ def make_multi_series_widget(series_class):
             self._queue_running = True
             self._stop_after_current = False
             self.btn_add_series.setEnabled(False)
+            self.btn_add_folders.setEnabled(False)
             self.btn_run_series.setEnabled(False)
             self.btn_pause_series.setEnabled(True)
             self.btn_open_session.setEnabled(False)
@@ -278,6 +368,8 @@ def make_multi_series_widget(series_class):
             self._active_series = page
             self._idle_since = None
             page._batch_result = None
+            page._batch_last_warning = ''
+            page._batch_idle_retries = 0
             page._batch_managed = True
             page._queue_state = "running"
             self._autosave_session()
@@ -303,7 +395,30 @@ def make_multi_series_widget(series_class):
                 if self._idle_since is None:
                     self._idle_since = now
                 elif now - self._idle_since >= 15:
-                    page._batch_complete(False, 'Quy trình đã dừng trước bước xuất. Kiểm tra log, module và đăng nhập/API của bộ này.')
+                    if getattr(page, '_batch_idle_retries', 0) < 1:
+                        page._batch_idle_retries = 1
+                        page._log('↻ Kiểm tra file hiện tại và thử chạy lại bộ một lần trước khi kết luận lỗi.')
+                        pipeline = page.dub_feature_tab
+                        pipeline._chain_after_stt = None
+                        pipeline._chain_dub_after_translate = False
+                        pipeline._render_after_dub = False
+                        pipeline._dub_queue = []
+                        pipeline._dub_running = False
+                        pipeline._stop_card_poll()
+                        page._render_running = False
+                        page._render_queue = []
+                        page._live_accepting = False
+                        page._live_render = False
+                        page.total_progress_end()
+                        self._idle_since = None
+                        try:
+                            pipeline._run_full_pipeline()
+                        except Exception as exc:
+                            page._batch_complete(False, f'Chạy lại thất bại: {exc}')
+                    else:
+                        detail = getattr(page, '_batch_last_warning', '')
+                        page._batch_complete(False, 'Quy trình vẫn dừng sau khi kiểm tra và chạy lại. ' +
+                                             (detail or 'Kiểm tra nhật ký của bộ này.'))
                 return
             pipeline = page.dub_feature_tab
             pipeline._chain_after_stt = None
@@ -319,6 +434,13 @@ def make_multi_series_widget(series_class):
                 page._merge_parts_active = False
             pipeline._stop_card_poll()
             page.total_progress_end()
+            if result[0]:
+                release = getattr(page, 'release_completed_series_files', None)
+                if callable(release):
+                    try:
+                        release()
+                    except Exception as exc:
+                        page._log(f'⚠️ Không nhả hết file sau khi hoàn tất: {exc}')
             page._batch_managed = False
             page._batch_cards = None
             self._record(page, *result)
@@ -343,6 +465,7 @@ def make_multi_series_widget(series_class):
             self._queue_running = False
             self._active_series = None
             self.btn_add_series.setEnabled(True)
+            self.btn_add_folders.setEnabled(True)
             self.btn_open_session.setEnabled(True)
             self.btn_resume_series.setEnabled(True)
             self.btn_run_series.setEnabled(True)
@@ -380,7 +503,8 @@ def make_multi_series_widget(series_class):
             self._session_loading = True
             self._restore_rows = list(rows)
             self._restore_current = None
-            for b in (self.btn_open_session,self.btn_run_series,self.btn_resume_series,self.btn_add_series): b.setEnabled(False)
+            for b in (self.btn_open_session,self.btn_run_series,self.btn_resume_series,
+                      self.btn_add_series,self.btn_add_folders): b.setEnabled(False)
             self._session_path = path
             self._restore_session_tick()
 
@@ -390,15 +514,17 @@ def make_multi_series_widget(series_class):
             except Exception as exc:
                 for p in self._pages: p._bulk_loading = False
                 self._session_loading = False
-                for b in (self.btn_open_session,self.btn_run_series,self.btn_resume_series,self.btn_add_series): b.setEnabled(True)
+                for b in (self.btn_open_session,self.btn_run_series,self.btn_resume_series,
+                      self.btn_add_series,self.btn_add_folders): b.setEnabled(True)
                 self.queue_status.setText(f"Khôi phục phiên chưa hoàn tất: {exc}. Các tab đã nạp được giữ lại.")
 
         def _restore_session_step(self):
             if self._restore_current is None:
                 if not self._restore_rows:
                     self._session_loading = False
-                    for b in (self.btn_open_session,self.btn_run_series,self.btn_resume_series,self.btn_add_series): b.setEnabled(True)
-                    self.queue_status.setText("Đã mở phiên. Kiểm tra các bộ rồi bấm Tiếp tục các bộ chờ; bộ lỗi không tự chạy lại.")
+                    for b in (self.btn_open_session,self.btn_run_series,self.btn_resume_series,
+                      self.btn_add_series,self.btn_add_folders): b.setEnabled(True)
+                    self.queue_status.setText("Đã mở phiên. Bấm Tiếp tục bộ chờ / thử lại bộ lỗi để kiểm tra và chạy lại các bộ chưa hoàn tất.")
                     return
                 row = self._restore_rows.pop(0)
                 self._add_series()
