@@ -303,7 +303,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.79"
+APP_VERSION = "1.0.80"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -3713,6 +3713,18 @@ class MovieCard(QFrame):
         super().mousePressEvent(e)
 
 
+class MultiUrlTextEdit(QTextEdit):
+    """Ô dán nhiều dòng: Enter xuống dòng, Ctrl+Enter bắt đầu quét."""
+    submit_requested = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and (event.modifiers() & Qt.KeyboardModifier.ControlModifier)):
+            self.submit_requested.emit()
+            return
+        super().keyPressEvent(event)
+
+
 class HonggouWidget(QWidget):
     balance_changed = pyqtSignal(int)
     refresh_stats_signal = pyqtSignal()
@@ -3772,6 +3784,10 @@ class HonggouWidget(QWidget):
         self._batch_tab_queue = []
         self._batch_total = 0
         self._batch_done = 0
+        # Tối đa 3 BỘ tách sub nền cùng lúc trong chế độ tải hàng loạt.
+        self._bg_stt_series_queue = []
+        self._bg_stt_series_active = []
+        self._batch_waiting_bg_stt = False
         self.current_job_id = ""
         self.current_episodes = []
         self.current_title = ""
@@ -4340,10 +4356,14 @@ class HonggouWidget(QWidget):
         master_layout.setContentsMargins(20, 20, 20, 20)
 
         top_bar = QHBoxLayout()
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Dán Link phim HOẶC Nhập Tên Phim vào đây rồi nhấn Enter...")
-        self.url_input.setStyleSheet("QLineEdit { padding: 12px; font-size: 14px; border-radius: 8px; border: 1px solid #374151; background: #1f2937; color: #f8fafc; } QLineEdit:focus { border: 1px solid #3b82f6; background: #1e293b; }")
-        self.url_input.returnPressed.connect(self._scan)
+        # QTextEdit cho phép dán nhiều link (mỗi dòng một bộ). QLineEdit cũ làm
+        # mất dấu xuống dòng nên chỉ quét được link đầu tiên.
+        self.url_input = MultiUrlTextEdit()
+        self.url_input.setFixedHeight(72)
+        self.url_input.setPlaceholderText(
+            "Dán nhiều link, mỗi dòng 1 link — Enter xuống dòng, Ctrl+Enter để quét...")
+        self.url_input.setStyleSheet("QTextEdit { padding: 9px; font-size: 14px; border-radius: 8px; border: 1px solid #374151; background: #1f2937; color: #f8fafc; } QTextEdit:focus { border: 1px solid #3b82f6; background: #1e293b; }")
+        self.url_input.submit_requested.connect(self._scan)
         self.btn_scan = QPushButton("🔍 Tìm / Quét Phim")
         self.btn_scan.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_scan.setStyleSheet("QPushButton { padding: 12px 24px; font-size: 14px; background-color: #2563eb; color: white; border-radius: 8px; font-weight: bold; border: none; } QPushButton:hover { background-color: #1d4ed8; } QPushButton:disabled { background-color: #374151; color: #64748b; }")
@@ -4654,7 +4674,10 @@ class HonggouWidget(QWidget):
         bottom_layout.addLayout(dl_row)
 
         stt_ctrl = QHBoxLayout(); stt_ctrl.setSpacing(8)
-        self.chk_auto_stt = QCheckBox("🔤 Tự động tách sub sau khi tải")
+        self.chk_auto_stt = QCheckBox("🔤 Tải xong từng tập → tách sub ngay")
+        self.chk_auto_stt.setToolTip(
+            "Mỗi tập tải hoàn chỉnh sẽ được tách sub ngay trong lúc video còn tải.\n"
+            "Chạy tối đa 3 tác vụ tách sub song song.")
         self.chk_auto_stt.setStyleSheet("""
             QCheckBox { color: #f1f5f9; font-size: 12px; padding: 4px; font-weight: bold; }
             QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #7c3aed;
@@ -5897,6 +5920,25 @@ class HonggouWidget(QWidget):
         match = re.search(r'(https?://\S+)', text)
         return match.group(1) if match else text
 
+    def _extract_urls_from_text(self, text):
+        """Lấy tất cả link từ nội dung dán, giữ thứ tự và loại link trùng."""
+        found = re.findall(r'https?://[^\s<>"\']+', text or '', flags=re.IGNORECASE)
+        urls = []
+        seen = set()
+        duplicate_count = 0
+        for value in found:
+            value = value.rstrip('.,;)]}>')
+            normalized = self._normalize_url(value)
+            if not normalized:
+                continue
+            if normalized in seen:
+                duplicate_count += 1
+                continue
+            seen.add(normalized)
+            urls.append(normalized)
+        self._duplicate_paste_count = duplicate_count
+        return urls
+
     def _start_batch_download(self):
         """Tải lần lượt TẤT CẢ các tab: xong bộ này tự sang bộ kế tiếp."""
         if getattr(self, '_batch_running', False):
@@ -5927,12 +5969,25 @@ class HonggouWidget(QWidget):
 
     def _batch_run_next_tab(self):
         if not self._batch_tab_queue:
+            if (getattr(self, '_bg_stt_series_queue', [])
+                    or getattr(self, '_bg_stt_series_active', [])):
+                self._batch_waiting_bg_stt = True
+                self.btn_batch_dl.setText(
+                    f"🔤 Chờ tách sub ({len(self._bg_stt_series_active)}/3 bộ)")
+                self.lbl_status.setText(
+                    "✅ Đã tải xong các bộ · đang chờ tối đa 3 bộ tách sub song song...")
+                return
+            self._batch_waiting_bg_stt = False
             self._batch_running = False
             self.btn_batch_dl.setEnabled(True)
             self.btn_batch_dl.setText("📥 Tải hàng loạt")
             if hasattr(self, 'txt_stt_log'):
-                self.txt_stt_log.append(f"🎉 Đã tải xong toàn bộ {self._batch_total} bộ!")
-            QMessageBox.information(self, "Xong", f"Đã tải xong {self._batch_total} bộ trong hàng đợi!")
+                self.txt_stt_log.append(
+                    f"🎉 Đã tải và xử lý xong toàn bộ {self._batch_total} bộ!")
+            QMessageBox.information(
+                self, "Xong",
+                f"Đã hoàn tất toàn bộ {self._batch_total} bộ trong hàng đợi\n"
+                "(bao gồm tải và các bước tự động đã bật).")
             return
         idx = self._batch_tab_queue.pop(0)
         self.btn_batch_dl.setText(f"📥 Đang tải ({self._batch_done}/{self._batch_total})")
@@ -5944,12 +5999,33 @@ class HonggouWidget(QWidget):
             self._apply_config(d["config"])
         if hasattr(self, 'txt_stt_log'):
             self.txt_stt_log.append(f"▶️ [{self._batch_done + 1}/{self._batch_total}] Tải bộ: {self.current_title}")
-        # chọn tất cả tập rồi tải
+        # Chỉ chọn các tập CHƯA có trên máy. Trước đây chọn cả dòng "Đã có
+        # trên máy" làm _download_selected bật cảnh báo tải trùng và hàng đợi
+        # đứng mãi ở bộ kế tiếp vì không có callback hoàn tất.
         t = self.table
+        need_download = 0
+        skipped_on_disk = 0
         for r in range(t.rowCount()):
             it = t.item(r, 0)
             if it and (it.flags() & Qt.ItemFlag.ItemIsUserCheckable):
-                it.setCheckState(Qt.CheckState.Checked)
+                status_item = t.item(r, 3)
+                status_text = status_item.text() if status_item else ""
+                already_on_disk = "Đã có trên máy" in status_text
+                if already_on_disk:
+                    it.setCheckState(Qt.CheckState.Unchecked)
+                    skipped_on_disk += 1
+                else:
+                    it.setCheckState(Qt.CheckState.Checked)
+                    need_download += 1
+
+        if need_download <= 0:
+            if hasattr(self, 'txt_stt_log'):
+                self.txt_stt_log.append(
+                    f"⏭ Bộ '{self.current_title}' đã đủ {skipped_on_disk} tập trên máy — tự chuyển bộ kế.")
+            self.lbl_status.setText(
+                f"⏭ Bộ này đã có đủ {skipped_on_disk} tập — đang chuyển bộ kế tiếp...")
+            QTimer.singleShot(300, self._batch_tab_finished)
+            return
         QTimer.singleShot(400, self._download_selected)
 
     def _batch_tab_finished(self):
@@ -5977,6 +6053,7 @@ class HonggouWidget(QWidget):
             ("chk_del_original", "chk"), ("chk_mute_original", "chk"), ("chk_show_browser", "chk"),
             ("chk_use_gpu", "chk"),
             ("cb_translate_engine", "cbo"), ("merge_mode_combo", "cbo"), ("cmb_dub_voice", "cbo"),
+            ("cmb_stt_src", "cbo"), ("cmb_stt_out", "cbo"), ("threads_combo", "cbo"),
             ("chunk_spinbox", "int"), ("spn_bgm_parallel", "int"), ("spn_orig_volume", "int"),
             ("spn_trans_workers", "int"), ("spn_tts_workers", "int"),
             ("spn_dub_rate", "dbl"),
@@ -6122,6 +6199,16 @@ class HonggouWidget(QWidget):
             QMessageBox.information(self, "Không thể đóng", "Phải còn ít nhất 1 tab.")
             return
         w = self.series_tabs.widget(index)
+        if w is getattr(self, '_active_dl_table', None):
+            mgr = getattr(self, 'download_manager', None)
+            if mgr is not None and not getattr(mgr, '_all_done_emitted', False):
+                QMessageBox.information(
+                    self, "Bộ đang tải", "Không thể đóng tab của bộ đang tải. Hãy chờ tải xong.")
+                return
+        monitor = self._tab_data.get(w, {}).get("monitor_thread")
+        if monitor:
+            try: monitor.stop()
+            except Exception: pass
         if w in self._tab_data:
             del self._tab_data[w]
         self.series_tabs.removeTab(index)
@@ -6142,13 +6229,13 @@ class HonggouWidget(QWidget):
         return t
 
     def _scan(self):
-        raw_text = self.url_input.text().strip()
+        raw_text = self.url_input.toPlainText().strip()
         if not raw_text:
             QMessageBox.warning(self, "Lỗi", "Vui lòng dán Link hoặc nhập Tên phim vào ô trống!")
             return
-            
-        is_url = False
-        if re.search(r'https?://', raw_text) or "hongguoduanju.com" in raw_text or "duju.info/series/" in raw_text: is_url = True
+
+        urls = self._extract_urls_from_text(raw_text)
+        is_url = bool(urls) or "hongguoduanju.com" in raw_text or "duju.info/series/" in raw_text
 
         if not is_url:
             self._search_keyword(raw_text)
@@ -6170,23 +6257,92 @@ class HonggouWidget(QWidget):
             )
             return
 
-        if getattr(self, 'monitor_thread', None): self.monitor_thread.stop()
-        raw_url = self._extract_url_from_text(raw_text)
-        url = self._normalize_url(raw_url)
-        if url != raw_text: self.url_input.setText(url) 
+        if not urls:
+            raw_url = self._extract_url_from_text(raw_text)
+            urls = [self._normalize_url(raw_url)]
+        self._queue_series_scans(urls)
+
+    def _queue_series_scans(self, urls):
+        """Xếp hàng quét link; mỗi link có một bảng/tab và state độc lập."""
+        if getattr(self, '_scan_queue_running', False):
+            QMessageBox.information(self, "Đang quét", "Vui lòng chờ danh sách link hiện tại quét xong.")
+            return
+
+        urls = [u for u in urls if u]
+        if not urls:
+            return
+
+        self._save_current_tab_state()
+        targets = []
+        current_data = self._tab_data.get(self.table, {})
+        current_is_empty = not current_data.get("series_id") and self.table.rowCount() == 0
+
+        for pos, url in enumerate(urls):
+            if pos == 0 and current_is_empty:
+                target = self.table
+            else:
+                target = self._new_series_tab(f"Đang quét {pos + 1}")
+            targets.append((target, url))
+
+        self._scan_queue = targets
+        self._scan_queue_total = len(targets)
+        self._scan_queue_done = 0
+        self._scan_duplicate_count = int(getattr(self, '_duplicate_paste_count', 0) or 0)
+        self._scan_queue_running = True
+        self.btn_scan.setEnabled(False)
+        self.content_stack.setCurrentWidget(self.page_detail)
+        self._start_next_series_scan()
+
+    def _start_next_series_scan(self):
+        if not getattr(self, '_scan_queue', []):
+            total = getattr(self, '_scan_queue_total', 0)
+            duplicates = getattr(self, '_scan_duplicate_count', 0)
+            self._scan_queue_running = False
+            self.btn_scan.setEnabled(True)
+            self.btn_scan.setText("🔍 Tìm / Quét Phim")
+            kept = max(0, total - max(0, duplicates - int(getattr(self, '_duplicate_paste_count', 0) or 0)))
+            duplicate_note = f" · Bỏ qua {duplicates} bộ trùng" if duplicates else ""
+            self.lbl_status.setText(
+                f"✅ Đã xử lý xong {kept} bộ, mỗi bộ nằm trong một tab riêng{duplicate_note}.")
+            return
+
+        target, url = self._scan_queue.pop(0)
+        if target not in self._tab_data:
+            self._scan_item_finished()
+            return
 
         self.content_stack.setCurrentWidget(self.page_detail)
-        self.btn_scan.setEnabled(False)
-        self.btn_scan.setText("⏳ Đang xử lý yêu cầu...")
-        self.lbl_status.setText("Trạng thái: Đang kết nối phân tích dữ liệu...")
-        self.table.setRowCount(0)
 
-        self.scan_thread = HonggouScanThread(url, self.auth_token)
-        self._keep_thread_alive(self.scan_thread)
-        self.scan_thread.scan_result.connect(self._on_scan_result)
-        self.scan_thread.error_signal.connect(self._on_scan_error)
-        self.scan_thread.url_resolved_signal.connect(self._on_url_resolved)
-        self.scan_thread.start()
+        old_monitor = self._tab_data[target].get("monitor_thread")
+        if old_monitor:
+            try: old_monitor.stop()
+            except Exception: pass
+
+        target.setRowCount(0)
+        self._tab_data[target].update({
+            "series_id": "", "episodes": [], "source_url": url,
+            "scan_status": "loading"
+        })
+        idx = self.series_tabs.indexOf(target)
+        if idx >= 0:
+            self.series_tabs.setTabText(idx, f"⏳ Bộ {self._scan_queue_done + 1}")
+
+        self.btn_scan.setText(
+            f"⏳ Đang quét {self._scan_queue_done + 1}/{self._scan_queue_total}...")
+        self.lbl_status.setText(f"🔎 Đang quét bộ {self._scan_queue_done + 1}/{self._scan_queue_total}...")
+
+        thread = HonggouScanThread(url, self.auth_token)
+        self.scan_thread = thread
+        self._keep_thread_alive(thread)
+        thread.scan_result.connect(lambda data, t=target: self._on_scan_result_for_tab(t, data))
+        thread.error_signal.connect(lambda msg, t=target: self._on_scan_error_for_tab(t, msg))
+        thread.url_resolved_signal.connect(
+            lambda resolved, t=target: self._tab_data.get(t, {}).update({"resolved_url": resolved}))
+        thread.start()
+
+    def _scan_item_finished(self):
+        self._scan_queue_done = getattr(self, '_scan_queue_done', 0) + 1
+        QTimer.singleShot(0, self._start_next_series_scan)
 
     def _search_keyword(self, keyword):
         self.content_stack.setCurrentWidget(self.page_grid)
@@ -6293,8 +6449,47 @@ class HonggouWidget(QWidget):
         self.hot_list.addItem(empty_item)
 
     def _on_scan_result(self, data):
-        self.btn_scan.setEnabled(True)
-        self.btn_scan.setText("🔍 Tìm / Quét Phim")
+        return self._on_scan_result_for_tab(self.table, data)
+
+    def _on_scan_result_for_tab(self, target_table, data):
+        """Nhận kết quả đúng tab đã phát lệnh quét, không ghi đè tab khác."""
+        if target_table not in getattr(self, '_tab_data', {}):
+            self._scan_item_finished()
+            return
+
+        # Hai link chia sẻ khác nhau vẫn có thể trỏ về cùng một bộ. Sau khi đã
+        # có series_id thật, giữ tab xuất hiện trước và bỏ tab trùng vừa quét.
+        result_series_id = str(data.get("series_id", "")).strip()
+        duplicate_table = None
+        if result_series_id:
+            for table, tab_data in self._tab_data.items():
+                if (table is not target_table
+                        and str(tab_data.get("series_id", "")).strip() == result_series_id):
+                    duplicate_table = table
+                    break
+        if duplicate_table is not None:
+            self._scan_duplicate_count = getattr(self, '_scan_duplicate_count', 0) + 1
+            duplicate_title = self._tab_data.get(duplicate_table, {}).get("title") or result_series_id
+            if hasattr(self, 'txt_stt_log'):
+                self.txt_stt_log.show()
+                self.txt_stt_log.append(f"⏭ Bỏ qua bộ trùng: {duplicate_title}")
+            target_index = self.series_tabs.indexOf(target_table)
+            if target_index >= 0 and self.series_tabs.count() > 1:
+                del self._tab_data[target_table]
+                self.series_tabs.removeTab(target_index)
+            existing_index = self.series_tabs.indexOf(duplicate_table)
+            if existing_index >= 0:
+                self.series_tabs.setCurrentIndex(existing_index)
+            self._scan_item_finished()
+            return
+
+        target_index = self.series_tabs.indexOf(target_table)
+        if target_index >= 0 and self.table is not target_table:
+            self.series_tabs.setCurrentIndex(target_index)
+
+        if not getattr(self, '_scan_queue_running', False):
+            self.btn_scan.setEnabled(True)
+            self.btn_scan.setText("🔍 Tìm / Quét Phim")
         
         status = data.get("status")
         self.current_job_id = data.get("job_id")
@@ -6364,6 +6559,8 @@ class HonggouWidget(QWidget):
                 self.content_stack.setCurrentWidget(self.page_grid)
             except Exception:
                 pass
+            if getattr(self, '_scan_queue_running', False):
+                self._scan_item_finished()
             return
 
         if status == "cache_hit":
@@ -6377,50 +6574,71 @@ class HonggouWidget(QWidget):
 
         if status not in ["cache_hit", "completed"] and self.current_job_id:
             self.monitor_thread = JobStatusMonitorThread(self.current_job_id, self.auth_token)
+            self._tab_data[target_table]["monitor_thread"] = self.monitor_thread
             self._keep_thread_alive(self.monitor_thread)
-            self.monitor_thread.update_signal.connect(self._on_monitor_update)
+            self.monitor_thread.update_signal.connect(
+                lambda update, t=target_table: self._on_monitor_update_for_tab(t, update))
             self.monitor_thread.start()
 
-    def _on_monitor_update(self, data):
-        status = data.get("status")
-        total_eps = data.get("total_episodes", self.table.rowCount())
-        if total_eps == 0 and self.table.rowCount() > 0:
-            total_eps = self.table.rowCount()
-            
-        self.current_episodes = data.get("episodes", [])
-        self._render_table(total_eps, self.current_episodes)
+        if getattr(self, '_scan_queue_running', False):
+            self._scan_item_finished()
 
-    def _render_table(self, total_eps, episodes):
+    def _on_monitor_update(self, data):
+        return self._on_monitor_update_for_tab(self.table, data)
+
+    def _on_monitor_update_for_tab(self, target_table, data):
+        if target_table not in getattr(self, '_tab_data', {}):
+            return
+        status = data.get("status")
+        total_eps = data.get("total_episodes", target_table.rowCount())
+        if total_eps == 0 and target_table.rowCount() > 0:
+            total_eps = target_table.rowCount()
+
+        episodes = data.get("episodes", [])
+        tab_state = self._tab_data[target_table]
+        tab_state["episodes"] = episodes
+        tab_state["total_eps"] = total_eps
+        if self.table is target_table:
+            self.current_episodes = episodes
+            self.current_total_eps = total_eps
+        self._render_table(total_eps, episodes, table=target_table, state=tab_state)
+
+    def _render_table(self, total_eps, episodes, table=None, state=None):
+        table = table or self.table
+        state = state or self._tab_data.get(table, {})
         checked_eps = set()
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
             if item and item.checkState() == Qt.CheckState.Checked: checked_eps.add(row)
 
-        if self.table.rowCount() != total_eps: self.table.setRowCount(total_eps)
+        if table.rowCount() != total_eps: table.setRowCount(total_eps)
         readonly_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        movie_folder = self._movie_folder()
+        series_id = state.get("series_id", getattr(self, 'current_series_id', ''))
+        title = state.get("title", getattr(self, 'current_title', ''))
+        cover_pixmap = state.get("cover_pixmap", getattr(self, 'current_cover_pixmap', None))
+        movie_folder = _hg_movie_folder(self.save_folder, series_id, title)
             
         for i in range(total_eps):
             ep_num = i + 1
             ep_data = next((e for e in episodes if e.get("episode_number") == ep_num), None)
             
-            file_name = _hg_episode_filename(movie_folder, self.current_title, ep_num)
+            file_name = _hg_episode_filename(movie_folder, title, ep_num)
             
             ep_item = QTableWidgetItem(f" Tập {ep_num}")
             ep_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             ep_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
             if i in checked_eps: ep_item.setCheckState(Qt.CheckState.Checked)
             else: ep_item.setCheckState(Qt.CheckState.Unchecked)
-            self.table.setItem(i, 0, ep_item)
-            self.table.setRowHeight(i, 55)
+            table.setItem(i, 0, ep_item)
+            table.setRowHeight(i, 55)
             
             thumb_item = QTableWidgetItem()
             thumb_item.setFlags(readonly_flags)
-            if hasattr(self, 'current_cover_pixmap') and self.current_cover_pixmap: thumb_item.setIcon(QIcon(self.current_cover_pixmap))
-            self.table.setItem(i, 1, thumb_item)
+            if cover_pixmap: thumb_item.setIcon(QIcon(cover_pixmap))
+            table.setItem(i, 1, thumb_item)
             
             file_item = QTableWidgetItem(file_name)
-            file_item.setFlags(readonly_flags); file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 2, file_item)
+            file_item.setFlags(readonly_flags); file_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); table.setItem(i, 2, file_item)
 
             safe_name = re.sub(r'[\\/*?:"<>|]', "", file_name)
             local_path = os.path.join(movie_folder, safe_name)
@@ -6436,7 +6654,7 @@ class HonggouWidget(QWidget):
                 link_item = QTableWidgetItem("☁️ Sẵn sàng tải")
                 link_item.setForeground(QColor("#10b981"))
                 
-            link_item.setFlags(readonly_flags); link_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); self.table.setItem(i, 3, link_item)
+            link_item.setFlags(readonly_flags); link_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); table.setItem(i, 3, link_item)
 
     def _toggle_select_all(self):
         def _on_disk(i):
@@ -6491,7 +6709,8 @@ class HonggouWidget(QWidget):
             QMessageBox.warning(self, "Hết lượt tải", "Bạn đã dùng hết 20 lượt tải miễn phí hôm nay!\nHãy chờ qua 0h đêm để hồi lượt, hoặc dùng chức năng 'Mua Trọn Bộ'.")
             return
 
-        if self.current_series_id in getattr(self, '_cached_history_ids', set()):
+        if (not getattr(self, '_batch_running', False)
+                and self.current_series_id in getattr(self, '_cached_history_ids', set())):
             reply = QMessageBox.question(self, "Cảnh báo tải trùng", "Bộ phim này bạn ĐÃ TẢI VỀ máy trước đó rồi!\nBạn có chắc chắn muốn TẢI LẠI và BỊ TRỪ 1 LƯỢT không?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.No: return
 
@@ -6533,6 +6752,22 @@ class HonggouWidget(QWidget):
         self._active_dl_selected_eps = {int(x) for x in selected_eps_nums}
         self._link_received_eps = set()
         self._dl_finished = 0
+        # Pipeline STT: tập nào tải hoàn chỉnh thì đưa vào hàng đợi tách sub
+        # ngay, không phải chờ cả bộ tải xong. Chỉ chạy 1 job STT tại một thời
+        # điểm để tránh tranh băng thông/CPU với các luồng tải video.
+        # Luôn tách ngay trong lúc tải, kể cả đang chạy Tải hàng loạt. Trước đây
+        # nhánh background vô tình tắt cờ này nên phải chờ đủ cả bộ mới thấy SRT.
+        self._stt_background_series_mode = False
+        self._stt_during_download = bool(
+            hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked()
+        )
+        self._stt_pipeline_queue = []
+        self._stt_pipeline_seen = set()
+        self._stt_pipeline_active = 0
+        self._stt_pipeline_downloads_done = False
+        self._stt_pipeline_ok = 0
+        self._stt_pipeline_failed = 0
+        self._stt_pipeline_finalized = False
         self.total_progress.setMaximum(num_eps); self.total_progress.setValue(0); self.total_progress.show()
 
         self.downloaded_file_paths = []
@@ -6862,6 +7097,8 @@ class HonggouWidget(QWidget):
         self._bump_total_progress()
         if hasattr(self, 'btn_stt_now'):
             self.btn_stt_now.setEnabled(True)
+        if getattr(self, '_stt_during_download', False):
+            self._enqueue_stt_during_download(file_path)
 
     def _on_download_error(self, ep_num, error_msg):
         # Lỗi tải/giải mã cũng có thể do link CDN đã hết hạn. Xin link mới và
@@ -6916,12 +7153,28 @@ class HonggouWidget(QWidget):
                     item = table.item(row, 0)
                     if item:
                         item.setCheckState(Qt.CheckState.Checked)
-            if getattr(self, '_batch_running', False):
-                if hasattr(self, 'txt_stt_log'):
-                    self.txt_stt_log.append(f"⚠️ {self._active_dl_title}: {message.splitlines()[0]} Tập lỗi: {missing_text}")
-                self._batch_tab_finished()
-            else:
+            if getattr(self, '_batch_running', False) and hasattr(self, 'txt_stt_log'):
+                self.txt_stt_log.append(
+                    f"⚠️ {self._active_dl_title}: {message.splitlines()[0]} Tập lỗi: {missing_text}")
+            elif not getattr(self, '_batch_running', False):
                 QMessageBox.warning(self, "Tải chưa đủ", message)
+
+            # Nếu pipeline sub đã chạy trong lúc tải, phải chờ nó kết thúc rồi
+            # mới chuyển bộ; nếu chuyển ngay callback STT cũ sẽ đụng state bộ mới.
+            if getattr(self, '_stt_background_series_mode', False) and valid_files:
+                self._enqueue_background_series_stt(
+                    list(valid_files), self._active_dl_title,
+                    self.cmb_stt_src.currentText(), self.cmb_stt_out.currentText())
+                self._batch_tab_finished()
+            elif getattr(self, '_stt_during_download', False) and valid_files:
+                self._files_for_stt = list(valid_files)
+                self._stt_files = list(valid_files)
+                for fp in valid_files:
+                    self._enqueue_stt_during_download(fp)
+                self._stt_pipeline_downloads_done = True
+                self._maybe_finish_stt_pipeline()
+            elif getattr(self, '_batch_running', False):
+                self._batch_tab_finished()
             return
 
         mode = self.merge_mode_combo.currentIndex()
@@ -6965,9 +7218,24 @@ class HonggouWidget(QWidget):
             self.btn_download.setEnabled(True)
             self.btn_download.setText("📥 Tải đã chọn")
             if hasattr(self, 'lbl_downloaded_badge'): self.lbl_downloaded_badge.show()
-            self.lbl_status.setText(f"✅ Đã tải {total_downloaded} tập. Tự động tách sub (ghép ở bước cuối)...")
+            if getattr(self, '_stt_background_series_mode', False):
+                self._enqueue_background_series_stt(
+                    list(files_to_merge), self._active_dl_title,
+                    self.cmb_stt_src.currentText(), self.cmb_stt_out.currentText())
+                self.lbl_status.setText(
+                    f"✅ Đã tải {total_downloaded} tập · đã đưa bộ vào hàng tách sub nền (tối đa 3 bộ).")
+                self._batch_tab_finished()
+                return
+            self.lbl_status.setText(
+                f"✅ Đã tải {total_downloaded} tập. Đang chờ tách sub còn lại...")
             self._files_for_stt = list(files_to_merge)
-            QTimer.singleShot(500, self._run_stt_on_downloaded)
+            self._stt_files = list(files_to_merge)
+            # Bảo đảm mọi file hợp lệ đều có trong pipeline, kể cả trường hợp
+            # signal tải-xong đến sát signal hoàn-tất.
+            for fp in files_to_merge:
+                self._enqueue_stt_during_download(fp)
+            self._stt_pipeline_downloads_done = True
+            self._maybe_finish_stt_pipeline()
             return
 
         if mode == 0 or len(files_to_merge) <= 1:
@@ -7349,6 +7617,144 @@ class HonggouWidget(QWidget):
     # ─────────────────────────────────────────────────────────────────
     #  STT / TÁCH SUB
     # ─────────────────────────────────────────────────────────────────
+    def _is_background_series_stt_mode(self):
+        """Cho phép 3 bộ chạy nền khi chuỗi chỉ cần tách sub, không có bước
+        dịch/lồng/gộp phụ thuộc kết quả của bộ hiện tại."""
+        return bool(
+            getattr(self, '_batch_running', False)
+            and hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked()
+            and not (hasattr(self, 'chk_do_translate') and self.chk_do_translate.isChecked())
+            and not (hasattr(self, 'chk_auto_dub') and self.chk_auto_dub.isChecked())
+            and self._get_merge_mode() == 0
+        )
+
+    def _enqueue_background_series_stt(self, files, title, src, out):
+        files = [os.path.abspath(f) for f in files if os.path.isfile(f)]
+        if not files:
+            return
+        self._bg_stt_series_queue.append({
+            "files": files, "title": title or "Phim",
+            "src": src or "zh-CN", "out": out or "vi-VN"
+        })
+        if hasattr(self, 'txt_stt_log'):
+            self.txt_stt_log.show()
+            self.txt_stt_log.append(
+                f"📚 Xếp bộ '{title}' vào hàng tách sub nền ({len(files)} tập).")
+        self._pump_background_series_stt()
+
+    def _pump_background_series_stt(self):
+        active = self._bg_stt_series_active
+        queue = self._bg_stt_series_queue
+        while len(active) < 3 and queue:
+            job = queue.pop(0)
+            # Mỗi bộ dùng 1 worker; ba bộ chạy đồng thời = tối đa 3 request STT,
+            # tránh nhân thành 9 request và dễ bị API giới hạn.
+            thread = SttBatchThread(
+                job["files"], src_lang=job["src"], out_lang=job["out"],
+                use_trans=(job["src"] != job["out"]), stt_workers=1)
+            job["thread"] = thread
+            active.append(job)
+            thread.progress_signal.connect(
+                lambda msg, name=job["title"]: self._on_background_stt_progress(name, msg))
+            thread.finished_signal.connect(
+                lambda ok, failed, j=job: self._on_background_series_stt_finished(j, ok, failed))
+            self._keep_thread_alive(thread)
+            if hasattr(self, 'txt_stt_log'):
+                self.txt_stt_log.append(
+                    f"🚀 Tách sub nền [{len(active)}/3 bộ]: {job['title']}")
+            thread.start()
+
+    def _on_background_stt_progress(self, title, message):
+        if hasattr(self, 'txt_stt_log'):
+            self.txt_stt_log.append(f"[{title}] {message}")
+
+    def _on_background_series_stt_finished(self, job, ok, failed):
+        if job in self._bg_stt_series_active:
+            self._bg_stt_series_active.remove(job)
+        if hasattr(self, 'txt_stt_log'):
+            self.txt_stt_log.append(
+                f"✅ Xong sub bộ '{job['title']}': {ok} thành công, {failed} lỗi.")
+        self._pump_background_series_stt()
+        if (getattr(self, '_batch_waiting_bg_stt', False)
+                and not self._bg_stt_series_active and not self._bg_stt_series_queue):
+            QTimer.singleShot(0, self._batch_run_next_tab)
+
+    def _enqueue_stt_during_download(self, file_path):
+        """Đưa file ĐÃ tải xong vào pipeline STT; không bao giờ đọc file .part."""
+        if not getattr(self, '_stt_during_download', False):
+            return
+        try:
+            file_path = os.path.abspath(file_path)
+            if (file_path in self._stt_pipeline_seen or not os.path.isfile(file_path)
+                    or os.path.getsize(file_path) <= 1024):
+                return
+        except Exception:
+            return
+
+        self._stt_pipeline_seen.add(file_path)
+        srt_path = os.path.splitext(file_path)[0] + ".srt"
+        if os.path.isfile(srt_path) and os.path.getsize(srt_path) > 0:
+            self._stt_pipeline_ok += 1
+            self._maybe_finish_stt_pipeline()
+            return
+
+        self._stt_pipeline_queue.append(file_path)
+        if hasattr(self, 'txt_stt_log'):
+            self.txt_stt_log.show()
+            self.txt_stt_log.append(
+                f"📥 Tải xong → xếp tách sub: {os.path.basename(file_path)}")
+        self._start_next_stt_during_download()
+
+    def _start_next_stt_during_download(self):
+        queue = getattr(self, '_stt_pipeline_queue', [])
+        active = int(getattr(self, '_stt_pipeline_active', 0) or 0)
+        if not queue and active <= 0:
+            self._maybe_finish_stt_pipeline()
+            return
+
+        # Tối đa 3 file STT đồng thời. Mỗi thread chỉ xử lý một file đã đóng
+        # hoàn chỉnh nên không bao giờ đọc trúng video còn đang ghi.
+        while queue and active < 3:
+            file_path = queue.pop(0)
+            active += 1
+            self._stt_pipeline_active = active
+            src = self.cmb_stt_src.currentText() if hasattr(self, 'cmb_stt_src') else "zh-CN"
+            out = self.cmb_stt_out.currentText() if hasattr(self, 'cmb_stt_out') else "vi-VN"
+            thread = SttBatchThread([file_path], src_lang=src, out_lang=out,
+                                    use_trans=(src != out), stt_workers=1)
+            thread.progress_signal.connect(self._on_stt_progress)
+            thread.finished_signal.connect(
+                lambda ok, failed, fp=file_path: self._on_stt_pipeline_item_finished(
+                    fp, ok, failed))
+            self._keep_thread_alive(thread)
+            thread.start()
+
+    def _on_stt_pipeline_item_finished(self, file_path, ok, failed):
+        self._stt_pipeline_ok += int(ok)
+        self._stt_pipeline_failed += int(failed)
+        self._stt_pipeline_active = max(
+            0, int(getattr(self, '_stt_pipeline_active', 0) or 0) - 1)
+        if hasattr(self, 'txt_stt_log'):
+            result = "✅" if ok else "❌"
+            self.txt_stt_log.append(
+                f"{result} Pipeline sub: {os.path.basename(file_path)}")
+        self._start_next_stt_during_download()
+
+    def _maybe_finish_stt_pipeline(self):
+        if not getattr(self, '_stt_pipeline_downloads_done', False):
+            return
+        if int(getattr(self, '_stt_pipeline_active', 0) or 0) > 0:
+            return
+        if getattr(self, '_stt_pipeline_queue', []):
+            self._start_next_stt_during_download()
+            return
+        if getattr(self, '_stt_pipeline_finalized', False):
+            return
+        self._stt_pipeline_finalized = True
+        ok = getattr(self, '_stt_pipeline_ok', 0)
+        failed = getattr(self, '_stt_pipeline_failed', 0)
+        QTimer.singleShot(0, lambda: self._on_stt_finished(ok, failed))
+
     def _run_dub_on_downloaded(self):
         files = getattr(self, '_files_for_stt', None) or getattr(self, 'downloaded_file_paths', [])
         files = [f for f in files if os.path.exists(f)]
@@ -7408,7 +7814,7 @@ class HonggouWidget(QWidget):
         self.btn_dub_now.setEnabled(True); self.btn_dub_now.setText("🎙 Lồng tiếng ngay")
         summary = f"✅ Lồng tiếng xong: {ok} thành công, {failed} lỗi. File output: *_dubbed.mp4"
         self.lbl_status.setText(summary); self.txt_stt_log.append("\n" + summary)
-        if ok > 0:
+        if ok > 0 and not getattr(self, '_batch_running', False):
             QMessageBox.information(self, "Lồng tiếng hoàn tất",
                 f"Đã lồng tiếng thành công {ok} video!\nFile đầu ra: *_dubbed.mp4 cạnh file gốc.")
 
@@ -7490,6 +7896,8 @@ class HonggouWidget(QWidget):
 
         if ok <= 0:
             self._files_for_stt = None
+            if getattr(self, '_batch_running', False):
+                self._batch_tab_finished()
             return
         if hasattr(self, 'btn_dub_now'): self.btn_dub_now.setEnabled(True)
         if hasattr(self, 'btn_bgm_only'): self.btn_bgm_only.setEnabled(True)
@@ -7505,8 +7913,9 @@ class HonggouWidget(QWidget):
         use_deepseek_engine = hasattr(self, 'cb_translate_engine') and self.cb_translate_engine.currentText().startswith("🚀")
 
         if not do_translate:
-            QMessageBox.information(self, "Tách sub hoàn tất",
-                f"Đã tách sub {ok} file!\n(Chỉ lưu sub tiếng gốc — chưa bật dịch tự động.)")
+            if not getattr(self, '_batch_running', False):
+                QMessageBox.information(self, "Tách sub hoàn tất",
+                    f"Đã tách sub {ok} file!\n(Chỉ lưu sub tiếng gốc — chưa bật dịch tự động.)")
             self._maybe_merge_after_stt(stt_files_list)
         elif use_deepseek_engine and DeepSeekTranslateThread and srt_files:
             # Dùng DeepSeek: không cần đăng nhập Gemini/AUTH_FILE, chỉ cần API key
@@ -7523,8 +7932,9 @@ class HonggouWidget(QWidget):
             self.txt_stt_log.append("\n🌐 Bắt đầu dịch bằng Gemini...")
             self._start_gemini_translate(srt_files)
         else:
-            QMessageBox.information(self, "Tách sub hoàn tất",
-                f"Đã tách sub {ok} file!\n(Chưa cấu hình engine dịch nên không dịch.)")
+            if not getattr(self, '_batch_running', False):
+                QMessageBox.information(self, "Tách sub hoàn tất",
+                    f"Đã tách sub {ok} file!\n(Chưa cấu hình engine dịch nên không dịch.)")
             self._maybe_merge_after_stt(stt_files_list)
         self._files_for_stt = None
 
@@ -7903,13 +8313,16 @@ class HonggouWidget(QWidget):
         # → hiện cảnh báo thay vì popup "Dịch hoàn tất" giả gây nhầm lẫn
         if n == 0:
             self.txt_stt_log.append(f"\n⚠️ {_engine_name}: Không dịch được file nào. Kiểm tra API key / số dư tài khoản.")
-            QMessageBox.warning(self, f"Dịch thất bại",
-                f"{_engine_name} không dịch được file nào.\n\n"
-                f"Nguyên nhân thường gặp:\n"
-                f"• Hết số dư tài khoản (HTTP 402)\n"
-                f"• API key sai hoặc hết hạn\n"
-                f"• Mất kết nối mạng\n\n"
-                f"Kiểm tra log bên dưới để xem chi tiết lỗi.")
+            if getattr(self, '_batch_running', False):
+                self._batch_tab_finished()
+            else:
+                QMessageBox.warning(self, f"Dịch thất bại",
+                    f"{_engine_name} không dịch được file nào.\n\n"
+                    f"Nguyên nhân thường gặp:\n"
+                    f"• Hết số dư tài khoản (HTTP 402)\n"
+                    f"• API key sai hoặc hết hạn\n"
+                    f"• Mất kết nối mạng\n\n"
+                    f"Kiểm tra log bên dưới để xem chi tiết lỗi.")
             return
 
         self.txt_stt_log.append(f"\n✅ Dịch {_engine_name} xong toàn bộ: {n} file.")
@@ -7918,8 +8331,9 @@ class HonggouWidget(QWidget):
             if not self._dub_queue and not self._dub_running:
                 self._merge_after_dub()
         else:
-            QMessageBox.information(self, "Dịch hoàn tất",
-                f"Đã dịch {n} file sang tiếng Việt (_vi.srt).\nCó thể bấm Lồng tiếng.")
+            if not getattr(self, '_batch_running', False):
+                QMessageBox.information(self, "Dịch hoàn tất",
+                    f"Đã dịch {n} file sang tiếng Việt (_vi.srt).\nCó thể bấm Lồng tiếng.")
             self._maybe_merge_after_stt(list(getattr(self, '_gemini_vi_map', {}).keys()))
 
     def _change_folder(self):
@@ -7930,10 +8344,26 @@ class HonggouWidget(QWidget):
             self.lbl_folder.setText(f"📂 Lưu vào: {self.save_folder}")
 
     def _on_scan_error(self, error_msg):
-        self.btn_scan.setEnabled(True)
-        self.btn_scan.setText("🔍 Tìm / Quét Phim")
-        self.lbl_status.setText("Trạng thái: Sẵn sàng phục vụ...")
-        QMessageBox.critical(self, "Lỗi Hệ Thống", error_msg)
+        return self._on_scan_error_for_tab(self.table, error_msg)
+
+    def _on_scan_error_for_tab(self, target_table, error_msg):
+        if target_table in getattr(self, '_tab_data', {}):
+            data = self._tab_data[target_table]
+            data["scan_status"] = "error"
+            data["scan_error"] = str(error_msg)
+            idx = self.series_tabs.indexOf(target_table)
+            if idx >= 0:
+                self.series_tabs.setTabText(idx, "❌ Lỗi quét")
+        self.lbl_status.setText(f"⚠️ Một bộ quét lỗi: {error_msg}")
+        if getattr(self, '_scan_queue_running', False):
+            if hasattr(self, 'txt_stt_log'):
+                self.txt_stt_log.show()
+                self.txt_stt_log.append(f"❌ Quét link lỗi: {error_msg}")
+            self._scan_item_finished()
+        else:
+            self.btn_scan.setEnabled(True)
+            self.btn_scan.setText("🔍 Tìm / Quét Phim")
+            QMessageBox.critical(self, "Lỗi Hệ Thống", error_msg)
 
     def _on_url_resolved(self, resolved_url):
         self.url_input.setText(resolved_url)
