@@ -5752,6 +5752,7 @@ class SingleSeriesRenderWidget(QWidget):
         # Resume per episode. Preserve valid final files and render only the rest.
         completed_outputs = []
         pending_cards = []
+        expected_outputs = []
         for card in selected_cards:
             vp = card.video_path
             stem, _ext = os.path.splitext(vp)
@@ -5761,6 +5762,7 @@ class SingleSeriesRenderWidget(QWidget):
                 if stem.lower().endswith("_dubbed"):
                     stem = stem[:-len("_dubbed")]
                 final_path = stem + "_final.mp4"
+            expected_outputs.append(final_path)
             if _valid_finished_video(final_path):
                 completed_outputs.append(final_path)
                 card.set_status("xong")
@@ -5785,6 +5787,9 @@ class SingleSeriesRenderWidget(QWidget):
         self._render_done_count = 0
         self._rendered_files = list(completed_outputs) # gồm cả file resume để gộp đủ tập
         self._render_failed_files = []  # không tự gộp thiếu tập nếu có render lỗi
+        self._incremental_parts = (self.cmb_merge_mode.currentText() == "Theo phần")
+        if self._incremental_parts:
+            self._setup_incremental_parts(expected_outputs)
         self._render_running = True
         self._stopping = False
         self._render_threads = {}         # out_path -> SingleRenderThread đang chạy
@@ -5805,6 +5810,8 @@ class SingleSeriesRenderWidget(QWidget):
                     f"{self._done_units}/{self._total_units} việc")
         _par = self.spn_render_parallel.value() if hasattr(self, "spn_render_parallel") else 1
         self._log(f"🚀 Bắt đầu render {len(self._render_queue)} tập ({_par} tập/lượt)...")
+        if self._incremental_parts:
+            self._queue_ready_render_parts()
         self._pump_render_queue()
 
     def _big_set_percent(self, pct):
@@ -5948,7 +5955,7 @@ class SingleSeriesRenderWidget(QWidget):
         if stem.endswith("_dubbed"): stem = stem[:-7]
         return os.path.normcase(stem)
 
-    def _accept_live_render(self, source, dubbed, subtitle):
+    def _accept_live_render(self, source, render_input, subtitle):
         if not getattr(self, "_live_accepting", False) or self._stopping:
             return
         if getattr(self, "_batch_managed", False) and getattr(self, "_batch_result", None) is not None:
@@ -5957,12 +5964,14 @@ class SingleSeriesRenderWidget(QWidget):
         card = next((c for c in self._live_cards if self._live_key(c.video_path) == key), None)
         if card is None or id(card) in self._live_admitted:
             return
-        if not os.path.isfile(dubbed) or os.path.getsize(dubbed) <= 0 or not os.path.isfile(subtitle):
+        if (not os.path.isfile(render_input) or os.path.getsize(render_input) <= 0
+                or not os.path.isfile(subtitle)):
             return
         self._live_admitted.add(id(card))
-        self._live_inputs[id(card)] = (dubbed, subtitle)
+        self._live_inputs[id(card)] = (render_input, subtitle)
         self._render_queue.append(card)
-        self._log(f"⚡ Lồng xong → xếp render: {os.path.basename(source)}")
+        stage = "Lồng xong" if os.path.abspath(render_input) != os.path.abspath(source) else "Dịch xong"
+        self._log(f"⚡ {stage} → xếp render: {os.path.basename(source)}")
         self._pump_render_queue()
 
     def _seal_live_render(self, failed=False):
@@ -5974,7 +5983,7 @@ class SingleSeriesRenderWidget(QWidget):
                 self._render_failed_files.append(c.video_path)
         if failed and not self._render_failed_files:
             self._render_failed_files.append("Dịch/lồng chưa đạt")
-        self._log("📥 Đã nhận hết kết quả lồng; chờ render xong để kiểm tra và ghép.")
+        self._log("📥 Đã nhận hết video sẵn sàng; chờ render xong để kiểm tra và ghép.")
         self._pump_render_queue()
 
     def _pump_render_queue(self):
@@ -6036,6 +6045,10 @@ class SingleSeriesRenderWidget(QWidget):
                     self._render_threads_alive.remove(t)
             except Exception:
                 pass
+            # Chỉ ghép sau khi QThread đã thoát hẳn, bảo đảm ffmpeg
+            # render đã đóng file đầu ra trước khi worker ghép đọc nó.
+            if getattr(self, "_incremental_parts", False):
+                QTimer.singleShot(0, self._queue_ready_render_parts)
 
         th.finished.connect(_release_render_thread)
         th.start()
@@ -6099,7 +6112,11 @@ class SingleSeriesRenderWidget(QWidget):
                 )
                 return
             if self.cmb_merge_mode.currentText() == "Theo phần" and self._rendered_files:
-                self._start_merge_parts(self._rendered_files)
+                if getattr(self, "_incremental_parts", False):
+                    self._incremental_render_finished = True
+                    self._queue_ready_render_parts(render_finished=True)
+                else:
+                    self._start_merge_parts(self._rendered_files)
             elif self.cmb_merge_mode.currentText() == "Gộp trọn bộ" and len(self._rendered_files) > 1:
                 self._start_merge(self._rendered_files)
             else:
@@ -6142,6 +6159,86 @@ class SingleSeriesRenderWidget(QWidget):
         # Khởi động tập kế cho đủ số song song (hoặc kết thúc nếu hết)
         self._pump_render_queue()
         
+    def _setup_incremental_parts(self, expected_files):
+        """Chuẩn bị các nhóm để render đủ nhóm nào thì ghép nhóm đó ngay."""
+        files = sorted(expected_files, key=lambda p: _natural_key(os.path.basename(p)))
+        size = self.spn_merge_parts.value()
+        self._incremental_part_groups = [files[i:i + size] for i in range(0, len(files), size)]
+        self._incremental_parts_queued = set()
+        self._incremental_render_finished = False
+        self._merge_parts_queue = []
+        self._merge_parts_outputs = []
+        self._thumbnail_warnings = []
+        self._merge_parts_badge_options = self._part_thumbnail_options() if self.chk_part_thumbnail.isChecked() else None
+        self._merge_parts_intro = None
+        if self._merge_parts_badge_options and hasattr(self, "intro_input"):
+            intro = self.intro_input.text().strip()
+            if intro:
+                self._merge_parts_intro = intro
+        self._merge_parts_active = True
+        self._log(f"📚 Ghép cuốn chiếu: đủ {size} tập sẽ ghép ngay, không chờ render hết bộ.")
+
+    def _queue_ready_render_parts(self, render_finished=False):
+        if not getattr(self, "_incremental_parts", False):
+            return
+        if render_finished:
+            self._incremental_render_finished = True
+        groups = getattr(self, "_incremental_part_groups", [])
+        size = self.spn_merge_parts.value()
+        for idx, files in enumerate(groups):
+            if idx in self._incremental_parts_queued:
+                continue
+            # Phần cuối có thể ít hơn size; chỉ chốt khi render đã hết.
+            if len(files) < size and not self._incremental_render_finished:
+                continue
+            if not all(_valid_finished_video(p) for p in files):
+                continue
+            out_dir = os.path.dirname(files[0])
+            name = os.path.basename(out_dir) or "TronBo"
+            start = idx * size + 1
+            end = start + len(files) - 1
+            out_path = os.path.join(out_dir,
+                f"{name}_Phan_{idx + 1:02d}_Tap_{start:03d}-{end:03d}.mp4")
+            self._merge_parts_queue.append((files, out_path))
+            self._incremental_parts_queued.add(idx)
+            self._log(f"📥 Phần {idx + 1} đã render đủ {len(files)} tập → xếp hàng ghép ngay.")
+        th = getattr(self, "merge_thread", None)
+        if self._merge_parts_queue and (th is None or not th.isRunning()):
+            self._start_next_merge_part()
+        elif (self._incremental_render_finished
+              and len(self._incremental_parts_queued) == len(groups)
+              and not self._merge_parts_queue
+              and (th is None or not th.isRunning())
+              and not any(t.isRunning() for t in getattr(self, "_render_threads_alive", []))):
+            self._finish_incremental_parts(True)
+
+    def _finish_incremental_parts(self, ok):
+        self._incremental_parts = False
+        self._merge_parts_active = False
+        warnings = "\n".join(getattr(self, "_thumbnail_warnings", []))
+        final_ok = bool(ok and not warnings)
+        self._batch_complete(final_ok, warnings or ("Ghép theo phần hoàn tất" if ok else "Ghép theo phần lỗi"))
+        if warnings:
+            QMessageBox.warning(self, "Video đã ghép, thumbnail cần xử lý", warnings)
+        self.btn_run.setEnabled(True)
+        if hasattr(self, 'btn_merge_now'):
+            self.btn_merge_now.setEnabled(True)
+        self.cmb_merge_mode.setEnabled(True)
+        self.spn_merge_parts.setEnabled(True)
+        self._update_run_label()
+        self.step_render.set_status("success" if ok else "error", 100)
+        if getattr(self, "_total_active", False):
+            if ok:
+                self._done_units = self._total_units
+                self._paint_total(self._total_units)
+            self.total_progress_end()
+        if ok and not warnings:
+            QMessageBox.information(self, "Hoàn tất Theo phần",
+                "Đã gộp thành công:\n" + "\n".join(self._merge_parts_outputs))
+        elif not ok:
+            QMessageBox.warning(self, "Lỗi gộp theo phần",
+                "Một phần gộp bị lỗi. Các phần đã hoàn tất được giữ lại.")
+
     def _start_merge_parts(self, file_list):
         files = sorted(file_list, key=lambda p: _natural_key(os.path.basename(p)))
         if not files or any(not os.path.isfile(p) for p in files):
@@ -6209,6 +6306,17 @@ class SingleSeriesRenderWidget(QWidget):
             if self._merge_parts_queue:
                 self._start_next_merge_part()
                 return
+        if getattr(self, "_incremental_parts", False):
+            if not ok:
+                self._merge_parts_queue = []
+                self._finish_incremental_parts(False)
+            elif getattr(self, "_incremental_render_finished", False):
+                self._finish_incremental_parts(True)
+            else:
+                # Hết phần đã sẵn sàng; giữ worker rảnh và chờ nhóm
+                # tập kế tiếp render đủ, không kết thúc toàn quy trình.
+                self._log("⏳ Đã ghép xong phần hiện tại; tiếp tục chờ render phần kế tiếp...")
+            return
         self._merge_parts_queue = []
         self._merge_parts_active = False
         warnings = "\n".join(self._thumbnail_warnings)

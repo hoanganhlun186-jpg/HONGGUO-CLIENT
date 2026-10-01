@@ -704,7 +704,7 @@ class DubFeatureWidget(QWidget):
         lbl_note.setStyleSheet("color:#F37021; font-weight:bold; font-size:10px; border:none;")
         root.addWidget(lbl_note)
 
-        self.chk_auto_render = QCheckBox("🎬 Tự Render sau khi lồng tiếng xong (dùng cấu hình tab Thiết kế)")
+        self.chk_auto_render = QCheckBox("🎬 Tự Render sau khi dịch/lồng tiếng xong (dùng cấu hình tab Thiết kế)")
         self.chk_auto_render.setChecked(self.settings.value("auto_render", True, type=bool))
         self.chk_auto_render.setStyleSheet("color:#10B981; font-weight:bold; font-size:10px;")
         root.addWidget(self.chk_auto_render)
@@ -1545,6 +1545,12 @@ class DubFeatureWidget(QWidget):
                 self._log(f"✅ Dịch xong {os.path.basename(video_path)} → xếp hàng lồng tiếng.")
                 self._dub_queue.append(video_path)
                 self._pump_dub_queue()
+            elif (getattr(self, "_live_pipeline", False)
+                  and vi_path and os.path.exists(vi_path)):
+                # Không lồng: mỗi tập dịch xong được render ngay bằng
+                # video/tiếng gốc, không chờ dịch hết cả bộ.
+                self._log(f"✅ Dịch xong {os.path.basename(video_path)} → xếp render ngay (tiếng gốc).")
+                self.host._accept_live_render(video_path, video_path, vi_path)
 
         def _on_item_failed(idx, msg):
             self._log(f"⚠️ Dịch lỗi 1 file: {msg}")
@@ -1644,6 +1650,12 @@ class DubFeatureWidget(QWidget):
         self._log("✅ Dịch xong toàn bộ.")
         self._refresh_host_cards()
         if not getattr(self, "_chain_dub_after_translate", False):
+            # Không lồng tiếng nhưng vẫn cho phép chuyển thẳng sang
+            # render bằng video/tiếng gốc khi người dùng bật Tự Render.
+            if getattr(self, "_render_after_dub", False):
+                self._log("🎬 Bỏ qua lồng tiếng; kiểm tra sub rồi bắt đầu render.")
+                self._verify_before_render()
+                return
             self._set_buttons_enabled(True)
             self._stop_card_poll()
             self._log("🎉 Hoàn tất bước dịch.")
@@ -2079,7 +2091,8 @@ class DubFeatureWidget(QWidget):
             if self._episode_incomplete(vp):
                 failed = True
             else:
-                self.host._accept_live_render(vp, self._dubbed_for(vp), self._vi_srt_for(vp))
+                render_input = self._dubbed_for(vp) if self._auto_dub_on else vp
+                self.host._accept_live_render(vp, render_input, self._vi_srt_for(vp))
         self._live_pipeline = False
         self._live_finished = True
         self.host._seal_live_render(failed=failed)
@@ -2102,7 +2115,6 @@ class DubFeatureWidget(QWidget):
     def _run_full_pipeline(self, all_series=False):
         if getattr(self.host, "_batch_managed", False):
             all_series = False
-            self.chk_auto_dub.setChecked(True)
             self.chk_auto_render.setChecked(True)
             self._fix_only_mode = False
         files = self._files_from_host(all_series=all_series)
@@ -2171,7 +2183,9 @@ class DubFeatureWidget(QWidget):
             self._log("   ℹ️ Chế độ tất cả các bộ: sẽ tách→dịch→lồng cho mọi bộ. "
                       "Render riêng bằng nút 🎬 RENDER TẤT CẢ CÁC BỘ (đúng cấu hình từng bộ).")
         else:
-            self._render_after_dub = (self._auto_dub_on and self.chk_auto_render.isChecked())
+            # Tự Render là tuỳ chọn độc lập: nếu tắt lồng tiếng,
+            # pipeline sẽ dịch xong rồi render bằng âm thanh gốc.
+            self._render_after_dub = self.chk_auto_render.isChecked()
         self._dub_queue = []
         self._dub_running = False
         self._dub_done_eps = 0
@@ -2201,7 +2215,10 @@ class DubFeatureWidget(QWidget):
         except Exception:
             self._total_on = False
 
-        self._live_pipeline = bool(self._render_after_dub and hasattr(self.host, "_accept_live_render"))
+        # Render cuốn chiếu cho cả hai chế độ: có lồng thì nhận
+        # *_dubbed; không lồng thì nhận video gốc ngay sau khi dịch.
+        self._live_pipeline = bool(self._render_after_dub
+                                   and hasattr(self.host, "_accept_live_render"))
         self._live_finished = False
         self._live_source_files = list(files)
         if self._live_pipeline:
@@ -2212,10 +2229,16 @@ class DubFeatureWidget(QWidget):
             self._log("⚡ Bật lồng xong từng tập → render ngay; chỉ ghép sau khi đủ tập.")
             # Silent episodes are prepared synchronously and have no dubbing worker.
             for vp in no_dialogue:
-                self.host._accept_live_render(vp, self._dubbed_for(vp), self._vi_srt_for(vp))
+                render_input = self._dubbed_for(vp) if self._auto_dub_on else vp
+                self.host._accept_live_render(vp, render_input, self._vi_srt_for(vp))
             # Resume after a reboot: already dubbed episodes go straight to render.
             for vp in already_dubbed:
                 self.host._accept_live_render(vp, self._dubbed_for(vp), self._vi_srt_for(vp))
+            # Sub đích đã có sẵn và không yêu cầu lồng: render ngay
+            # bằng video gốc, song song với các tập còn đang dịch.
+            if not self._auto_dub_on:
+                for vp in ready_vi:
+                    self.host._accept_live_render(vp, vp, self._vi_srt_for(vp))
         self._full_need_translate = list(need_translate)
         self._full_ready_vi = list(ready_vi)
 
@@ -2239,6 +2262,8 @@ class DubFeatureWidget(QWidget):
                                 pass
                         if self._auto_dub_on:
                             self._dub_queue.append(vp)
+                        elif self._live_pipeline:
+                            self.host._accept_live_render(vp, vp, vi)
                     else:
                         self._full_need_translate.append((vp, srt))
                 self._full_start_translate_stage()
@@ -2258,8 +2283,12 @@ class DubFeatureWidget(QWidget):
             self._start_translate(self._full_need_translate)
         else:
             if not self._auto_dub_on:
-                self._log("🎉 Hoàn tất (chỉ tách sub, không dịch/lồng).")
                 self._refresh_host_cards()
+                if self._render_after_dub:
+                    self._log("🎬 Bỏ qua lồng tiếng; kiểm tra sub rồi bắt đầu render.")
+                    self._verify_before_render()
+                else:
+                    self._log("🎉 Hoàn tất (không lồng tiếng/render).")
             elif not self._dub_queue and not self._dub_running:
                 self._refresh_host_cards()
                 if self._render_after_dub:
