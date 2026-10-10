@@ -1475,7 +1475,8 @@ class MergeRenderedThread(QThread):
     log = pyqtSignal(str)
     done = pyqtSignal(bool, str)
 
-    def __init__(self, file_list, out_file, intro_image=None, allow_single=False, part_badge=None):
+    def __init__(self, file_list, out_file, intro_image=None, allow_single=False, part_badge=None,
+                 video_only=False):
         super().__init__()
         self.part_badge = part_badge
         self.thumbnail_error = ""
@@ -1483,6 +1484,7 @@ class MergeRenderedThread(QThread):
         self.file_list = file_list
         self.out_file = out_file
         self.intro_image = intro_image
+        self.video_only = bool(video_only)
 
     def _probe_resolution(self, ffmpeg, filepath):
         """Trả về (width, height) của video, hoặc None nếu probe thất bại."""
@@ -1734,37 +1736,74 @@ class MergeRenderedThread(QThread):
                 input_args += ["-i", fp]
                 input_index += 1
 
-                if self._probe_has_audio(ffmpeg, fp):
-                    a_idx = v_idx
-                else:
-                    dur = max(0.1, float(_probe_duration_sec(fp) or 0.1))
-                    input_args += ["-f", "lavfi", "-t", f"{dur:.3f}",
-                                   "-i", "anullsrc=r=48000:cl=stereo"]
-                    a_idx = input_index
-                    input_index += 1
-                    self.log.emit(f"   🔇 {os.path.basename(fp)} không có audio → chèn im lặng.\n")
-
                 filter_parts.append(
                     f"[{v_idx}:v:0]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
                     f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
                     f"fps={target_fps:g},setpts=PTS-STARTPTS[v{i}]"
                 )
-                filter_parts.append(
-                    f"[{a_idx}:a:0]aformat=sample_rates=48000:channel_layouts=stereo,"
-                    f"aresample=async=1,asetpts=PTS-STARTPTS[a{i}]"
-                )
-                labels.append(f"[v{i}][a{i}]")
+                if self.video_only:
+                    labels.append(f"[v{i}]")
+                else:
+                    if self._probe_has_audio(ffmpeg, fp):
+                        a_idx = v_idx
+                    else:
+                        dur = max(0.1, float(_probe_duration_sec(fp) or 0.1))
+                        input_args += ["-f", "lavfi", "-t", f"{dur:.3f}",
+                                       "-i", "anullsrc=r=48000:cl=stereo"]
+                        a_idx = input_index
+                        input_index += 1
+                        self.log.emit(f"   🔇 {os.path.basename(fp)} không có audio → chèn im lặng.\n")
+                    filter_parts.append(
+                        f"[{a_idx}:a:0]aformat=sample_rates=48000:channel_layouts=stereo,"
+                        f"aresample=async=1,asetpts=PTS-STARTPTS[a{i}]"
+                    )
+                    labels.append(f"[v{i}][a{i}]")
 
-            filter_parts.append(
-                "".join(labels) + f"concat=n={len(files)}:v=1:a=1[vmerge][amerge]"
-            )
+            if self.video_only:
+                filter_parts.append("".join(labels) + f"concat=n={len(files)}:v=1:a=0[vmerge]")
+            else:
+                filter_parts.append("".join(labels) + f"concat=n={len(files)}:v=1:a=1[vmerge][amerge]")
             with open(filter_txt, "w", encoding="utf-8") as f:
                 f.write(";".join(filter_parts))
+            maps = ["-map", "[vmerge]"]
+            if not self.video_only:
+                maps += ["-map", "[amerge]"]
             return ([ffmpeg, "-y", "-nostdin", *input_args,
-                     "-filter_complex_script", filter_txt,
-                     "-map", "[vmerge]", "-map", "[amerge]"])
+                     "-filter_complex_script", filter_txt, *maps])
 
         def _finish_success(mode):
+            if self.video_only:
+                silent = os.path.splitext(self.out_file)[0] + "_silent_tmp.mp4"
+                # Các *_video_sub.mp4 vốn đã không có audio. Fast-copy giữ
+                # nguyên trạng thái đó, nên không tạo thêm một bản sao lớn
+                # bằng chính dung lượng trọn bộ (có thể làm đầy ổ đĩa).
+                if self._probe_has_audio(ffmpeg, self.out_file):
+                    try:
+                        if os.path.isfile(silent):
+                            os.remove(silent)
+                    except OSError:
+                        pass
+                    strip = subprocess.run(
+                        [ffmpeg, "-y", "-nostdin", "-i", self.out_file,
+                         "-map", "0:v:0", "-c:v", "copy", "-an",
+                         "-movflags", "+faststart", silent],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        startupinfo=si, text=True, encoding="utf-8", errors="replace")
+                    if strip.returncode != 0 or not os.path.isfile(silent):
+                        try:
+                            if os.path.isfile(silent):
+                                os.remove(silent)
+                        except OSError:
+                            pass
+                        raise RuntimeError("Không loại bỏ được audio khỏi video sub trọn bộ")
+                    os.replace(silent, self.out_file)
+                else:
+                    try:
+                        if os.path.isfile(silent):
+                            os.remove(silent)
+                    except OSError:
+                        pass
+                    self.log.emit("🔇 Video sub trọn bộ đã không có audio → giữ nguyên, không sao chép lại.\n")
             self.log.emit(f"✅ Gộp trọn bộ thành công ({mode}): {os.path.basename(self.out_file)}\n")
             thumb_jpg = self._prepare_thumbnail()
             if thumb_jpg:
@@ -1792,10 +1831,11 @@ class MergeRenderedThread(QThread):
                 enc_args = build_video_encoder_args(
                     merge_codec, crf_val=20, preset_hw="quality", preset_sw="medium"
                 )
-                cmd = [*base_cmd, *enc_args,
-                       "-c:a", "aac", "-b:a", "192k", "-shortest",
-                       "-video_track_timescale", "90000", "-movflags", "+faststart",
-                       self.out_file]
+                cmd = [*base_cmd, *enc_args]
+                cmd += (["-an"] if self.video_only else
+                        ["-c:a", "aac", "-b:a", "192k", "-shortest"])
+                cmd += ["-video_track_timescale", "90000", "-movflags", "+faststart",
+                        self.out_file]
                 proc = subprocess.run(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     startupinfo=si, text=True, encoding="utf-8", errors="replace"
@@ -1832,6 +1872,17 @@ class MergeRenderedThread(QThread):
                         )
                         fast_ok = False
                 if fast_ok:
+                    expected_duration = sum(_probe_duration_sec(path) for path in files)
+                    actual_duration = _probe_duration_sec(self.out_file)
+                    if (expected_duration <= 0 or actual_duration <= 0
+                            or abs(actual_duration - expected_duration) > 0.12):
+                        self.log.emit(
+                            f"⚠️ Fast-copy làm sai timeline "
+                            f"({actual_duration:.3f}/{expected_duration:.3f}s) "
+                            "→ tự gộp lại an toàn, không bỏ tập.\n"
+                        )
+                        fast_ok = False
+                if fast_ok:
                     _finish_success("copy stream")
                     return
                 need_cpu_normalize = True
@@ -1847,10 +1898,11 @@ class MergeRenderedThread(QThread):
                 base_cmd = _build_filter_concat_base()
                 cmd_fb = [*base_cmd,
                           "-c:v", "libx264", "-crf", "20", "-preset", "medium",
-                          "-pix_fmt", "yuv420p",
-                          "-c:a", "aac", "-b:a", "192k", "-shortest",
-                          "-video_track_timescale", "90000", "-movflags", "+faststart",
-                          self.out_file]
+                          "-pix_fmt", "yuv420p"]
+                cmd_fb += (["-an"] if self.video_only else
+                           ["-c:a", "aac", "-b:a", "192k", "-shortest"])
+                cmd_fb += ["-video_track_timescale", "90000", "-movflags", "+faststart",
+                           self.out_file]
                 proc = subprocess.run(
                     cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     startupinfo=si, text=True, encoding="utf-8", errors="replace"
@@ -1877,6 +1929,337 @@ class MergeRenderedThread(QThread):
                         os.remove(tmp)
                 except Exception:
                     pass
+
+
+class ExportOriginalAudioThread(QThread):
+    """Tách audio gốc của nhiều tập song song, độc lập với luồng render/amix."""
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+    done = pyqtSignal(bool, list)
+
+    def __init__(self, video_paths, workers=2):
+        super().__init__()
+        self.video_paths = list(video_paths or [])
+        self.workers = max(1, min(8, int(workers or 1)))
+
+    @staticmethod
+    def _original_source(video_path):
+        stem, ext = os.path.splitext(video_path)
+        low = stem.lower()
+        for suffix in ("_dubbed", "_final", "_rendered"):
+            if low.endswith(suffix):
+                candidate = stem[:-len(suffix)] + ext
+                if os.path.isfile(candidate):
+                    return candidate
+                break
+        return video_path
+
+    @staticmethod
+    def _output_path(source):
+        stem, _ = os.path.splitext(source)
+        return stem + "_audio_goc.m4a"
+
+    def _extract_one(self, source, output=None):
+        ffmpeg = get_ffmpeg_path()
+        output = output or self._output_path(source)
+        si = subprocess.STARTUPINFO() if os.name == "nt" else None
+        if si:
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        # Ưu tiên copy nguyên stream: nhanh, không giảm chất lượng. Nếu codec gốc
+        # không tương thích M4A thì mới chuyển AAC để web/trình duyệt phát được.
+        copy_cmd = [ffmpeg, "-y", "-nostdin", "-i", source,
+                    "-map", "0:a:0", "-vn", "-c:a", "copy",
+                    "-movflags", "+faststart", output]
+        proc = subprocess.run(copy_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              startupinfo=si, text=True, encoding="utf-8", errors="replace")
+        if proc.returncode != 0 or not os.path.isfile(output) or os.path.getsize(output) <= 1024:
+            try:
+                if os.path.exists(output):
+                    os.remove(output)
+            except Exception:
+                pass
+            aac_cmd = [ffmpeg, "-y", "-nostdin", "-i", source,
+                       "-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "192k",
+                       "-ar", "48000", "-movflags", "+faststart", output]
+            proc = subprocess.run(aac_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  startupinfo=si, text=True, encoding="utf-8", errors="replace")
+        if proc.returncode != 0 or not os.path.isfile(output) or os.path.getsize(output) <= 1024:
+            try:
+                if os.path.exists(output):
+                    os.remove(output)
+            except Exception:
+                pass
+            err = (proc.stderr or "")[-500:].strip()
+            raise RuntimeError(err or "FFmpeg không tạo được audio")
+        return output
+
+    def run(self):
+        sources = []
+        seen = set()
+        for path in self.video_paths:
+            source = self._original_source(path)
+            key = os.path.normcase(os.path.abspath(source))
+            if os.path.isfile(source) and key not in seen:
+                seen.add(key)
+                sources.append(source)
+        if not sources:
+            self.log.emit("❌ Không tìm thấy video nguồn để xuất audio gốc.")
+            self.done.emit(False, [])
+            return
+
+        worker_count = min(self.workers, len(sources))
+        self.log.emit(f"🎧 Xuất audio gốc: {len(sources)} tập · {worker_count} luồng song song")
+        outputs = {}
+        failed = []
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            jobs = {pool.submit(self._extract_one, src): src for src in sources}
+            completed = 0
+            for future in as_completed(jobs):
+                src = jobs[future]
+                completed += 1
+                try:
+                    output = future.result()
+                    outputs[src] = output
+                    self.log.emit(f"✅ Audio gốc: {os.path.basename(output)}")
+                except Exception as exc:
+                    failed.append(src)
+                    self.log.emit(f"❌ {os.path.basename(src)}: {exc}")
+                self.progress.emit(completed, len(sources))
+
+        ordered = [outputs[src] for src in sources if src in outputs]
+        self.done.emit(bool(ordered) and not failed, ordered)
+
+
+class ExportSeparatedAudioThread(ExportOriginalAudioThread):
+    """Xuất hai track rời: bản lồng tiếng/amix hiện tại và tiếng gốc."""
+
+    # Báo riêng từng tập khi CẢ HAI track đã đóng file xong. RenderWidget dùng
+    # tín hiệu này để dọn video nguồn cuốn chiếu mà không xóa sớm lúc ffmpeg
+    # vẫn đang đọc tiếng gốc hoặc bản lồng.
+    episode_done = pyqtSignal(str, bool, list)
+
+    def run(self):
+        tasks = []
+        seen = set()
+        for selected in self.video_paths:
+            if not os.path.isfile(selected):
+                continue
+            original = self._original_source(selected)
+            selected_stem, _ = os.path.splitext(selected)
+            original_stem, original_ext = os.path.splitext(original)
+            dubbed_candidate = original_stem + "_dubbed" + original_ext
+            dubbed_source = (selected if selected_stem.lower().endswith("_dubbed")
+                             else dubbed_candidate if os.path.isfile(dubbed_candidate)
+                             else selected)
+            if selected_stem.lower().endswith("_dubbed"):
+                base_stem = selected_stem[:-len("_dubbed")]
+            elif selected_stem.lower().endswith("_final"):
+                base_stem = selected_stem[:-len("_final")]
+            else:
+                base_stem = original_stem
+            candidates = [
+                (dubbed_source, base_stem + "_audio_long_tieng.m4a", "lồng tiếng"),
+                (original, base_stem + "_audio_goc.m4a", "tiếng gốc"),
+            ]
+            for source, output, label in candidates:
+                key = os.path.normcase(os.path.abspath(output))
+                if key not in seen:
+                    seen.add(key)
+                    tasks.append((source, output, label, original))
+
+        if not tasks:
+            self.log.emit("❌ Không tìm thấy nguồn để xuất hai track audio.")
+            self.done.emit(False, [])
+            return
+
+        worker_count = min(self.workers, len(tasks))
+        self.log.emit(f"🎧 Tách lồng tiếng + tiếng gốc: {len(tasks)} file · {worker_count} luồng")
+        outputs = {}
+        failed = []
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            jobs = {pool.submit(self._extract_one, source, output): (source, output, label, episode)
+                    for source, output, label, episode in tasks}
+            episode_results = {}
+            completed = 0
+            for future in as_completed(jobs):
+                source, output, label, episode = jobs[future]
+                completed += 1
+                state = episode_results.setdefault(episode, {"done": 0, "ok": True, "outputs": []})
+                try:
+                    outputs[output] = future.result()
+                    state["outputs"].append(output)
+                    self.log.emit(f"✅ Audio {label}: {os.path.basename(output)}")
+                except Exception as exc:
+                    failed.append(output)
+                    state["ok"] = False
+                    self.log.emit(f"❌ Audio {label} · {os.path.basename(source)}: {exc}")
+                state["done"] += 1
+                if state["done"] == 2:
+                    self.episode_done.emit(episode, bool(state["ok"]), list(state["outputs"]))
+                self.progress.emit(completed, len(tasks))
+        ordered = [outputs[output] for _, output, _, _ in tasks if output in outputs]
+        self.done.emit(bool(ordered) and not failed, ordered)
+
+
+class MergeSeparatedPackageThread(QThread):
+    """Nối hai dải audio theo timeline video và xác minh bộ 3 trọn bộ."""
+    log = pyqtSignal(str)
+    done = pyqtSignal(bool, list, str)
+
+    def __init__(self, video_file, episode_videos, audio_files):
+        super().__init__()
+        self.video_file = video_file
+        self.episode_videos = list(episode_videos or [])
+        self.audio_files = list(audio_files or [])
+
+    def run(self):
+        ffmpeg = get_ffmpeg_path()
+        out_dir = os.path.dirname(self.video_file)
+        base = os.path.splitext(self.video_file)[0]
+        if base.lower().endswith("_rendered"):
+            base = base[:-len("_Rendered")]
+        if base.lower().endswith("_video_sub"):
+            base = base[:-len("_video_sub")]
+        dub_out = base + "_audio_long_tieng.m4a"
+        orig_out = base + "_audio_goc.m4a"
+        tmp_dir = tempfile.mkdtemp(prefix="_audio_merge_", dir=out_dir)
+        si = subprocess.STARTUPINFO() if os.name == "nt" else None
+        if si: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        try:
+            episodes = sorted(self.episode_videos, key=lambda p: _natural_key(os.path.basename(p)))
+            durations = [_probe_duration_sec(p) for p in episodes]
+            if not episodes or any(d <= 0 for d in durations):
+                raise RuntimeError("Không đọc được thời lượng video tập để căn audio")
+
+            def group(suffix):
+                items = [p for p in self.audio_files if p.lower().endswith(suffix)]
+                return sorted(items, key=lambda p: _natural_key(os.path.basename(p)))
+
+            def merge_track(inputs, output, label):
+                if len(inputs) != len(episodes):
+                    raise RuntimeError(f"{label}: có {len(inputs)} audio nhưng video có {len(episodes)} tập")
+                # Không encode AAC từng tập rồi concat-copy: encoder delay nhỏ
+                # của từng file sẽ cộng dồn (đặc biệt bộ 100-300 tập) và làm
+                # audio trọn bộ lệch khỏi video. Tạo tên ngắn trong thư mục tạm,
+                # concat bằng filter rồi chỉ encode AAC MỘT LẦN cho cả bộ.
+                short_inputs = []
+                for i, (audio, duration) in enumerate(zip(inputs, durations)):
+                    short = os.path.join(tmp_dir, f"{label}-{i + 1:04d}.m4a")
+                    try:
+                        os.link(audio, short)
+                    except OSError:
+                        shutil.copyfile(audio, short)
+                    short_inputs.append(short)
+                filter_file = os.path.join(tmp_dir, label + "-filter.txt")
+                filters = []
+                labels = []
+                for i, duration in enumerate(durations):
+                    filters.append(
+                        f"[{i}:a:0]aformat=sample_rates=48000:channel_layouts=stereo,"
+                        f"aresample=48000:async=1:first_pts=0,apad,"
+                        f"atrim=0:{duration:.6f},asetpts=PTS-STARTPTS[a{i}]")
+                    labels.append(f"[a{i}]")
+                filters.append("".join(labels) + f"concat=n={len(inputs)}:v=0:a=1[aout]")
+                with open(filter_file, "w", encoding="utf-8") as handle:
+                    handle.write(";".join(filters))
+                input_args = []
+                for item in short_inputs:
+                    input_args.extend(["-i", item])
+                total_duration = sum(durations)
+                cmd = [ffmpeg, "-y", "-nostdin", "-nostats", "-progress", "pipe:1", *input_args,
+                       "-filter_complex_script", filter_file, "-map", "[aout]",
+                       "-t", f"{total_duration:.6f}", "-c:a", "aac", "-b:a", "192k",
+                       "-ar", "48000", "-ac", "2", "-movflags", "+faststart", output]
+                error_file = os.path.join(tmp_dir, label + "-ffmpeg-error.txt")
+                started = time.monotonic()
+                last_percent = -5
+                last_report = started
+                with open(error_file, "w+", encoding="utf-8", errors="replace") as errors:
+                    p = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=errors, startupinfo=si,
+                        text=True, encoding="utf-8", errors="replace", bufsize=1)
+                    current_seconds = 0.0
+                    for raw_line in p.stdout or ():
+                        key, sep, value = raw_line.strip().partition("=")
+                        if not sep:
+                            continue
+                        if key == "out_time":
+                            try:
+                                hours, minutes, seconds = value.split(":")
+                                current_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+                            except (ValueError, TypeError):
+                                continue
+                        elif key == "progress" and current_seconds > 0:
+                            percent = min(99, int(current_seconds * 100 / max(total_duration, 0.001)))
+                            now = time.monotonic()
+                            if percent >= last_percent + 5 or now - last_report >= 60:
+                                elapsed = max(now - started, 0.001)
+                                eta = max(0, int(elapsed * (total_duration - current_seconds) / current_seconds))
+                                eta_text = f"{eta // 60}p{eta % 60:02d}s"
+                                self.log.emit(
+                                    f"⏳ Nối audio {label}: {percent}% · còn khoảng {eta_text}")
+                                last_percent = percent
+                                last_report = now
+                    returncode = p.wait()
+                    errors.flush()
+                    errors.seek(0)
+                    error_text = errors.read()
+                if returncode or not os.path.isfile(output) or os.path.getsize(output) <= 1024:
+                    if os.path.isfile(output) and os.path.getsize(output) <= 1024:
+                        try:
+                            os.remove(output)
+                        except OSError:
+                            pass
+                    raise RuntimeError(f"Không nối được {label}: {(error_text or '')[-400:]}")
+                self.log.emit(f"✅ Nối audio {label}: 100%")
+
+            self.log.emit("🎧 Đang căn và nối audio lồng tiếng trọn bộ...")
+            merge_track(group("_audio_long_tieng.m4a"), dub_out, "long-tieng")
+            self.log.emit("🎧 Đang căn và nối audio gốc trọn bộ...")
+            merge_track(group("_audio_goc.m4a"), orig_out, "tieng-goc")
+            values = [_probe_duration_sec(p) for p in (self.video_file, dub_out, orig_out)]
+            drift = max(values) - min(values)
+            if min(values) <= 0 or drift > 0.12:
+                raise RuntimeError(f"Ba file lệch thời lượng {drift:.3f}s (giới hạn 0.12s)")
+
+            # Gói lồng tiếng làm audio mặc định ngay trong MP4 để Safari/iOS
+            # phát và tua bằng một media duy nhất. Hai M4A vẫn được giữ cho
+            # web PC đổi sang tiếng gốc mà không cần tạo MP4 thứ hai.
+            embedded_tmp = base + "_embedded_audio_tmp.mp4"
+            try:
+                if os.path.isfile(embedded_tmp):
+                    os.remove(embedded_tmp)
+                self.log.emit("📦 Đang nhúng 2 track audio vào MP4 trọn bộ (stream-copy)...")
+                cmd = [ffmpeg, "-y", "-nostdin",
+                       "-i", self.video_file, "-i", dub_out, "-i", orig_out,
+                       "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0",
+                       "-c", "copy",
+                       "-metadata:s:a:0", "language=vie",
+                       "-metadata:s:a:0", "title=Lồng tiếng",
+                       "-metadata:s:a:1", "language=zho",
+                       "-metadata:s:a:1", "title=Tiếng gốc",
+                       "-disposition:a:0", "default", "-disposition:a:1", "0",
+                       "-movflags", "+faststart", embedded_tmp]
+                p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   startupinfo=si, text=True, encoding="utf-8", errors="replace")
+                if (p.returncode or not os.path.isfile(embedded_tmp)
+                        or os.path.getsize(embedded_tmp) <= 1024):
+                    raise RuntimeError("Không nhúng được 2 audio vào MP4: " + (p.stderr or "")[-500:])
+                os.replace(embedded_tmp, self.video_file)
+            finally:
+                try:
+                    if os.path.isfile(embedded_tmp):
+                        os.remove(embedded_tmp)
+                except OSError:
+                    pass
+
+            self.done.emit(True, [self.video_file, dub_out, orig_out],
+                           f"Đồng bộ đạt: lệch tối đa {drift:.3f}s · MP4 có 2 audio nhúng")
+        except Exception as exc:
+            self.done.emit(False, [], str(exc))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 def _probe_duration_sec(video_path):
     """Đọc tổng thời lượng (giây) của video bằng ffmpeg -i. Trả 0 nếu không đọc được."""
@@ -1925,6 +2308,26 @@ class SingleRenderThread(QThread):
                 try: stream.close()
                 except Exception: pass
 
+    def _validate_output_timeline(self):
+        """Chỉ công nhận tập đã render khi timeline bắt đầu từ 0 và đủ duration."""
+        source_duration = _probe_duration_sec(self.vp)
+        output_duration = _probe_duration_sec(self.op)
+        speed = 1.05 if self.cfg.get("speed") else 1.0
+        expected = source_duration / speed if source_duration > 0 else 0.0
+        fps = float(self.cfg.get("target_fps") or 30.0)
+        tolerance = max(0.12, 2.0 / max(fps, 1.0))
+        if expected <= 0 or output_duration <= 0 or abs(output_duration - expected) > tolerance:
+            self.log.emit(
+                f"❌ Timeline tập chưa đạt: {output_duration:.3f}/{expected:.3f}s "
+                f"(lệch {abs(output_duration - expected):.3f}s) → không đánh dấu xong.\n")
+            try:
+                if os.path.isfile(self.op): os.remove(self.op)
+            except OSError:
+                pass
+            return False
+        self.log.emit(f"✅ Timeline tập đạt chuẩn: {output_duration:.3f}s · timebase 1/90000.\n")
+        return True
+
     def _emit_progress_from_line(self, line, last_pct):
         """Từ 1 dòng ffmpeg (out_time_ms=... hoặc time=HH:MM:SS), tính % và phát signal.
         Trả về pct mới (để không phát trùng). Cần self._total_dur > 0."""
@@ -1951,12 +2354,11 @@ class SingleRenderThread(QThread):
         self._total_dur = _probe_duration_sec(self.vp)
         self.log.emit(f"🎬 Bắt đầu Render & Ép phụ đề...\n")
         quality_text = self.cfg.get("render_quality", "⭐ Tốt (CRF 20)")
-        self.log.emit(f"   📊 Chất lượng: {quality_text} | Codec: {get_optimal_ffmpeg_codec()}\n")
-        _fb = get_codec_fallback_reason()
+        codec = self.cfg.get("render_codec") or get_optimal_ffmpeg_codec()
+        self.log.emit(f"   📊 Chất lượng: {quality_text} | Codec: {codec}\n")
+        _fb = get_codec_fallback_reason() if codec != "libx264" else ""
         if _fb:
             self.log.emit(f"   ⚠️ {_fb}\n")
-        codec = get_optimal_ffmpeg_codec()
-
         has_audio = False
         try:
             ffmpeg_bin = get_ffmpeg_path()
@@ -2118,8 +2520,14 @@ class SingleRenderThread(QThread):
                 f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1 [v_res]")
             last_vid_out = "[v_res]"
 
+        # Chuẩn hóa timeline ở bước cuối của MỌI tập. FPS/độ phân giải giống
+        # nhau là chưa đủ: PTS khác điểm bắt đầu vẫn làm concat-copy chồng giờ.
+        filter_chains.append(f"{last_vid_out}setpts=PTS-STARTPTS[v_timeline]")
+        last_vid_out = "[v_timeline]"
+
         audio_map = ""
-        if self.cfg.get("tts_en") and self.tts_path and os.path.exists(self.tts_path):
+        video_only = bool(self.cfg.get("video_only"))
+        if not video_only and self.cfg.get("tts_en") and self.tts_path and os.path.exists(self.tts_path):
             tts_idx = inputs.count("-i")
             inputs.extend(["-i", self.tts_path])
             tts_v = self.cfg.get("tts_ai_vol", 150) / 100.0
@@ -2132,7 +2540,7 @@ class SingleRenderThread(QThread):
             else:
                 filter_chains.append(f"[{tts_idx}:a]aformat=channel_layouts=stereo,volume={tts_v:.2f}[a_mixed]")
                 audio_map = "[a_mixed]"
-        else:
+        elif not video_only:
             if has_audio:
                 orig_v = self.cfg.get("tts_orig_vol", 15) / 100.0
                 if orig_v > 0:
@@ -2183,6 +2591,7 @@ class SingleRenderThread(QThread):
             enc_args = []
             if "amf" in codec.lower() or "nvenc" in codec.lower() or "qsv" in codec.lower():
                 enc_args.extend(["-c:v", codec, "-pix_fmt", "yuv420p"])
+                if video_only: enc_args.extend(["-an"])
                 if audio_map: enc_args.extend(["-c:a", "aac", "-b:a", "192k"])
 
                 if use_crf:
@@ -2204,9 +2613,15 @@ class SingleRenderThread(QThread):
                     # Không để AAC dài hơn video vài ms; nếu audio dài hơn, concat -c copy
                     # sẽ tạo khe timestamp ở điểm nối và có thể làm FPS/tbr nhảy sai.
                     enc_args.extend(["-shortest"])
-                enc_args.extend(["-movflags", "+faststart", self.op])
+                enc_args.extend(["-video_track_timescale", "90000",
+                                 "-avoid_negative_ts", "make_zero",
+                                 "-movflags", "+faststart", self.op])
             else:
-                enc_args.extend(["-c:v", codec, "-pix_fmt", "yuv420p"])
+                # Nhiều tập chạy song song: không để mỗi libx264 tự chiếm toàn
+                # bộ lõi CPU (4 process x 30+ thread dễ thiếu RAM/tài nguyên và
+                # làm các tập cuối lỗi đồng loạt).
+                enc_args.extend(["-c:v", codec, "-pix_fmt", "yuv420p", "-threads", "6"])
+                if video_only: enc_args.extend(["-an"])
                 if audio_map: enc_args.extend(["-c:a", "aac", "-b:a", "192k"])
                 if use_crf:
                     enc_args.extend(["-crf", str(crf_val), "-preset", preset_sw])
@@ -2214,13 +2629,18 @@ class SingleRenderThread(QThread):
                     enc_args.extend(["-b:v", "1000k", "-preset", preset_sw])
                 if audio_map:
                     enc_args.extend(["-shortest"])
-                enc_args.extend(["-movflags", "+faststart", self.op])
+                enc_args.extend(["-video_track_timescale", "90000",
+                                 "-avoid_negative_ts", "make_zero",
+                                 "-movflags", "+faststart", self.op])
             cmd.extend(enc_args)
         else:
             cmd.extend(["-map", "0:v"])
             if audio_map: cmd.extend(["-map", audio_map, "-c", "copy"])
             else: cmd.extend(["-c:v", "copy"])
-            cmd.extend(["-movflags", "+faststart", self.op])
+            if video_only: cmd.extend(["-an"])
+            cmd.extend(["-video_track_timescale", "90000",
+                        "-avoid_negative_ts", "make_zero",
+                        "-movflags", "+faststart", self.op])
 
         try:
             self.log.emit(f"  ⚙️ Đang xử lý FFmpeg, vui lòng đợi...\n")
@@ -2260,7 +2680,7 @@ class SingleRenderThread(QThread):
                     if os.path.exists(self.op): os.remove(self.op)
                 except Exception: pass
                 self.done.emit(False)
-            elif proc.returncode == 0:
+            elif proc.returncode == 0 and self._validate_output_timeline():
                 self.progress.emit(100)
                 self.log.emit(f"⏱️ Render hoàn thành trong: {format_time(elapsed)}\n")
                 self.done.emit(True)
@@ -2288,7 +2708,9 @@ class SingleRenderThread(QThread):
                         base_cmd = cmd[:cut]
                     except ValueError:
                         base_cmd = cmd  # phòng hờ, không nên xảy ra
-                    cpu_args = ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+                    cpu_args = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-threads", "4"]
+                    if video_only:
+                        cpu_args += ["-an"]
                     if ctx.get("audio_map"):
                         cpu_args += ["-c:a", "aac", "-b:a", "192k"]
                     if use_crf:
@@ -2297,7 +2719,9 @@ class SingleRenderThread(QThread):
                         cpu_args += ["-b:v", "1000k", "-preset", preset_sw]
                     if ctx.get("audio_map"):
                         cpu_args += ["-shortest"]
-                    cpu_args += ["-movflags", "+faststart", self.op]
+                    cpu_args += ["-video_track_timescale", "90000",
+                                 "-avoid_negative_ts", "make_zero",
+                                 "-movflags", "+faststart", self.op]
                     cmd_cpu = base_cmd + cpu_args
 
                     kw = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
@@ -2332,7 +2756,7 @@ class SingleRenderThread(QThread):
                     self._close_process_streams(proc); self._proc = None
                     if self._cancel:
                         self.log.emit("⛔ Đã hủy render.\n"); self.done.emit(False)
-                    elif proc.returncode == 0:
+                    elif proc.returncode == 0 and self._validate_output_timeline():
                         self.progress.emit(100)
                         self.log.emit(f"✅ Render thành công bằng CPU (libx264) trong: {format_time(time.time() - start_t)}\n")
                         self.done.emit(True)
@@ -2692,6 +3116,27 @@ class EpisodeCard(QFrame):
             return
         self._load_thumbnail()
 
+    def replace_video_source(self, video_path, load_thumbnail=True):
+        """Đổi nguồn card sang đầu ra còn được giữ lại và nạp lại thumbnail."""
+        if not video_path or not os.path.isfile(video_path):
+            return False
+        try:
+            if os.path.abspath(self.video_path) == os.path.abspath(video_path):
+                return True
+        except Exception:
+            pass
+        self.video_path = video_path
+        self.lbl_name.setText(os.path.basename(video_path))
+        self.lbl_name.setToolTip(video_path)
+        self._thumb_loaded = False
+        self._thumb_loading = False
+        self._thumb_source = ""
+        self._thumb_pix = QPixmap()
+        self._update_source_badges()
+        if load_thumbnail:
+            self.ensure_thumbnail()
+        return True
+
     def _load_thumbnail(self):
         """Thumbnail nền nhẹ: tối đa 1 ffmpeg và chỉ chạy cho card đang nhìn thấy."""
         src = self.video_path
@@ -2770,7 +3215,15 @@ class EpisodeCard(QFrame):
     def _update_source_badges(self):
         has_vi = bool(self.srt_path and self.srt_path.lower().endswith("_vi.srt"))
         stem, ext = os.path.splitext(self.video_path)
-        is_dub = stem.lower().endswith("_dubbed") or os.path.exists(stem + "_dubbed" + ext)
+        base = stem
+        for suffix in ("_dubbed", "_final", "_video_sub"):
+            if stem.lower().endswith(suffix):
+                base = stem[:-len(suffix)]
+                break
+        is_dub = bool(
+            stem.lower().endswith("_dubbed")
+            or os.path.exists(base + "_dubbed" + ext)
+            or os.path.exists(base + "_audio_long_tieng.m4a"))
         self.badge_translate.setVisible(has_vi)
         self.badge_voice.setVisible(is_dub)
         self.cmb_track.setCurrentIndex(1 if is_dub else 0)
@@ -2823,24 +3276,28 @@ class EpisodeCard(QFrame):
         self.selected = val
         self._apply_style()
 
-    def refresh_srt_from_disk(self):
+    def refresh_srt_from_disk(self, load_thumbnail=True):
         """Tự dò lại sub + video lồng tiếng như logic cũ, sau đó cập nhật badge/card."""
         stem, ext = os.path.splitext(self.video_path)
-        if stem.endswith("_dubbed"):
-            orig_stem = stem[:-len("_dubbed")]
-        else:
-            orig_stem = stem
+        orig_stem = stem
+        for suffix in ("_dubbed", "_final", "_video_sub"):
+            if stem.lower().endswith(suffix):
+                orig_stem = stem[:-len(suffix)]
+                break
         dubbed_video = orig_stem + "_dubbed" + ext
+        video_sub = orig_stem + "_video_sub.mp4"
+        audio_dub = orig_stem + "_audio_long_tieng.m4a"
+        audio_original = orig_stem + "_audio_goc.m4a"
         video_changed = False
-        if os.path.exists(dubbed_video) and self.video_path != dubbed_video:
-            self.video_path = dubbed_video
-            video_changed = True
-            self.lbl_name.setText(os.path.basename(self.video_path))
-            self.lbl_name.setToolTip(self.video_path)
-            self._thumb_loaded = False
-            self._thumb_loading = False
-            self._thumb_source = ""
-            self.ensure_thumbnail()
+        # Sau khi dọn nguồn, dùng video sub không tiếng làm nguồn card. Chỉ
+        # nhận đây là tập hoàn tất khi hai audio đi kèm cũng tồn tại.
+        packaged = all(os.path.isfile(path) and os.path.getsize(path) > 1024
+                       for path in (video_sub, audio_dub, audio_original))
+        replacement = video_sub if packaged else (
+            dubbed_video if os.path.exists(dubbed_video) else None)
+        if replacement and self.video_path != replacement:
+            video_changed = self.replace_video_source(
+                replacement, load_thumbnail=load_thumbnail)
 
         vi = orig_stem + "_vi.srt"
         raw = orig_stem + ".srt"
@@ -3500,11 +3957,24 @@ class SingleSeriesRenderWidget(QWidget):
 
         rp_row = QHBoxLayout(); rp_row.setSpacing(5)
         rp_row.addWidget(QLabel("Song song", styleSheet="color:#858D96; font-size:8px; border:none;"))
-        self.spn_render_parallel = QSpinBox(); self.spn_render_parallel.setRange(1, 4)
-        self.spn_render_parallel.setValue(int(self.settings.value("render_parallel", 2)))
+        self.spn_render_parallel = QSpinBox(); self.spn_render_parallel.setRange(1, 2)
+        self.spn_render_parallel.setValue(min(2, int(self.settings.value("render_parallel", 2))))
         self.spn_render_parallel.setFixedWidth(43)
         self.spn_render_parallel.valueChanged.connect(lambda v: self.settings.setValue("render_parallel", v))
         rp_row.addWidget(self.spn_render_parallel)
+        rp_row.addSpacing(7)
+        rp_row.addWidget(QLabel("Bộ mã hóa", styleSheet="color:#858D96; font-size:8px; border:none;"))
+        self.cmb_render_engine = QComboBox()
+        self.cmb_render_engine.addItems(["Tự động (ưu tiên GPU)", "CPU (libx264)"])
+        _saved_engine = str(self.settings.value("render_engine", "Tự động (ưu tiên GPU)"))
+        _engine_idx = self.cmb_render_engine.findText(_saved_engine)
+        self.cmb_render_engine.setCurrentIndex(_engine_idx if _engine_idx >= 0 else 0)
+        self.cmb_render_engine.setToolTip(
+            "Tự động sẽ kiểm tra card thật bằng FFmpeg và ưu tiên NVIDIA/AMD/Intel. "
+            "Nếu GPU hoặc driver không hỗ trợ, tool tự chuyển về CPU.")
+        self.cmb_render_engine.currentTextChanged.connect(
+            lambda t: self.settings.setValue("render_engine", t))
+        rp_row.addWidget(self.cmb_render_engine)
         rp_row.addSpacing(7)
         rp_row.addWidget(QLabel("FPS", styleSheet="color:#858D96; font-size:8px; border:none;"))
         self.cmb_fps = QComboBox(); self.cmb_fps.addItems(["Giữ gốc", "24", "25", "30"])
@@ -3535,6 +4005,14 @@ class SingleSeriesRenderWidget(QWidget):
             "QPushButton:hover { background:#214335; }")
         self.btn_merge_now.clicked.connect(self._start_merge_now)
         bot_lay.addWidget(self.btn_merge_now)
+
+        self.btn_export_original_audio = QPushButton("🎧  Xuất audio gốc các tập đã chọn")
+        self.btn_export_original_audio.setFixedHeight(28)
+        self.btn_export_original_audio.setStyleSheet(
+            "QPushButton { background:#182B38; color:#72C9F0; border:1px solid #28536A; border-radius:5px; font-size:9px; } "
+            "QPushButton:hover { background:#203B4D; }")
+        self.btn_export_original_audio.clicked.connect(self._start_export_original_audio)
+        bot_lay.addWidget(self.btn_export_original_audio)
         rl.addLayout(bot_lay)
 
         # ── Pipeline dưới cùng: nhìn là hiểu luồng, người mới chỉ cần 1 nút.
@@ -3560,7 +4038,38 @@ class SingleSeriesRenderWidget(QWidget):
         btn_dub.clicked.connect(self._open_pipeline_dub); bb.addWidget(btn_dub, 1)
 
         self.btn_run = _pipe_button("④  Render & Xuất", "Tạo video hoàn chỉnh")
-        self.btn_run.clicked.connect(self._start_render_all); bb.addWidget(self.btn_run, 1)
+        self.btn_run.clicked.connect(self._start_normal_render); bb.addWidget(self.btn_run, 1)
+
+        self.chk_export_separate = QCheckBox("Xuất tách 3 file\nVideo sub + lồng tiếng + tiếng gốc")
+        self.chk_export_separate.setChecked(
+            self.settings.value("export_separate_tracks", False, type=bool))
+        self.chk_export_separate.setToolTip(
+            "Áp dụng cho toàn bộ tập đã chọn khi bấm Render & Xuất hoặc Làm tất cả")
+        self.chk_export_separate.setStyleSheet(
+            "QCheckBox { background:#142A48; color:#ECF5FF; border:1px solid #25517F; "
+            "border-radius:9px; padding:5px 11px; font-size:8px; font-weight:900; } "
+            "QCheckBox:hover { background:#193B64; border-color:#2D8DFF; } "
+            "QCheckBox::indicator { width:18px; height:18px; }")
+        self.chk_export_separate.stateChanged.connect(
+            lambda _v: self.settings.setValue(
+                "export_separate_tracks", self.chk_export_separate.isChecked()))
+        bb.addWidget(self.chk_export_separate, 1)
+
+        self.chk_cleanup_each_episode = QCheckBox("Dọn từng tập sau khi xong\nChỉ giữ gói trọn bộ")
+        self.chk_cleanup_each_episode.setChecked(
+            self.settings.value("cleanup_each_separated_episode", True, type=bool))
+        self.chk_cleanup_each_episode.setToolTip(
+            "Chỉ áp dụng khi xuất tách 3 file. Video nguồn chỉ bị xóa sau khi đúng tập đó "
+            "đã render xong và đã tách đủ hai audio; file tập lẻ được dọn sau khi gói trọn bộ được xác minh.")
+        self.chk_cleanup_each_episode.setStyleSheet(
+            "QCheckBox { background:#342815; color:#FFE2A8; border:1px solid #725322; "
+            "border-radius:9px; padding:5px 11px; font-size:8px; font-weight:900; } "
+            "QCheckBox:hover { background:#46351A; border-color:#D79B35; } "
+            "QCheckBox::indicator { width:18px; height:18px; }")
+        self.chk_cleanup_each_episode.stateChanged.connect(
+            lambda _v: self.settings.setValue(
+                "cleanup_each_separated_episode", self.chk_cleanup_each_episode.isChecked()))
+        bb.addWidget(self.chk_cleanup_each_episode, 1)
 
         quick = QFrame(); quick.setStyleSheet("QFrame { background:#12243D; border:1px solid #23486F; border-radius:9px; }")
         ql2 = QVBoxLayout(quick); ql2.setContentsMargins(8,4,8,4); ql2.setSpacing(2)
@@ -3576,8 +4085,8 @@ class SingleSeriesRenderWidget(QWidget):
         qr.addWidget(self.lbl_bottom_count); ql2.addLayout(qr)
         bb.addWidget(quick)
 
-        self.btn_stop = QPushButton("■")
-        self.btn_stop.setFixedSize(38, 48); self.btn_stop.setToolTip("Dừng xử lý")
+        self.btn_stop = QPushButton("■ DỪNG\nTẤT CẢ")
+        self.btn_stop.setFixedSize(72, 48); self.btn_stop.setToolTip("Dừng toàn bộ: tách sub, dịch, lồng tiếng, render và hàng đợi")
         self.btn_stop.setStyleSheet("QPushButton { background:#3A2028; color:#FF9BAA; border:1px solid #6D3442; border-radius:9px; font-size:11px; }")
         self.btn_stop.clicked.connect(self._stop_render); self.btn_stop.setEnabled(False); bb.addWidget(self.btn_stop)
 
@@ -4040,7 +4549,7 @@ class SingleSeriesRenderWidget(QWidget):
         # Quy về stem GỐC để dò các output cạnh video.
         low_stem = stem.lower()
         base = stem
-        for suffix in ("_dubbed", "_final"):
+        for suffix in ("_dubbed", "_final", "_video_sub"):
             if low_stem.endswith(suffix):
                 base = stem[:-len(suffix)]
                 break
@@ -4049,14 +4558,32 @@ class SingleSeriesRenderWidget(QWidget):
         raw_path = base + ".srt"
         dubbed_path = base + "_dubbed" + ext
         final_path = base + "_final.mp4"
+        video_sub_path = base + "_video_sub.mp4"
+        audio_dub_path = base + "_audio_long_tieng.m4a"
+        audio_original_path = base + "_audio_goc.m4a"
 
         has_sp = bool(sp and os.path.exists(sp))
         has_vi_disk = os.path.exists(vi_path)
         has_raw_disk = os.path.exists(raw_path)
         has_sub = bool(has_sp or has_vi_disk or has_raw_disk)
         translated = bool(has_vi_disk or (has_sp and str(sp).lower().endswith("_vi.srt")))
-        dubbed = bool(stem.lower().endswith("_dubbed") or os.path.exists(dubbed_path))
-        exported = bool(os.path.exists(final_path) or str(vp).lower().endswith("_final.mp4"))
+        separate_mode = bool(
+            hasattr(self, "chk_export_separate")
+            and self.chk_export_separate.isChecked())
+        # Ở chế độ 3 file, *_dubbed.mp4 được dọn sau khi đã tách audio. Vì vậy
+        # audio lồng tiếng hợp lệ cũng phải được tính là đã lồng, nếu không bộ
+        # lọc sẽ báo sai hàng chục tập "Chưa lồng tiếng".
+        dubbed = bool(
+            stem.lower().endswith("_dubbed")
+            or os.path.exists(dubbed_path)
+            or (separate_mode and os.path.exists(audio_dub_path)))
+        # Luồng cũ xuất *_final.mp4; luồng gói 3 file xuất video không tiếng
+        # *_video_sub.mp4. Cả hai đều là một tập đã render/xuất hoàn chỉnh.
+        exported = bool(
+            os.path.exists(final_path)
+            or os.path.exists(video_sub_path)
+            or str(vp).lower().endswith(("_final.mp4", "_video_sub.mp4"))
+        )
 
         status_text = ""
         try:
@@ -4077,7 +4604,13 @@ class SingleSeriesRenderWidget(QWidget):
         except Exception:
             pass
 
-        done = exported or (has_sub and translated and dubbed)
+        if separate_mode:
+            done = bool(
+                os.path.exists(video_sub_path)
+                and os.path.exists(audio_dub_path)
+                and os.path.exists(audio_original_path))
+        else:
+            done = exported or (has_sub and translated and dubbed)
         return {"has_sub": has_sub, "translated": translated, "dubbed": dubbed,
                 "exported": exported, "error": error, "edited": edited,
                 "portrait": portrait, "landscape": landscape, "done": done}
@@ -4996,6 +5529,8 @@ class SingleSeriesRenderWidget(QWidget):
             self.btn_run.setText(f"④  Render & Xuất ({n_sel})\nTạo video hoàn chỉnh")
         if hasattr(self, "btn_merge_now"):
             self.btn_merge_now.setText(f"🔗  Gộp nhanh ({n_sel})")
+        if hasattr(self, "btn_export_original_audio"):
+            self.btn_export_original_audio.setText(f"🎧  Xuất audio gốc ({n_sel})")
         if hasattr(self, "lbl_editor_count"):
             self.lbl_editor_count.setText(f"{n_all} video")
         if hasattr(self, "lbl_selected_count"):
@@ -5535,6 +6070,9 @@ class SingleSeriesRenderWidget(QWidget):
             "margin_l": 0, "margin_r": 0, "margin_v": margin_v,
             "hardsub_en": design["hardsub_en"],
             "render_quality": design["render_quality"],
+            "render_codec": ("libx264" if hasattr(self, "cmb_render_engine")
+                             and self.cmb_render_engine.currentText().startswith("CPU")
+                             else get_optimal_ffmpeg_codec()),
             "target_fps": self._get_target_fps(),
             "target_res": getattr(self, "_target_res", None),
             # KHÔNG bật tts_en -> SingleRenderThread bỏ qua phần audio TTS
@@ -5701,6 +6239,9 @@ class SingleSeriesRenderWidget(QWidget):
     def _run_full_pipeline_external(self):
         """Nút 'LÀM TẤT CẢ' ngoài: chuyển việc cho tab con Sub→Dịch→Lồng chạy
         trọn quy trình (dùng cấu hình đã set trong tab đó)."""
+        self._separate_export_mode = bool(
+            hasattr(self, "chk_export_separate") and self.chk_export_separate.isChecked())
+        self._separate_audio_started = False
         tab = getattr(self, "dub_feature_tab", None)
         if tab is None or not hasattr(tab, "_run_full_pipeline"):
             QMessageBox.warning(self, "Thiếu tính năng",
@@ -5721,6 +6262,267 @@ class SingleSeriesRenderWidget(QWidget):
         self.spn_merge_parts.setVisible(mode == "Theo phần")
         self.settings.setValue("render_merge_mode", mode)
         self.settings.setValue("merge_after_render", mode != "Tập lẻ")
+
+    def _start_normal_render(self):
+        if hasattr(self, "chk_export_separate") and self.chk_export_separate.isChecked():
+            self._start_separate_package()
+        else:
+            self._separate_export_mode = False
+            self._separate_audio_started = False
+            self._start_render_all()
+
+    def _launch_separate_audio(self, video_paths):
+        video_paths = [path for path in (video_paths or []) if path and os.path.isfile(path)]
+        if not video_paths or getattr(self, "_separate_audio_started", False):
+            return
+        self._separate_audio_started = True
+        workers = min(int(self.spn_render_parallel.value()), max(1, len(video_paths) * 2))
+        self.separate_audio_thread = ExportSeparatedAudioThread(video_paths, workers)
+        self.separate_audio_thread.log.connect(self._log)
+        self.separate_audio_thread.progress.connect(self._on_separate_audio_progress)
+        self.separate_audio_thread.episode_done.connect(self._on_separate_episode_audio_done)
+        self.separate_audio_thread.done.connect(self._on_separate_audio_done)
+        self.separate_audio_thread.start()
+
+    def _start_separate_package(self):
+        """Một nút tạo video sub không tiếng + audio lồng tiếng + audio gốc."""
+        if self._render_running:
+            QMessageBox.information(self, "Đang render", "Đang render, vui lòng đợi xong.")
+            return
+        audio_thread = getattr(self, "separate_audio_thread", None)
+        if audio_thread is not None and audio_thread.isRunning():
+            QMessageBox.information(self, "Đang xuất", "Gói video và audio rời đang được xử lý.")
+            return
+        original_thread = getattr(self, "audio_export_thread", None)
+        if original_thread is not None and original_thread.isRunning():
+            QMessageBox.information(self, "Đang xuất", "Luồng xuất audio gốc đang chạy, vui lòng đợi xong.")
+            return
+        selected_cards = self._selected_cards()
+        video_paths = [getattr(card, "video_path", "") for card in selected_cards]
+        video_paths = [path for path in video_paths if path and os.path.isfile(path)]
+        if not video_paths:
+            QMessageBox.information(self, "Chưa chọn video", "Hãy tick ít nhất 1 video để xuất.")
+            return
+
+        self._separate_export_mode = True
+        self._separate_audio_started = False
+        self._separate_audio_finished = False
+        self._separate_audio_ok = False
+        self._separate_audio_outputs = []
+        self._separate_video_merge_result = None
+        self._separate_audio_ready_sources = set()
+        self._separate_render_ready_sources = set()
+        self._separate_source_cards = {
+            self._live_key(path): path
+            for path in video_paths
+        }
+        self._separate_cleaned_sources = set()
+        self.chk_export_separate.setEnabled(False)
+        self._launch_separate_audio(video_paths)
+        self._start_render_all()
+
+    def _on_separate_audio_progress(self, done, total):
+        self._log(f"🎧 Tiến độ audio rời: {done}/{total}")
+
+    def _launch_live_episode_audio(self, render_input):
+        """Tách hai audio ngay khi một tập được bàn giao sang render."""
+        if not getattr(self, "_separate_export_mode", False):
+            return
+        original = ExportOriginalAudioThread._original_source(render_input)
+        key = self._live_key(original)
+        started = getattr(self, "_separate_episode_audio_started", set())
+        if key in started:
+            return
+        started.add(key)
+        self._separate_episode_audio_started = started
+        thread = ExportSeparatedAudioThread([render_input], workers=2)
+        if not hasattr(self, "_separate_episode_audio_threads"):
+            self._separate_episode_audio_threads = {}
+        self._separate_episode_audio_threads[key] = thread
+        thread.log.connect(self._log)
+        thread.progress.connect(self._on_separate_audio_progress)
+        thread.episode_done.connect(self._on_separate_episode_audio_done)
+        thread.done.connect(lambda ok, outputs, k=key: self._on_live_episode_audio_done(k, ok, outputs))
+        # Không xóa reference ngay trong signal finished (tránh Qt6Core crash).
+        thread.finished.connect(lambda k=key, t=thread: QTimer.singleShot(
+            1000, lambda: self._release_live_audio_thread(k, t)))
+        self._log(f"🎧 Lồng xong → tách ngay 2 audio: {os.path.basename(original)}")
+        thread.start()
+
+    def _on_live_episode_audio_done(self, key, ok, outputs):
+        self._separate_audio_ok = bool(getattr(self, "_separate_audio_ok", True) and ok)
+        current = list(getattr(self, "_separate_audio_outputs", []) or [])
+        for path in outputs or []:
+            if path not in current:
+                current.append(path)
+        self._separate_audio_outputs = current
+        if outputs:
+            self._log(f"✅ Đã có 2 audio tập: {os.path.basename(key)}")
+        if getattr(self, "_separate_audio_sealed", False):
+            running = [t for t in getattr(self, "_separate_episode_audio_threads", {}).values()
+                       if t.isRunning()]
+            if not running:
+                self._separate_audio_finished = True
+                self._try_finish_separated_full_package()
+
+    def _release_live_audio_thread(self, key, thread):
+        threads = getattr(self, "_separate_episode_audio_threads", {})
+        if threads.get(key) is thread:
+            threads.pop(key, None)
+        if getattr(self, "_separate_audio_sealed", False) and not any(t.isRunning() for t in threads.values()):
+            self._separate_audio_finished = True
+            self._try_finish_separated_full_package()
+
+    def _on_separate_episode_audio_done(self, source, ok, _outputs):
+        if ok:
+            key = self._live_key(source)
+            self._separate_audio_ready_sources.add(key)
+            self._try_cleanup_separate_source(key)
+
+    def _try_cleanup_separate_source(self, source_key):
+        """Xóa video nguồn của một tập chỉ sau khi render + hai audio đều xong."""
+        if not (getattr(self, "_separate_export_mode", False)
+                and hasattr(self, "chk_cleanup_each_episode")
+                and self.chk_cleanup_each_episode.isChecked()):
+            return
+        if source_key in getattr(self, "_separate_cleaned_sources", set()):
+            return
+        if source_key not in getattr(self, "_separate_audio_ready_sources", set()):
+            return
+        if source_key not in getattr(self, "_separate_render_ready_sources", set()):
+            return
+        source = getattr(self, "_separate_source_cards", {}).get(source_key, source_key + ".mp4")
+        stem = source_key
+        ext = os.path.splitext(source)[1] or ".mp4"
+        original = stem + ext
+        video_sub = stem + "_video_sub.mp4"
+        audio_dub = stem + "_audio_long_tieng.m4a"
+        audio_original = stem + "_audio_goc.m4a"
+        # Đổi card sang video giữ lại TRƯỚC khi xóa nguồn. Điều kiện đủ cả ba
+        # file bảo đảm card không bao giờ trỏ nhầm vào đầu ra còn dang dở.
+        if all(os.path.isfile(path) and os.path.getsize(path) > 1024
+               for path in (video_sub, audio_dub, audio_original)):
+            card = next((item for item in getattr(self, "cards", [])
+                         if self._live_key(getattr(item, "video_path", "")) == source_key), None)
+            if card is not None:
+                card.replace_video_source(video_sub)
+        candidates = {original, stem + "_dubbed" + ext}
+        removed = []
+        for path in candidates:
+            low = os.path.basename(path).lower()
+            # Tuyệt đối không đụng đầu ra render hay gói trọn bộ.
+            if any(token in low for token in ("_final", "_rendered", "_tronbo")):
+                continue
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+                    removed.append(os.path.basename(path))
+            except OSError as exc:
+                self._log(f"⚠️ Chưa dọn được {os.path.basename(path)}: {exc}")
+        self._separate_cleaned_sources.add(source_key)
+        if removed:
+            self._log("🧹 Đã đủ video + 2 audio, dọn tập nguồn: " + ", ".join(removed))
+
+    def _cleanup_separated_episode_outputs(self, final_outputs):
+        """Sau xác minh cuối, chỉ giữ 3 media trọn bộ và ảnh bìa.
+
+        Gói chỉ được dọn sau khi MergeSeparatedPackageThread đã kiểm tra đủ ba
+        file và độ lệch thời lượng đạt chuẩn. Khi đó SRT/TXT dịch, JSON quy ước,
+        video nguồn/dub/video_sub và audio từng tập đều không còn cần thiết.
+        """
+        if not (hasattr(self, "chk_cleanup_each_episode")
+                and self.chk_cleanup_each_episode.isChecked()):
+            return
+        keep = {os.path.normcase(os.path.abspath(p)) for p in (final_outputs or [])}
+        removed = 0
+        folders = {os.path.dirname(os.path.abspath(path)) for path in (final_outputs or []) if path}
+        image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+        for folder in folders:
+            try:
+                entries = list(os.scandir(folder))
+            except OSError as exc:
+                self._log(f"⚠️ Không quét được thư mục để dọn: {exc}")
+                continue
+            for entry in entries:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                path = entry.path
+                key = os.path.normcase(os.path.abspath(path))
+                ext = os.path.splitext(entry.name)[1].lower()
+                # Giữ đúng ba file media cuối và ảnh bìa phục vụ uploader/web.
+                if key in keep or ext in image_exts:
+                    continue
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError as exc:
+                    self._log(f"⚠️ Chưa dọn được {entry.name}: {exc}")
+        if removed:
+            self._log(f"🧹 Đã xác minh gói trọn bộ; dọn {removed} file tập lẻ/SRT/TXT/tạm. Chỉ giữ 3 media trọn bộ + ảnh bìa.")
+
+    def _on_separate_audio_done(self, ok, outputs):
+        if hasattr(self, "chk_export_separate"):
+            self.chk_export_separate.setEnabled(not self._render_running)
+        self._separate_audio_ok = ok
+        self._separate_audio_finished = True
+        self._separate_audio_outputs = list(outputs or [])
+        if outputs:
+            self._log(f"🎧 Đã xuất {len(outputs)} file audio rời.")
+        if not ok:
+            self._log("⚠️ Một số track audio rời xuất chưa thành công; xem log phía trên.")
+            if getattr(self, "_batch_managed", False):
+                self._batch_result = (False, "Xuất video xong nhưng có track lồng tiếng/tiếng gốc bị lỗi")
+        self._try_finish_separated_full_package()
+
+    def _try_finish_separated_full_package(self):
+        if not getattr(self, "_separate_export_mode", False):
+            return False
+        if self.cmb_merge_mode.currentText() != "Gộp trọn bộ":
+            return False
+        video_result = getattr(self, "_separate_video_merge_result", None)
+        if video_result is None or not getattr(self, "_separate_audio_finished", False):
+            return True
+        video_ok, final_path, warning = video_result
+        if not video_ok or warning or not getattr(self, "_separate_audio_ok", False):
+            detail = warning or "Video trọn bộ hoặc audio tập lẻ chưa hoàn tất"
+            self._batch_complete(False, detail)
+            self.step_render.set_status("error", 100)
+            QMessageBox.warning(self, "Gói trọn bộ chưa hoàn tất", detail)
+            return True
+        self.separated_merge_thread = MergeSeparatedPackageThread(
+            final_path, self._rendered_files, self._separate_audio_outputs)
+        self.separated_merge_thread.log.connect(self._log)
+        self._separated_package_result = (False, [], "Luồng đóng gói chưa trả kết quả")
+        self.separated_merge_thread.done.connect(self._remember_separated_package_result)
+        self.separated_merge_thread.finished.connect(
+            lambda: QTimer.singleShot(200, self._on_separated_package_thread_finished))
+        self._separate_video_merge_result = None
+        self.separated_merge_thread.start()
+        return True
+
+    def _remember_separated_package_result(self, ok, outputs, detail):
+        self._separated_package_result = (bool(ok), list(outputs or []), str(detail))
+
+    def _on_separated_package_thread_finished(self):
+        self._on_separated_package_done(*getattr(
+            self, "_separated_package_result",
+            (False, [], "Luồng đóng gói không trả kết quả")))
+
+    def _on_separated_package_done(self, ok, outputs, detail):
+        self.btn_run.setEnabled(True)
+        self.chk_export_separate.setEnabled(True)
+        self.cmb_merge_mode.setEnabled(True)
+        self.spn_merge_parts.setEnabled(True)
+        self._batch_complete(ok, detail)
+        self.step_render.set_status("success" if ok else "error", 100)
+        if ok:
+            self._cleanup_separated_episode_outputs(outputs)
+            self._log("✅ Gói trọn bộ 3 file đã đồng bộ:\n" + "\n".join(outputs))
+            QMessageBox.information(self, "Hoàn tất 3 file trọn bộ",
+                detail + "\n\n" + "\n".join(outputs))
+        else:
+            self._log("❌ Không tạo được gói 3 file trọn bộ: " + detail)
+            QMessageBox.warning(self, "Lỗi đồng bộ trọn bộ", detail)
 
     def _start_render_all(self, streaming=False):
         if self._render_running:
@@ -5756,7 +6558,15 @@ class SingleSeriesRenderWidget(QWidget):
         for card in selected_cards:
             vp = card.video_path
             stem, _ext = os.path.splitext(vp)
-            if stem.lower().endswith("_final"):
+            if getattr(self, "_separate_export_mode", False):
+                if stem.lower().endswith("_dubbed"):
+                    stem = stem[:-len("_dubbed")]
+                elif stem.lower().endswith("_final"):
+                    stem = stem[:-len("_final")]
+                elif stem.lower().endswith("_video_sub"):
+                    stem = stem[:-len("_video_sub")]
+                final_path = stem + "_video_sub.mp4"
+            elif stem.lower().endswith("_final"):
                 final_path = vp
             else:
                 if stem.lower().endswith("_dubbed"):
@@ -5787,6 +6597,48 @@ class SingleSeriesRenderWidget(QWidget):
         self._render_done_count = 0
         self._rendered_files = list(completed_outputs) # gồm cả file resume để gộp đủ tập
         self._render_failed_files = []  # không tự gộp thiếu tập nếu có render lỗi
+        # Bình thường tôn trọng mức song song người dùng chọn (ví dụ 4). Nếu
+        # một tập lỗi, tự hạ còn 2 và thử lại tập đó đúng một lần.
+        self._render_safe_parallel = None
+        self._render_retry_counts = {}
+        self._render_retry_waiting = {}
+        self._render_expected_outputs = list(expected_outputs)
+        self._render_finish_pending = False
+        self._render_finish_started = False
+        if streaming and getattr(self, "_separate_export_mode", False):
+            self._separate_audio_outputs = []
+            self._separate_audio_ok = True
+            self._separate_audio_finished = False
+            self._separate_audio_sealed = False
+            self._separate_episode_audio_started = set()
+            self._separate_episode_audio_threads = {}
+            self._separate_audio_ready_sources = set()
+            self._separate_render_ready_sources = set()
+            self._separate_source_cards = {
+                self._live_key(c.video_path): c.video_path
+                for c in selected_cards
+            }
+            self._separate_cleaned_sources = set()
+            completed_keys = {os.path.normcase(os.path.abspath(p)) for p in completed_outputs}
+            for card, expected in zip(selected_cards, expected_outputs):
+                if os.path.normcase(os.path.abspath(expected)) not in completed_keys:
+                    continue
+                source_key = self._live_key(card.video_path)
+                stem = source_key
+                ext = os.path.splitext(card.video_path)[1] or ".mp4"
+                original = stem + ext
+                dubbed = stem + "_dubbed" + ext
+                self._separate_render_ready_sources.add(source_key)
+                existing_audio = [stem + "_audio_long_tieng.m4a", stem + "_audio_goc.m4a"]
+                if all(os.path.isfile(path) and os.path.getsize(path) > 1024
+                       for path in existing_audio):
+                    self._separate_audio_ready_sources.add(source_key)
+                    for path in existing_audio:
+                        if path not in self._separate_audio_outputs:
+                            self._separate_audio_outputs.append(path)
+                else:
+                    render_input = dubbed if _valid_finished_video(dubbed) else card.video_path
+                    self._launch_live_episode_audio(render_input)
         self._incremental_parts = (self.cmb_merge_mode.currentText() == "Theo phần")
         if self._incremental_parts:
             self._setup_incremental_parts(expected_outputs)
@@ -5926,19 +6778,66 @@ class SingleSeriesRenderWidget(QWidget):
         if reply == QMessageBox.StandardButton.Yes:
             self._start_merge(files_to_merge)
 
+    def _start_export_original_audio(self):
+        """Khởi chạy nhánh audio độc lập; có thể chạy cùng lúc với render/amix."""
+        thread = getattr(self, "audio_export_thread", None)
+        if thread is not None and thread.isRunning():
+            QMessageBox.information(self, "Đang xuất audio", "Nhánh xuất audio gốc đang chạy, vui lòng đợi xong.")
+            return
+        separate_thread = getattr(self, "separate_audio_thread", None)
+        if separate_thread is not None and separate_thread.isRunning():
+            QMessageBox.information(self, "Đang xuất audio", "Nhánh xuất hai audio rời đang chạy, vui lòng đợi xong.")
+            return
+
+        selected_cards = self._selected_cards()
+        video_paths = []
+        for card in selected_cards:
+            path = getattr(card, "video_path", None)
+            if path and os.path.isfile(path) and path not in video_paths:
+                video_paths.append(path)
+        if not video_paths:
+            QMessageBox.information(self, "Chưa chọn video", "Hãy tick ít nhất 1 video để xuất audio gốc.")
+            return
+
+        video_paths.sort(key=lambda path: _natural_key(os.path.basename(path)))
+        workers = min(int(self.spn_render_parallel.value()), len(video_paths))
+        self.btn_export_original_audio.setEnabled(False)
+        self.btn_export_original_audio.setText(f"⏳  Đang xuất audio ({workers} luồng)...")
+        self.audio_export_thread = ExportOriginalAudioThread(video_paths, workers)
+        self.audio_export_thread.log.connect(self._log)
+        self.audio_export_thread.progress.connect(self._on_audio_export_progress)
+        self.audio_export_thread.done.connect(self._on_audio_export_done)
+        self.audio_export_thread.start()
+
+    def _on_audio_export_progress(self, done, total):
+        self.btn_export_original_audio.setText(f"🎧  Đang xuất audio {done}/{total}")
+
+    def _on_audio_export_done(self, ok, outputs):
+        self.btn_export_original_audio.setEnabled(True)
+        self._update_run_label()
+        if outputs:
+            folder = os.path.dirname(outputs[0])
+            status = "hoàn tất" if ok else "xong một phần"
+            QMessageBox.information(
+                self, "Xuất audio gốc",
+                f"Đã {status}: {len(outputs)} file audio gốc.\nLưu tại:\n{folder}"
+            )
+        else:
+            QMessageBox.warning(self, "Xuất audio lỗi", "Không xuất được audio gốc. Hãy kiểm tra log.")
+
     def _stop_render(self):
-        if not self._render_running:
+        pipeline = getattr(self, "dub_feature_tab", None)
+        pipeline_busy = bool(
+            pipeline is not None and hasattr(pipeline, "is_busy") and pipeline.is_busy())
+        if not self._render_running and not pipeline_busy:
             return
         self._stopping = True
         self._live_accepting = False
-        pipeline = getattr(self, "dub_feature_tab", None)
-        if pipeline is not None and getattr(pipeline, "_live_pipeline", False):
-            pipeline._live_pipeline = False
-            pipeline._live_finished = True
-            pipeline._render_after_dub = False
+        if pipeline is not None and hasattr(pipeline, "stop_all"):
+            pipeline.stop_all()
         self._render_queue = []          # xóa các tập chưa render
         self.btn_stop.setEnabled(False)
-        self._log("⛔ Đang dừng render... (đợi các tập đang chạy thoát)")
+        self._log("⛔ Đang dừng TOÀN BỘ quy trình... (đợi các tác vụ đang chạy thoát an toàn)")
         for th in list(getattr(self, "_render_threads", {}).values()):
             try:
                 if th and th.isRunning():
@@ -5946,13 +6845,21 @@ class SingleSeriesRenderWidget(QWidget):
             except Exception:
                 pass
 
-        if not self._render_threads:
+        if self._render_running and not self._render_threads:
             self._finish_render_all()
+        elif not self._render_running:
+            self._stopping = False
+            self._batch_complete(False, "Đã dừng toàn bộ quy trình")
+            self.total_progress_end()
 
     @staticmethod
     def _live_key(path):
         stem = os.path.splitext(os.path.abspath(path))[0]
-        if stem.endswith("_dubbed"): stem = stem[:-7]
+        low = stem.lower()
+        for suffix in ("_dubbed", "_final", "_video_sub"):
+            if low.endswith(suffix):
+                stem = stem[:-len(suffix)]
+                break
         return os.path.normcase(stem)
 
     def _accept_live_render(self, source, render_input, subtitle):
@@ -5970,6 +6877,8 @@ class SingleSeriesRenderWidget(QWidget):
         self._live_admitted.add(id(card))
         self._live_inputs[id(card)] = (render_input, subtitle)
         self._render_queue.append(card)
+        if getattr(self, "_separate_export_mode", False):
+            self._launch_live_episode_audio(render_input)
         stage = "Lồng xong" if os.path.abspath(render_input) != os.path.abspath(source) else "Dịch xong"
         self._log(f"⚡ {stage} → xếp render: {os.path.basename(source)}")
         self._pump_render_queue()
@@ -5981,8 +6890,19 @@ class SingleSeriesRenderWidget(QWidget):
         for c in self._live_cards:
             if id(c) not in self._live_admitted:
                 self._render_failed_files.append(c.video_path)
-        if failed and not self._render_failed_files:
-            self._render_failed_files.append("Dịch/lồng chưa đạt")
+        # Không biến cờ lỗi cũ của bước dịch/lồng thành một "tập lỗi" giả.
+        # Các card chưa được nhận đã được ghi rõ phía trên; các đầu ra render
+        # còn thiếu/hỏng sẽ được _finish_render_all kiểm tra trực tiếp trên đĩa.
+        # Vì vậy nếu mọi card đã được nhận thì cứ chờ render thực tế hoàn tất.
+        if getattr(self, "_separate_export_mode", False):
+            # Mỗi tập đã tự tách audio lúc được nhận. Từ đây chỉ niêm phong danh
+            # sách và chờ các worker audio cuối cùng đóng file.
+            ready_inputs = [pair[0] for pair in getattr(self, "_live_inputs", {}).values()]
+            for render_input in ready_inputs:
+                self._launch_live_episode_audio(render_input)
+            self._separate_audio_sealed = True
+            if not any(t.isRunning() for t in getattr(self, "_separate_episode_audio_threads", {}).values()):
+                self._separate_audio_finished = True
         self._log("📥 Đã nhận hết video sẵn sàng; chờ render xong để kiểm tra và ghép.")
         self._pump_render_queue()
 
@@ -5992,25 +6912,54 @@ class SingleSeriesRenderWidget(QWidget):
             if not self._render_threads:
                 self._finish_render_all()
             return
-        par = self.spn_render_parallel.value() if hasattr(self, "spn_render_parallel") else 1
+        configured = self.spn_render_parallel.value() if hasattr(self, "spn_render_parallel") else 1
+        par = int(getattr(self, "_render_safe_parallel", None) or configured)
         while self._render_queue and len(self._render_threads) < par:
             card = self._render_queue.pop(0)
             self._start_one_render(card)
         # Hết hàng đợi và không còn thread nào chạy -> xong
-        if not self._render_queue and not self._render_threads and not getattr(self, "_live_accepting", False):
-            self._finish_render_all()
+        if (not self._render_queue and not self._render_threads
+                and not getattr(self, "_render_retry_waiting", {})
+                and not getattr(self, "_live_accepting", False)):
+            self._request_finish_render_all()
+
+    def _request_finish_render_all(self):
+        """Chỉ chốt render sau khi mọi QThread đã thoát thật sự.
+
+        Signal ``done`` của SingleRenderThread được phát trước khi ``run()``
+        trả về. Nếu gộp ngay tại thời điểm đó, Windows vẫn có thể đang giữ
+        handle của file MP4 và FFmpeg gộp sẽ lỗi ngẫu nhiên.
+        """
+        if getattr(self, "_render_finish_started", False):
+            return
+        alive = [t for t in getattr(self, "_render_threads_alive", []) if t.isRunning()]
+        if alive:
+            if not getattr(self, "_render_finish_pending", False):
+                self._log(f"⏳ Render đã đủ; chờ {len(alive)} luồng đóng file an toàn trước khi gộp...")
+            self._render_finish_pending = True
+            return
+        self._render_finish_pending = False
+        self._render_finish_started = True
+        self._finish_render_all()
 
     def _start_one_render(self, card):
         card.set_status("đang render")
         vp, sp = getattr(self, "_live_inputs", {}).get(id(card), (card.video_path, card.srt_path))
         out_dir = os.path.dirname(vp)
         self._last_render_dir = out_dir
+        separate_mode = bool(getattr(self, "_separate_export_mode", False))
         stem = os.path.splitext(os.path.basename(vp))[0]
-        if stem.endswith("_dubbed"):
+        if stem.lower().endswith("_dubbed"):
             stem = stem[:-len("_dubbed")]
-        out_path = os.path.join(out_dir, f"{stem}_final.mp4")
+        elif separate_mode and stem.lower().endswith("_final"):
+            stem = stem[:-len("_final")]
+        elif separate_mode and stem.lower().endswith("_video_sub"):
+            stem = stem[:-len("_video_sub")]
+        suffix = "_video_sub.mp4" if separate_mode else "_final.mp4"
+        out_path = os.path.join(out_dir, f"{stem}{suffix}")
         design = copy.deepcopy(getattr(self, "_live_designs", {}).get(id(card)) or getattr(card, "design_config", None) or self._default_design())
         cfg = self._build_cfg(vp, design)
+        cfg["video_only"] = separate_mode
 
         done_so_far = getattr(self, "_render_done_count", 0)
         total = getattr(self, "_render_total", 0)
@@ -6039,19 +6988,39 @@ class SingleSeriesRenderWidget(QWidget):
             self._render_threads_alive = []
         self._render_threads_alive.append(th)
 
-        def _release_render_thread(t=th):
-            try:
-                if t in self._render_threads_alive:
-                    self._render_threads_alive.remove(t)
-            except Exception:
-                pass
-            # Chỉ ghép sau khi QThread đã thoát hẳn, bảo đảm ffmpeg
-            # render đã đóng file đầu ra trước khi worker ghép đọc nó.
-            if getattr(self, "_incremental_parts", False):
-                QTimer.singleShot(0, self._queue_ready_render_parts)
+        def _release_render_thread_later(t=th):
+            # Không bỏ reference ngay trong lúc Qt đang phát finished; Python
+            # 3.14 + PyQt6 có thể hủy wrapper tại đây và abort Qt6Core.dll.
+            QTimer.singleShot(1000, lambda thread=t: self._release_render_thread_safe(thread))
 
-        th.finished.connect(_release_render_thread)
+        th.finished.connect(_release_render_thread_later)
         th.start()
+
+    def _release_render_thread_safe(self, t):
+        """Nhả render QThread sau khi toàn bộ queued signal đã hoàn tất."""
+        try:
+            if t in getattr(self, "_render_threads_alive", []):
+                self._render_threads_alive.remove(t)
+        except Exception:
+            pass
+        retry = getattr(self, "_render_retry_waiting", {}).pop(t, None)
+        if retry is not None and not self._stopping:
+            card, out_path = retry
+            try:
+                if os.path.isfile(out_path):
+                    os.remove(out_path)
+            except OSError:
+                pass
+            card.set_status("thử lại")
+            self._render_queue.insert(0, card)
+            self._log(f"🔁 Tự thử lại với tối đa 2 luồng: {os.path.basename(card.video_path)}")
+            QTimer.singleShot(0, self._pump_render_queue)
+        # Chỉ ghép sau khi QThread đã thoát hẳn, bảo đảm ffmpeg
+        # render đã đóng file đầu ra trước khi worker ghép đọc nó.
+        if getattr(self, "_incremental_parts", False):
+            QTimer.singleShot(0, self._queue_ready_render_parts)
+        if getattr(self, "_render_finish_pending", False):
+            QTimer.singleShot(0, self._request_finish_render_all)
 
     def _on_render_percent_multi(self, out_path, pct):
         """% của 1 tập trong nhóm song song. Thanh hiển thị = trung bình các tập
@@ -6084,6 +7053,10 @@ class SingleSeriesRenderWidget(QWidget):
 
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        if hasattr(self, "chk_export_separate"):
+            audio_busy = (hasattr(self, "separate_audio_thread")
+                          and self.separate_audio_thread.isRunning())
+            self.chk_export_separate.setEnabled(not audio_busy)
         if hasattr(self, 'btn_merge_now'):
             self.btn_merge_now.setEnabled(True)
         self.cmb_merge_mode.setEnabled(True)
@@ -6098,6 +7071,30 @@ class SingleSeriesRenderWidget(QWidget):
             QMessageBox.information(self, "Đã dừng", "Đã dừng render theo yêu cầu.")
         else:
             failed = list(getattr(self, "_render_failed_files", []) or [])
+            # Kiểm tra lại từ đĩa sau khi tất cả worker đã thoát. Không bao giờ
+            # gộp một bộ thiếu/tệp dở dù signal tiến độ trước đó đã báo đủ.
+            expected = list(getattr(self, "_render_expected_outputs", []) or [])
+            invalid = [p for p in expected if not _valid_finished_video(p)]
+            known = {os.path.normcase(os.path.abspath(p)) for p in failed if p}
+            for path in invalid:
+                key = os.path.normcase(os.path.abspath(path))
+                if key not in known:
+                    failed.append(path)
+                    known.add(key)
+            # Một lần render lỗi trước đây được ghi bằng đường dẫn đầu vào
+            # (_dubbed.mp4), rồi bước kiểm tra ổ đĩa thêm đầu ra
+            # (_video_sub.mp4), khiến 4 tập bị báo thành 8. Gom theo stem tập
+            # và ưu tiên hiển thị đầu ra cần tạo.
+            if failed:
+                invalid_by_episode = {self._live_key(p): p for p in invalid}
+                unique_failed = {}
+                for path in failed:
+                    if not path or path == "Dịch/lồng chưa đạt":
+                        unique_failed.setdefault(str(path), path)
+                        continue
+                    episode_key = self._live_key(path)
+                    unique_failed[episode_key] = invalid_by_episode.get(episode_key, path)
+                failed = list(unique_failed.values())
             if failed:
                 self._batch_complete(False, f"{len(failed)} tập render lỗi; không gộp")
                 self.step_render.set_status("error", 100)
@@ -6137,7 +7134,7 @@ class SingleSeriesRenderWidget(QWidget):
 
     def _on_one_done(self, ok, card, out_path):
         # Gỡ thread vừa xong khỏi nhóm đang chạy
-        self._render_threads.pop(out_path, None)
+        finished_thread = self._render_threads.pop(out_path, None)
         self._render_pct.pop(out_path, None)
         if self._stopping and not ok:
             card.set_status("đã dừng")
@@ -6145,7 +7142,25 @@ class SingleSeriesRenderWidget(QWidget):
             card.set_status("xong" if ok else "lỗi")
             if ok:
                 self._rendered_files.append(out_path)
+                if getattr(self, "_separate_export_mode", False):
+                    source = getattr(card, "video_path", out_path)
+                    source_key = self._live_key(source)
+                    self._separate_render_ready_sources.add(source_key)
+                    self._try_cleanup_separate_source(source_key)
             else:
+                retry_key = self._live_key(getattr(card, "video_path", out_path))
+                retry_count = getattr(self, "_render_retry_counts", {}).get(retry_key, 0)
+                if retry_count < 1 and finished_thread is not None:
+                    self._render_retry_counts[retry_key] = retry_count + 1
+                    self._render_safe_parallel = min(2, self.spn_render_parallel.value())
+                    self._render_retry_waiting[finished_thread] = (card, out_path)
+                    card.set_status("chờ thử lại")
+                    self._log(
+                        f"⚠️ Render lỗi lần đầu: {os.path.basename(card.video_path)} → "
+                        "tự hạ song song còn 2 và thử lại; chưa tính là lỗi bộ."
+                    )
+                    self._pump_render_queue()
+                    return
                 if not hasattr(self, "_render_failed_files"):
                     self._render_failed_files = []
                 self._render_failed_files.append(getattr(card, "video_path", out_path))
@@ -6290,7 +7305,8 @@ class SingleSeriesRenderWidget(QWidget):
         self.merge_thread.log.connect(self._log)
         self.merge_thread.done.connect(self._remember_merge_part_result)
         # Chỉ thay reference và chạy phần sau khi worker cũ thực sự thoát.
-        self.merge_thread.finished.connect(self._on_merge_part_finished)
+        self.merge_thread.finished.connect(
+            lambda: QTimer.singleShot(0, self._on_merge_part_finished))
         self.merge_thread.start()
 
     def _remember_merge_part_result(self, ok, path):
@@ -6343,6 +7359,33 @@ class SingleSeriesRenderWidget(QWidget):
 
     def _start_merge(self, file_list):
         file_list = [p for p in (file_list or []) if p and os.path.exists(p)]
+        # Gộp trọn bộ 3 file phải lấy trạng thái thật trên ổ đĩa, không chỉ
+        # dùng _rendered_files của phiên hiện tại (phiên mở lại sẽ thiếu các
+        # tập đã render từ trước). Quét lại toàn bộ *_video_sub.mp4 cạnh các
+        # tập, loại file trọn bộ/tạm rồi mới sắp xếp và gộp.
+        if (getattr(self, "_separate_export_mode", False)
+                and self.cmb_merge_mode.currentText() == "Gộp trọn bộ"
+                and file_list):
+            scan_dir = os.path.dirname(file_list[0])
+            disk_videos = []
+            try:
+                for name in os.listdir(scan_dir):
+                    low = name.lower()
+                    if (low.endswith("_video_sub.mp4")
+                            and "_tronbo_" not in low
+                            and "_tmp" not in low):
+                        path = os.path.join(scan_dir, name)
+                        if _valid_finished_video(path):
+                            disk_videos.append(path)
+            except OSError as exc:
+                self._log(f"⚠️ Không quét lại được thư mục trước khi gộp: {exc}")
+            if disk_videos:
+                if len(disk_videos) != len(file_list):
+                    self._log(
+                        f"🔎 Quét lại thư mục: danh sách phiên có {len(file_list)} tập, "
+                        f"ổ đĩa có {len(disk_videos)} tập → dùng đủ file trên ổ đĩa."
+                    )
+                file_list = disk_videos
         if len(file_list) < 2:
             self._log("⚠️ Không đủ ít nhất 2 file hợp lệ để gộp.")
             QMessageBox.warning(self, "Không đủ file", "Cần ít nhất 2 file video hợp lệ để gộp.")
@@ -6360,8 +7403,50 @@ class SingleSeriesRenderWidget(QWidget):
         out_dir = os.path.dirname(first_file)
         dir_name = os.path.basename(out_dir)
         if not dir_name: dir_name = "TronBo"
-        out_path = os.path.join(out_dir, f"{dir_name}_TronBo_Rendered.mp4")
-        
+        out_name = (f"{dir_name}_TronBo_video_sub.mp4"
+                    if getattr(self, "_separate_export_mode", False)
+                    else f"{dir_name}_TronBo_Rendered.mp4")
+        out_path = os.path.join(out_dir, out_name)
+
+        # Dọn bản sao tạm còn lại nếu lần trước hết dung lượng giữa bước bỏ
+        # audio. Đây chỉ là file trung gian, không phải kết quả trọn bộ.
+        silent_tmp = os.path.splitext(out_path)[0] + "_silent_tmp.mp4"
+        try:
+            if os.path.isfile(silent_tmp):
+                os.remove(silent_tmp)
+                self._log(f"🧹 Đã dọn file gộp tạm dở: {os.path.basename(silent_tmp)}")
+        except OSError as exc:
+            self._log(f"⚠️ Chưa dọn được file gộp tạm: {exc}")
+
+        # Nếu lần trước đã gộp xong video_sub nhưng chỉ lỗi ở bước sao chép
+        # bỏ audio, tái sử dụng file 8GB đã hợp lệ. Không xóa rồi gộp lại,
+        # vừa mất thời gian vừa cần thêm dung lượng ổ đĩa.
+        reuse_video = False
+        if (getattr(self, "_separate_export_mode", False)
+                and _valid_finished_video(out_path)):
+            try:
+                newest_input = max(os.path.getmtime(path) for path in file_list)
+                probe = MergeRenderedThread(file_list, out_path, video_only=True)
+                expected_duration = sum(_probe_duration_sec(path) for path in file_list)
+                actual_duration = _probe_duration_sec(out_path)
+                reuse_video = (os.path.getmtime(out_path) >= newest_input
+                               and expected_duration > 0
+                               and abs(actual_duration - expected_duration) <= 0.12)
+                if os.path.getmtime(out_path) >= newest_input and not reuse_video:
+                    self._log(
+                        f"⚠️ Video trọn bộ cũ thiếu/sai thời lượng "
+                        f"({actual_duration:.3f}/{expected_duration:.3f}s) → gộp lại đủ tập."
+                    )
+            except Exception:
+                reuse_video = False
+        if reuse_video:
+            self._log("♻️ Video trọn bộ đã hợp lệ → dùng lại; bước đóng gói sẽ chuẩn hóa 2 audio nhúng.")
+            from types import SimpleNamespace
+            self.merge_thread = SimpleNamespace(thumbnail_error="")
+            self._full_merge_result = (True, out_path)
+            QTimer.singleShot(0, self._on_full_merge_thread_finished)
+            return
+
         if os.path.exists(out_path):
             try: os.remove(out_path)
             except: pass
@@ -6373,13 +7458,34 @@ class SingleSeriesRenderWidget(QWidget):
             else:
                 self._log("⚠️ Không tìm thấy ảnh bìa, bỏ qua nhúng.\n")
                 
-        self.merge_thread = MergeRenderedThread(file_list, out_path, intro_img)
+        self.merge_thread = MergeRenderedThread(
+            file_list, out_path, intro_img,
+            video_only=bool(getattr(self, "_separate_export_mode", False)))
         self.merge_thread.log.connect(self._log)
-        self.merge_thread.done.connect(self._on_merge_done)
+        self._full_merge_result = (False, out_path)
+        self.merge_thread.done.connect(self._remember_full_merge_result)
+        # MergeRenderedThread cũng phát done trước khi QThread thoát. Chỉ nối
+        # tiếp hai audio / chốt hàng đợi sau signal finished.
+        self.merge_thread.finished.connect(
+            lambda: QTimer.singleShot(200, self._on_full_merge_thread_finished))
         self.merge_thread.start()
+
+    def _remember_full_merge_result(self, ok, final_path):
+        self._full_merge_result = (bool(ok), final_path)
+
+    def _on_full_merge_thread_finished(self):
+        ok, final_path = getattr(self, "_full_merge_result", (False, ""))
+        self._on_merge_done(ok, final_path)
 
     def _on_merge_done(self, ok, final_path):
         warning = getattr(self.merge_thread, 'thumbnail_error', '')
+        if (getattr(self, "_separate_export_mode", False)
+                and self.cmb_merge_mode.currentText() == "Gộp trọn bộ"):
+            self._separate_video_merge_result = (ok, final_path, warning)
+            self._log("✅ Video sub trọn bộ đã xong; chờ/căn hai dải audio..." if ok
+                      else "❌ Video sub trọn bộ gộp lỗi.")
+            self._try_finish_separated_full_package()
+            return
         self._batch_complete(ok and not warning, warning or ("Ghép trọn bộ hoàn tất" if ok else "Ghép trọn bộ lỗi"))
         if warning: QMessageBox.warning(self, "Video đã ghép, thumbnail cần xử lý", warning)
         self.btn_run.setEnabled(True)

@@ -76,8 +76,20 @@ def preflight(page):
     cards = page._selected_cards()
     if not cards:
         return 'Chưa tick chọn tập nào.'
-    if any(not os.path.isfile(c.video_path) for c in cards):
-        return 'Có video nguồn đã mất hoặc bị di chuyển.'
+    missing_incomplete = []
+    for card in cards:
+        if os.path.isfile(card.video_path):
+            continue
+        try:
+            completed = bool(page._card_state(card).get('done'))
+        except Exception:
+            completed = False
+        if not completed:
+            missing_incomplete.append(os.path.basename(card.video_path))
+    if missing_incomplete:
+        sample = ', '.join(missing_incomplete[:3])
+        more = f' và {len(missing_incomplete)-3} tập khác' if len(missing_incomplete) > 3 else ''
+        return f'Tập chưa hoàn tất bị thiếu video nguồn: {sample}{more}.'
     # One output folder per series prevents misleading grouped names/output collisions.
     directories = {os.path.normcase(os.path.abspath(os.path.dirname(c.video_path))) for c in cards}
     if len(directories) != 1:
@@ -371,13 +383,52 @@ def make_multi_series_widget(series_class):
             page._batch_last_warning = ''
             page._batch_idle_retries = 0
             page._batch_managed = True
+            # Mỗi bộ giữ lựa chọn riêng: chỉ bộ được tick mới đi luồng 3 file.
+            page._separate_export_mode = bool(
+                hasattr(page, 'chk_export_separate') and page.chk_export_separate.isChecked())
+            page._separate_audio_started = False
+            page._separate_audio_finished = False
+            page._separate_audio_ok = False
+            page._separate_audio_outputs = []
+            page._separate_video_merge_result = None
             page._queue_state = "running"
             self._autosave_session()
             self.series_tabs.setCurrentWidget(page)
             self.series_tabs.setTabText(self.series_tabs.indexOf(page), page._series_name + ' · Đang chạy')
-            self.queue_status.setText(f'Đang chạy {page._series_name}; còn {len(self._pending)} bộ chờ. Bộ lỗi sẽ ghi lý do và chuyển tiếp.')
+            self.queue_status.setText(f'Đang chạy {page._series_name}; còn {len(self._pending)} bộ chờ. Nếu lỗi, hàng đợi sẽ dừng tại đúng bộ này.')
             try:
-                page.dub_feature_tab._run_full_pipeline()
+                # Nếu từng tập đã đủ bộ 3 file nhưng chưa có file trọn bộ (ví
+                # dụ app bị đóng ngay trước bước gộp), video nguồn có thể đã
+                # được dọn. Không quay lại pipeline dịch/lồng; gộp trực tiếp từ
+                # các đầu ra tập lẻ đang còn trên đĩa.
+                states = [page._card_state(card) for card in page._selected_cards()]
+                ready_to_merge = bool(
+                    page._separate_export_mode
+                    and states
+                    and all(state.get('done') for state in states)
+                    and page.cmb_merge_mode.currentText() == 'Gộp trọn bộ')
+                if ready_to_merge:
+                    audio_outputs = []
+                    for card in page._selected_cards():
+                        stem, _ext = os.path.splitext(card.video_path)
+                        low = stem.lower()
+                        for suffix in ('_dubbed', '_final', '_video_sub'):
+                            if low.endswith(suffix):
+                                stem = stem[:-len(suffix)]
+                                break
+                        audio_outputs.extend([
+                            stem + '_audio_long_tieng.m4a',
+                            stem + '_audio_goc.m4a'])
+                    page._separate_audio_outputs = audio_outputs
+                    page._separate_audio_ok = all(
+                        os.path.isfile(path) and os.path.getsize(path) > 1024
+                        for path in audio_outputs)
+                    page._separate_audio_finished = page._separate_audio_ok
+                    page._separate_audio_sealed = True
+                    page._log('↻ Các tập đã đủ 3 file → bỏ qua dịch/lồng và gộp trọn bộ trực tiếp.')
+                    page._start_render_all(streaming=False)
+                else:
+                    page.dub_feature_tab._run_full_pipeline()
             except Exception as exc:
                 page._batch_complete(False, f'Không khởi động được: {exc}')
 
@@ -445,6 +496,26 @@ def make_multi_series_widget(series_class):
             page._batch_cards = None
             self._record(page, *result)
             self._active_series = None
+            if not result[0]:
+                # Chế độ hàng đợi nghiêm ngặt: một bộ chưa hoàn tất gói đầu ra
+                # thì tuyệt đối không được nhảy sang bộ kế tiếp. Giữ nguyên
+                # _pending để nút Tiếp tục sẽ quay lại bộ lỗi trước, sau đó mới
+                # lần lượt chạy các bộ còn chờ.
+                self._queue_timer.stop()
+                self._queue_running = False
+                self.btn_add_series.setEnabled(True)
+                self.btn_add_folders.setEnabled(True)
+                self.btn_open_session.setEnabled(True)
+                self.btn_resume_series.setEnabled(True)
+                self.btn_run_series.setEnabled(True)
+                self.btn_pause_series.setEnabled(False)
+                for queued_page in self._pages:
+                    queued_page.setEnabled(True)
+                self.queue_status.setText(
+                    f'ĐÃ DỪNG tại {page._series_name}: {result[1]} · '
+                    'Sửa nguyên nhân rồi bấm Tiếp tục bộ chờ / thử lại bộ lỗi. '
+                    'Chưa chạy sang bộ kế tiếp.')
+                return
             self._dispatch_next()
 
         def _record(self, page, ok, detail):
@@ -548,6 +619,11 @@ def make_multi_series_widget(series_class):
                 if c:
                     c.design_config = entry.get('design') or page._default_design()
                     c.chk_select.setChecked(bool(entry.get('selected',True)))
+                    # Phiên cũ lưu đường dẫn video nguồn. Nếu tập đã xuất đủ bộ
+                    # 3 file, đổi card sang *_video_sub.mp4 ngay khi khôi phục.
+                    # Thumbnail vẫn được cơ chế lazy-load nạp khi card hiện ra,
+                    # tránh khởi chạy hàng trăm ffmpeg cùng lúc.
+                    c.refresh_srt_from_disk(load_thumbnail=False)
             if not cards:
                 page._bulk_loading = False
                 page._relayout_grid()

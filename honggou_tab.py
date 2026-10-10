@@ -26,6 +26,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, pyqtSlot, QSize, QSettings, QTimer, QMetaObject
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QFont, QColor, QPainter, QPainterPath, QBrush, QPen
 
+# Giới hạn dùng chung cho pipeline nhận dạng/tách phụ đề trong tab Hongguo.
+MAX_PARALLEL_STT = 10
+
 # Tab Render (chỉnh sửa & khắc sub/hiệu ứng lên video). Import an toàn: nếu
 # thiếu file render_tab.py hoặc lỗi import thì app VẪN chạy bình thường, chỉ
 # không hiện tab Render (RenderWidget = None).
@@ -303,7 +306,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.81"
+APP_VERSION = "1.0.97"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -3810,7 +3813,19 @@ class HonggouWidget(QWidget):
 
     def _keep_thread_alive(self, thread):
         self._active_threads.append(thread)
-        thread.finished.connect(lambda: self._active_threads.remove(thread) if thread in self._active_threads else None)
+        # Python 3.14/PyQt6 có thể hủy wrapper QThread ngay giữa lúc Qt đang
+        # dispatch finished, gây crash Qt6Core.dll (0xc0000409). Giữ worker
+        # thêm một nhịp an toàn rồi mới bỏ reference.
+        def _release_later(t=thread):
+            QTimer.singleShot(1000, lambda worker=t: self._release_active_thread(worker))
+        thread.finished.connect(_release_later)
+
+    def _release_active_thread(self, thread):
+        try:
+            if thread in self._active_threads:
+                self._active_threads.remove(thread)
+        except Exception:
+            pass
 
     def _is_vip(self):
         return bool(getattr(self, 'vip_unlocked', False))
@@ -4677,7 +4692,7 @@ class HonggouWidget(QWidget):
         self.chk_auto_stt = QCheckBox("🔤 Tải xong từng tập → tách sub ngay")
         self.chk_auto_stt.setToolTip(
             "Mỗi tập tải hoàn chỉnh sẽ được tách sub ngay trong lúc video còn tải.\n"
-            "Chạy tối đa 3 tác vụ tách sub song song.")
+            f"Chạy tối đa {MAX_PARALLEL_STT} tác vụ tách sub song song.")
         self.chk_auto_stt.setStyleSheet("""
             QCheckBox { color: #f1f5f9; font-size: 12px; padding: 4px; font-weight: bold; }
             QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #7c3aed;
@@ -5973,9 +5988,9 @@ class HonggouWidget(QWidget):
                     or getattr(self, '_bg_stt_series_active', [])):
                 self._batch_waiting_bg_stt = True
                 self.btn_batch_dl.setText(
-                    f"🔤 Chờ tách sub ({len(self._bg_stt_series_active)}/3 bộ)")
+                    f"🔤 Chờ tách sub ({len(self._bg_stt_series_active)}/{MAX_PARALLEL_STT} bộ)")
                 self.lbl_status.setText(
-                    "✅ Đã tải xong các bộ · đang chờ tối đa 3 bộ tách sub song song...")
+                    f"✅ Đã tải xong các bộ · đang chờ tối đa {MAX_PARALLEL_STT} bộ tách sub song song...")
                 return
             self._batch_waiting_bg_stt = False
             self._batch_running = False
@@ -7223,7 +7238,7 @@ class HonggouWidget(QWidget):
                     list(files_to_merge), self._active_dl_title,
                     self.cmb_stt_src.currentText(), self.cmb_stt_out.currentText())
                 self.lbl_status.setText(
-                    f"✅ Đã tải {total_downloaded} tập · đã đưa bộ vào hàng tách sub nền (tối đa 3 bộ).")
+                    f"✅ Đã tải {total_downloaded} tập · đã đưa bộ vào hàng tách sub nền (tối đa {MAX_PARALLEL_STT} bộ).")
                 self._batch_tab_finished()
                 return
             self.lbl_status.setText(
@@ -7618,7 +7633,7 @@ class HonggouWidget(QWidget):
     #  STT / TÁCH SUB
     # ─────────────────────────────────────────────────────────────────
     def _is_background_series_stt_mode(self):
-        """Cho phép 3 bộ chạy nền khi chuỗi chỉ cần tách sub, không có bước
+        """Cho phép nhiều bộ chạy nền khi chuỗi chỉ cần tách sub, không có bước
         dịch/lồng/gộp phụ thuộc kết quả của bộ hiện tại."""
         return bool(
             getattr(self, '_batch_running', False)
@@ -7645,10 +7660,9 @@ class HonggouWidget(QWidget):
     def _pump_background_series_stt(self):
         active = self._bg_stt_series_active
         queue = self._bg_stt_series_queue
-        while len(active) < 3 and queue:
+        while len(active) < MAX_PARALLEL_STT and queue:
             job = queue.pop(0)
-            # Mỗi bộ dùng 1 worker; ba bộ chạy đồng thời = tối đa 3 request STT,
-            # tránh nhân thành 9 request và dễ bị API giới hạn.
+            # Mỗi bộ dùng 1 worker để tổng số request STT không vượt giới hạn.
             thread = SttBatchThread(
                 job["files"], src_lang=job["src"], out_lang=job["out"],
                 use_trans=(job["src"] != job["out"]), stt_workers=1)
@@ -7661,7 +7675,7 @@ class HonggouWidget(QWidget):
             self._keep_thread_alive(thread)
             if hasattr(self, 'txt_stt_log'):
                 self.txt_stt_log.append(
-                    f"🚀 Tách sub nền [{len(active)}/3 bộ]: {job['title']}")
+                    f"🚀 Tách sub nền [{len(active)}/{MAX_PARALLEL_STT} bộ]: {job['title']}")
             thread.start()
 
     def _on_background_stt_progress(self, title, message):
@@ -7712,9 +7726,9 @@ class HonggouWidget(QWidget):
             self._maybe_finish_stt_pipeline()
             return
 
-        # Tối đa 3 file STT đồng thời. Mỗi thread chỉ xử lý một file đã đóng
+        # Mỗi thread chỉ xử lý một file đã đóng; giới hạn dùng chung ở trên
         # hoàn chỉnh nên không bao giờ đọc trúng video còn đang ghi.
-        while queue and active < 3:
+        while queue and active < MAX_PARALLEL_STT:
             file_path = queue.pop(0)
             active += 1
             self._stt_pipeline_active = active

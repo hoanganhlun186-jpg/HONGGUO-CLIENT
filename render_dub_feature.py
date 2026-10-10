@@ -5,7 +5,10 @@ render_dub_feature.py
 Gắn thêm 1 tab con "🔤 Tách sub → Dịch → Lồng tiếng" vào RenderWidget.
 """
 
+import json
 import os
+import sys
+from pathlib import Path
 import subprocess
 
 try:
@@ -139,21 +142,54 @@ def _load_dub_voices(lang="vi", source="capcut"):
             value = f"🔊 {name} (Pekka) [pekka:{vid}]"
             voices.append((display, value))
     else:
-        # Giọng CapCut miễn phí
-        if lang == "en":
-            raw = [
-                ("Jessie",          "DiT_en_female_jessie"),
-                ("Male Profess",    "en_us_007"),
-                ("English",         "BV510_streaming"),
-                ("American Female", "BV029_streaming"),
-            ]
-        else:
-            raw = [
-                ("Cô Gái Hoạt Ngôn", "BV074_streaming"),
-                ("Thanh Niên Tự Tin","BV075_streaming"),
-                ("Nhỏ Ngọt Ngào",    "BV421_vivn_streaming"),
-                ("Giọng Bé",         "BV074_streaming_dsp"),
-            ]
+        # Đọc toàn bộ giọng CapCut miễn phí từ danh mục gốc thay vì chỉ hiện
+        # 4 giọng viết cứng. Khi chạy từ source, file nằm cạnh module; khi app
+        # được đóng gói, PyInstaller có thể đặt nó trong _MEIPASS.
+        raw = []
+        roots = [Path(__file__).resolve().parent]
+        bundle_root = getattr(sys, "_MEIPASS", None)
+        if bundle_root:
+            roots.insert(0, Path(bundle_root))
+        catalog = next((root / "Voice.json" for root in roots
+                        if (root / "Voice.json").is_file()), None)
+        if catalog:
+            try:
+                data = json.loads(catalog.read_text(encoding="utf-8-sig"))
+                seen = set()
+                for voice in data if isinstance(data, list) else []:
+                    code = str(voice.get("voice_type") or "").strip()
+                    name = str(voice.get("display_name") or code).strip()
+                    voice_lang = str(voice.get("lan") or "").strip().lower()
+                    locale = str(voice.get("lang") or "").strip().lower()
+                    if not code or code in seen:
+                        continue
+                    if voice_lang != lang and not locale.startswith(lang + "-"):
+                        continue
+                    # Các mã Neural là Edge TTS, không phải giọng CapCut. Tab
+                    # lồng tiếng đã có nhánh Edge riêng nên không trộn vào đây.
+                    if "neural" in code.lower():
+                        continue
+                    seen.add(code)
+                    raw.append((name, code))
+            except (OSError, ValueError, TypeError):
+                raw = []
+
+        # Fallback an toàn nếu bản phát hành quên kèm Voice.json.
+        if not raw:
+            if lang == "en":
+                raw = [
+                    ("Jessie",          "DiT_en_female_jessie"),
+                    ("Male Profess",    "en_us_007"),
+                    ("English",         "BV510_streaming"),
+                    ("American Female", "BV029_streaming"),
+                ]
+            else:
+                raw = [
+                    ("Cô Gái Hoạt Ngôn", "BV074_streaming"),
+                    ("Thanh Niên Tự Tin","BV075_streaming"),
+                    ("Nhỏ Ngọt Ngào",    "BV421_vivn_streaming"),
+                    ("Giọng Bé",         "BV074_streaming_dsp"),
+                ]
         for name, code in raw:
             display = f"🌟 {name}"
             value = f"🌟 {name} [{code}]"
@@ -277,6 +313,83 @@ class PekkaTestWorker(QThread):
         except Exception as e:
             self.done.emit(False, f"Lỗi kết nối: {str(e)}")
 
+
+class CapCutTestWorker(QThread):
+    """Tạo và tải một mẫu giọng CapCut mà không khóa giao diện."""
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, voice_code, out_file, test_text=None):
+        super().__init__()
+        self.voice_code = voice_code
+        self.out_file = out_file
+        self.test_text = test_text or "Xin chào, đây là giọng đọc thử nghiệm của hệ thống."
+
+    def run(self):
+        import json as _json
+        import time as _time
+        import urllib.request
+        try:
+            from capcut_tts_api import CapCutClient
+            client = CapCutClient()
+            created = client.create_tts_task(
+                texts=self.test_text, voice=self.voice_code, rate="1.0")
+            tasks = (created.get("data") or {}).get("tasks") or []
+            if not tasks:
+                raise RuntimeError("CapCut không trả về tác vụ TTS")
+            task_id = tasks[0].get("id")
+            token = tasks[0].get("token")
+            if not task_id or not token:
+                raise RuntimeError("Tác vụ CapCut thiếu id/token")
+
+            url = ""
+            final_status = ""
+            for _ in range(60):
+                _time.sleep(2)
+                queried = client.query_tts_task(task_id, token)
+                items = (queried.get("data") or {}).get("tasks") or []
+                if not items:
+                    continue
+                item = items[0]
+                final_status = str(item.get("status") or "")
+                state = final_status.lower()
+                if state in {"failed", "error", "fail"}:
+                    raise RuntimeError(f"CapCut báo lỗi: {final_status}")
+                if state not in {"succeed", "success", "completed", "done", "finish"}:
+                    continue
+                payload = item.get("payload") or "{}"
+                payload = _json.loads(payload) if isinstance(payload, str) else payload
+                subtitles = payload.get("audio_subtitles") or []
+                if subtitles:
+                    url = subtitles[0].get("speech_url") or ""
+                if not url:
+                    for key in ("audio_list", "url_list"):
+                        for entry in payload.get(key) or []:
+                            if isinstance(entry, dict):
+                                url = (entry.get("url") or entry.get("audio_url")
+                                       or entry.get("speech_url") or "")
+                            else:
+                                url = str(entry or "")
+                            if url:
+                                break
+                        if url:
+                            break
+                break
+            if not url:
+                raise RuntimeError(
+                    f"Không nhận được audio sau 120 giây (trạng thái: {final_status or 'chưa rõ'})")
+
+            urllib.request.urlretrieve(url, self.out_file)
+            if not os.path.isfile(self.out_file) or os.path.getsize(self.out_file) <= 1000:
+                raise RuntimeError("File mẫu tải về bị rỗng")
+            self.done.emit(True, "")
+        except Exception as exc:
+            try:
+                if os.path.isfile(self.out_file):
+                    os.remove(self.out_file)
+            except OSError:
+                pass
+            self.done.emit(False, str(exc))
+
 # --------------------------------------------------------------------------- #
 # LUỒNG TẢI HÀNG LOẠT TOÀN BỘ GIỌNG MẪU VỀ MÁY (Tự động)                      #
 # --------------------------------------------------------------------------- #
@@ -360,6 +473,7 @@ class DubFeatureWidget(QWidget):
         self._MAX_VERIFY_RETRY = 2        
         self._verify_round = 0            
         self._translate_failed = set()    
+        self._cancel_requested = False
         self._skip_from_render = set()    
         self._bad_found = []              
         self._build_ui()
@@ -679,6 +793,10 @@ class DubFeatureWidget(QWidget):
 
         self.chk_remove_bgm = QCheckBox("🎵 Tách nhạc nền (Demucs) trước khi lồng")
         self.chk_remove_bgm.setChecked(self.settings.value("remove_bgm", False, type=bool))
+        # Chỉ kiểm tra/cài Demucs khi người dùng thật sự bấm bật.
+        # Dùng clicked thay cho stateChanged để callback cài xong có thể
+        # tick lại checkbox mà không tạo vòng lặp kiểm tra.
+        self.chk_remove_bgm.clicked.connect(self._on_remove_bgm_clicked)
         lay.addWidget(self.chk_remove_bgm)
         self.chk_use_gpu = QCheckBox("⚡ Dùng GPU cho Demucs")
         self.chk_use_gpu.setChecked(self.settings.value("use_gpu", False, type=bool))
@@ -763,6 +881,60 @@ class DubFeatureWidget(QWidget):
         root.addWidget(self.txt_log)
 
         self._on_engine_changed(self.cb_translate_engine.currentText())
+
+    def _on_remove_bgm_clicked(self, checked):
+        """Lazy-check/lazy-install Demucs when the option is enabled."""
+        if not checked:
+            return
+
+        try:
+            from demucs_manager import is_demucs_ready, ensure_demucs_installed_ui
+        except Exception as exc:
+            self.chk_remove_bgm.setChecked(False)
+            QMessageBox.warning(
+                self, "Thiếu bộ cài Demucs",
+                "Không nạp được demucs_manager.py nên chưa thể tự tải "
+                f"Demucs.\n\nChi tiết: {exc}")
+            return
+
+        # Trả checkbox về OFF trong lúc kiểm tra/cài để quy trình lồng
+        # tiếng không thể khởi chạy nhầm khi Demucs chưa sẵn sàng.
+        self.chk_remove_bgm.setChecked(False)
+        self.chk_remove_bgm.setEnabled(False)
+        self.chk_remove_bgm.setText("🎵 Đang kiểm tra Demucs...")
+
+        class _DemucsCheckThread(QThread):
+            result = pyqtSignal(bool)
+
+            def run(self):
+                self.result.emit(is_demucs_ready())
+
+        def _restore_checkbox():
+            self.chk_remove_bgm.setEnabled(True)
+            self.chk_remove_bgm.setText("🎵 Tách nhạc nền (Demucs) trước khi lồng")
+
+        def _enable_after_install():
+            _restore_checkbox()
+            self.chk_remove_bgm.setChecked(True)
+            self.settings.setValue("remove_bgm", True)
+            self._log("✅ Demucs đã sẵn sàng để tách nhạc nền.")
+
+        def _on_check_done(ready):
+            _restore_checkbox()
+            if ready:
+                self.chk_remove_bgm.setChecked(True)
+                self.settings.setValue("remove_bgm", True)
+                self._log("✅ Đã phát hiện Demucs trên máy.")
+            else:
+                # Hàm manager hiện hộp thoại xác nhận, tự tải/cài toàn
+                # bộ thư mục portable và chỉ callback khi kiểm tra thành công.
+                ensure_demucs_installed_ui(self, _enable_after_install)
+
+        self._demucs_check_thread = _DemucsCheckThread(self)
+        self._demucs_check_thread.result.connect(_on_check_done)
+        self._demucs_check_thread.finished.connect(
+            self._demucs_check_thread.deleteLater)
+        self._demucs_check_thread.start()
 
     def _pekka_key(self):
         """Lấy Pekka API key: ưu tiên ô nhập (nếu đã tạo), fallback settings."""
@@ -945,13 +1117,14 @@ class DubFeatureWidget(QWidget):
             except Exception as e: QMessageBox.warning(self, "Lỗi mở file", f"Chi tiết: {e}")
             return
 
-        # 2. Giọng CapCut không tạo online tại đây → cần file mẫu có sẵn
+        # 2. Giọng CapCut chưa có mẫu → tạo trực tiếp qua API trong luồng nền.
         if not is_pekka:
-            QMessageBox.information(
-                self, "Chưa có mẫu",
-                "Giọng CapCut này chưa có file mẫu trong thư mục 'voice_samples'.\n"
-                "Vui lòng chạy script tạo mẫu (tao_mau_giong.py) để tạo sẵn, "
-                "hoặc dùng giọng đã có mẫu.")
+            self.btn_test_voice.setEnabled(False)
+            self.btn_test_voice.setText("⏳ Đang tạo mẫu...")
+            self._test_worker = CapCutTestWorker(
+                voice_type, out_file, self._test_sample_text())
+            self._test_worker.done.connect(self._on_test_done)
+            self._test_worker.start()
             return
 
         # 3. Giọng Pekka → tải mẫu online bằng API key
@@ -998,7 +1171,21 @@ class DubFeatureWidget(QWidget):
         if not hasattr(self, "_threads_alive"):
             self._threads_alive = []
         self._threads_alive.append(th)
-        th.finished.connect(lambda: self._threads_alive.remove(th) if th in self._threads_alive else None)
+        # Không bỏ reference QThread ngay bên trong chính tín hiệu finished.
+        # PyQt/Python 3.14 có thể gọi destructor khi Qt vẫn còn đang dispatch
+        # các slot khác của tín hiệu này, dẫn tới abort trong Qt6Core.dll
+        # (Windows 0xc0000409). Trì hoãn qua một nhịp event-loop và giữ thêm
+        # một khoảng đệm ngắn để mọi queued signal đã chạy xong.
+        def _release_later(_thread=th):
+            QTimer.singleShot(1000, lambda t=_thread: self._release_kept_thread(t))
+        th.finished.connect(_release_later)
+
+    def _release_kept_thread(self, th):
+        try:
+            if th in getattr(self, "_threads_alive", []):
+                self._threads_alive.remove(th)
+        except Exception:
+            pass
 
     def _files_from_host(self, all_series=False):
         def _resume_source(path):
@@ -1027,6 +1214,14 @@ class DubFeatureWidget(QWidget):
             cards = getattr(self.host, "cards", []) or []
         for c in cards:
             vp = getattr(c, "video_path", None)
+            try:
+                if (getattr(self.host, "_separate_export_mode", False)
+                        and self.host._card_state(c).get("done")):
+                    # Tập đã đủ video sub + hai audio: không đưa video không
+                    # tiếng quay lại chuỗi nhận diện/dịch/lồng.
+                    continue
+            except Exception:
+                pass
             if vp and os.path.exists(vp):
                 vp = _resume_source(vp)
                 if vp not in files:
@@ -1354,10 +1549,11 @@ class DubFeatureWidget(QWidget):
             dub = self._dubbed_for(video_path)
             if os.path.exists(dub):
                 return True
-
+            # Không có câu thoại nhưng track "lồng tiếng" vẫn phải tuân theo
+            # mức tiếng gốc người dùng đặt cho luồng lồng (0%, 10%, ...).
+            # Track audio_goc được tách riêng từ video nguồn nên luôn giữ 100%.
             mute = self.chk_mute_original.isChecked()
             orig_v = 0.0 if mute else (self.spn_orig_volume.value() / 100.0)
-
             try:
                 ff = get_ffmpeg_path()
                 si = None
@@ -1371,10 +1567,10 @@ class DubFeatureWidget(QWidget):
                            "-map", "0:v:0", "-map", "1:a:0", "-shortest",
                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                            "-movflags", "+faststart", dub]
-                    self._log(f"🔇 {os.path.basename(video_path)}: tập không thoại → tắt tiếng gốc cho đồng bộ.")
+                    self._log(f"🔇 {os.path.basename(video_path)}: tập không thoại → track lồng tiếng tắt tiếng gốc.")
                 elif abs(orig_v - 1.0) < 0.001:
                     shutil.copyfile(video_path, dub)
-                    self._log(f"🔇 {os.path.basename(video_path)}: tập không thoại → giữ tiếng gốc 100%.")
+                    self._log(f"🔇 {os.path.basename(video_path)}: tập không thoại → track lồng tiếng giữ tiếng gốc 100%.")
                     return True
                 else:
                     cmd = [ff, "-y", "-i", video_path,
@@ -1383,7 +1579,7 @@ class DubFeatureWidget(QWidget):
                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                            "-movflags", "+faststart", dub]
                     self._log(f"🔇 {os.path.basename(video_path)}: tập không thoại → "
-                              f"tiếng gốc {int(orig_v*100)}% cho đồng bộ.")
+                              f"track lồng tiếng giữ tiếng gốc {int(orig_v*100)}%.")
 
                 proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       startupinfo=si, text=True, errors="ignore")
@@ -1411,12 +1607,74 @@ class DubFeatureWidget(QWidget):
         if ext is not None:
             ext.setEnabled(on)
 
+    def is_busy(self):
+        if (getattr(self, "_live_pipeline", False)
+                or getattr(self, "_dub_running", False)
+                or bool(getattr(self, "_dub_queue", []))):
+            return True
+        candidates = [getattr(self, "_stt_thread", None),
+                      getattr(self, "_gtrans_thread", None),
+                      getattr(self, "_dub_thread", None)]
+        candidates.extend(list(getattr(self, "_dub_threads", {}).values()))
+        for thread in candidates:
+            try:
+                if thread is not None and thread.isRunning():
+                    return True
+            except RuntimeError:
+                pass
+        return False
+
+    def _arm_global_stop(self):
+        self._cancel_requested = False
+        if hasattr(self.host, "btn_stop"):
+            self.host.btn_stop.setEnabled(True)
+
+    def stop_all(self):
+        """Dừng toàn bộ pipeline của tab Render, không cho callback nối bước sau."""
+        self._cancel_requested = True
+        self._chain_after_stt = None
+        self._chain_dub_after_translate = False
+        self._render_after_dub = False
+        self._live_pipeline = False
+        self._live_finished = True
+        self._dub_queue = []
+        self._full_need_translate = []
+        self._full_ready_vi = []
+        self._total_on = False
+
+        threads = [getattr(self, "_stt_thread", None),
+                   getattr(self, "_gtrans_thread", None),
+                   getattr(self, "_dub_thread", None),
+                   getattr(self, "_test_worker", None),
+                   getattr(self, "_voices_worker", None)]
+        threads.extend(list(getattr(self, "_dub_threads", {}).values()))
+        for thread in threads:
+            if thread is None:
+                continue
+            try:
+                if hasattr(thread, "stop"):
+                    thread.stop()
+                elif hasattr(thread, "cancel"):
+                    thread.cancel()
+                else:
+                    thread.requestInterruption()
+            except Exception:
+                pass
+
+        self._dub_running = any(
+            thread is not None and thread.isRunning()
+            for thread in getattr(self, "_dub_threads", {}).values())
+        self._set_buttons_enabled(True)
+        self._stop_card_poll()
+        self._log("⛔ Đã gửi lệnh dừng: tách sub, dịch, lồng tiếng và hàng đợi kế tiếp.")
+
     def _run_only_stt(self):
         files = self._files_from_host()
         if not files:
             QMessageBox.warning(self, "Không có file", "Hàng đợi Render đang trống!")
             return
         self._save_settings()
+        self._arm_global_stop()
         self._chain_after_stt = None
         self._start_stt(files)
 
@@ -1476,6 +1734,11 @@ class DubFeatureWidget(QWidget):
                 self._stt_done_prev = done
 
     def _on_stt_finished(self, ok, failed):
+        if getattr(self, "_cancel_requested", False):
+            self._log("⛔ Tách sub đã dừng; không chuyển sang bước dịch.")
+            self._set_buttons_enabled(True)
+            self._stop_card_poll()
+            return
         if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
             return
         self.bar_stt.setValue(100)
@@ -1493,6 +1756,7 @@ class DubFeatureWidget(QWidget):
             QMessageBox.warning(self, "Không có file", "Hàng đợi Render đang trống!")
             return
         self._save_settings()
+        self._arm_global_stop()
 
         to_translate = []
         for vp in files:
@@ -1628,6 +1892,11 @@ class DubFeatureWidget(QWidget):
         self._gtrans_thread.start()
 
     def _on_translate_all_done(self, *args):
+        if getattr(self, "_cancel_requested", False):
+            self._log("⛔ Dịch đã dừng; không chuyển sang bước lồng/render.")
+            self._set_buttons_enabled(True)
+            self._stop_card_poll()
+            return
         if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
             return
         fatal = getattr(getattr(self, "_gtrans_thread", None), "fatal_error", "")
@@ -1683,6 +1952,7 @@ class DubFeatureWidget(QWidget):
             QMessageBox.warning(self, "Không có file", "Hàng đợi Render đang trống!")
             return
         self._save_settings()
+        self._arm_global_stop()
 
         ready = []
         for vp in files:
@@ -1718,6 +1988,9 @@ class DubFeatureWidget(QWidget):
         self._pump_dub_queue()
 
     def _pump_dub_queue(self):
+        if getattr(self, "_cancel_requested", False):
+            self._dub_queue = []
+            return
         if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
             return
         # Chạy nhiều tập SONG SONG: giữ tối đa N thread lồng cùng lúc.
@@ -1789,6 +2062,17 @@ class DubFeatureWidget(QWidget):
         self._dub_threads[video_path] = th
 
         def _one_done(ok, failed, _vp=video_path):
+            cancelled = getattr(self, "_cancel_requested", False)
+            # Cuốn chiếu thật sự: DubThread chỉ phát finished_signal sau khi
+            # ffmpeg/TTS của tập đã hoàn tất. Nếu file _dubbed đã probe được,
+            # đưa ngay tập này sang hàng render; không chờ dịch/lồng hết bộ và
+            # cũng không phụ thuộc tín hiệu QThread.finished đến muộn hơn.
+            dub_path = self._dubbed_for(_vp)
+            if (not cancelled and bool(ok) and not bool(failed)
+                    and getattr(self, "_live_pipeline", False)
+                    and _valid_video_output(dub_path)):
+                self._log(f"⚡ Lồng xong → render ngay: {os.path.basename(_vp)}")
+                self.host._accept_live_render(_vp, dub_path, self._vi_srt_for(_vp))
             # Gỡ thread vừa xong khỏi danh sách đang chạy
             self._dub_threads.pop(_vp, None)
             self._dub_done_eps = getattr(self, "_dub_done_eps", 0) + 1
@@ -1796,14 +2080,14 @@ class DubFeatureWidget(QWidget):
             done, total = self._dub_counts()
             self.lbl_dub_prog.setText(f"③ Lồng tiếng · {done}/{total} tập")
             # Còn tập trong hàng -> khởi động tiếp cho đủ số song song
-            if self._dub_queue:
+            if self._dub_queue and not cancelled:
                 self._pump_dub_queue()
             # Hết cả hàng đợi lẫn thread đang chạy -> xong toàn bộ
             if not self._dub_queue and not self._dub_threads:
                 self._dub_running = False
                 trans_running = (getattr(self, "_gtrans_thread", None) is not None
                                  and self._gtrans_thread.isRunning())
-                if not trans_running:
+                if not trans_running and not cancelled:
                     self._log("✅ Lồng tiếng xong toàn bộ.")
                     self._refresh_host_cards()
                     self._set_buttons_enabled(True)
@@ -1822,15 +2106,6 @@ class DubFeatureWidget(QWidget):
                             pass
                         self._total_on = False
 
-        # Only hand off after the dubbing worker has actually closed its output.
-        live_result = {"ok": False}
-        def _remember_live_result(ok, failed):
-            live_result["ok"] = bool(ok) and not bool(failed)
-        th.finished_signal.connect(_remember_live_result)
-        def _handoff_live_render():
-            if live_result["ok"] and getattr(self, "_live_pipeline", False):
-                self.host._accept_live_render(video_path, self._dubbed_for(video_path), self._vi_srt_for(video_path))
-        th.finished.connect(_handoff_live_render)
         th.finished_signal.connect(_one_done)
         self._keep_alive(th)
         th.start()
@@ -2113,6 +2388,7 @@ class DubFeatureWidget(QWidget):
             self._log("❌ Không tìm thấy chức năng render của tab Thiết kế.")
 
     def _run_full_pipeline(self, all_series=False):
+        self._arm_global_stop()
         if getattr(self.host, "_batch_managed", False):
             all_series = False
             self.chk_auto_render.setChecked(True)
@@ -2178,14 +2454,12 @@ class DubFeatureWidget(QWidget):
 
         self._auto_dub_on = self.chk_auto_dub.isChecked()
         self._chain_dub_after_translate = self._auto_dub_on
-        if all_series:
-            self._render_after_dub = False
-            self._log("   ℹ️ Chế độ tất cả các bộ: sẽ tách→dịch→lồng cho mọi bộ. "
-                      "Render riêng bằng nút 🎬 RENDER TẤT CẢ CÁC BỘ (đúng cấu hình từng bộ).")
-        else:
-            # Tự Render là tuỳ chọn độc lập: nếu tắt lồng tiếng,
-            # pipeline sẽ dịch xong rồi render bằng âm thanh gốc.
-            self._render_after_dub = self.chk_auto_render.isChecked()
+        # Một bộ hay tất cả các bộ đều chạy liền mạch. Trước đây all_series
+        # cố ý dừng sau lồng tiếng, khiến nút "Chạy tất cả bộ" trông như bị
+        # kẹt và người dùng phải bấm Render lần nữa.
+        self._render_after_dub = self.chk_auto_render.isChecked()
+        if all_series and self._render_after_dub:
+            self._log("   ⚡ Chế độ tất cả các bộ: tập nào lồng xong sẽ render ngay; đủ tập thì tự gộp.")
         self._dub_queue = []
         self._dub_running = False
         self._dub_done_eps = 0
@@ -2273,6 +2547,8 @@ class DubFeatureWidget(QWidget):
             self._full_start_translate_stage()
 
     def _full_start_translate_stage(self):
+        if getattr(self, "_cancel_requested", False):
+            return
         if getattr(self.host, "_batch_managed", False) and getattr(self.host, "_batch_result", None) is not None:
             return
         if self._auto_dub_on and self._dub_queue:

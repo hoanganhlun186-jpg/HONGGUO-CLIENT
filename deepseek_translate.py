@@ -77,7 +77,8 @@ def parse_srt(srt_text: str) -> List[SrtBlock]:
             continue
         idx = lines[0].strip()
         time_range = lines[1].strip()
-        text = "\n".join(lines[2:]).strip()
+        # Mỗi block SRT phải là đúng một dòng đầu vào của AI, giống parser Gemini.
+        text = " ".join(part.strip() for part in lines[2:] if part.strip()).strip()
         if not re.match(r"^\d+$", idx) or "-->" not in time_range:
             # Không đúng định dạng SRT chuẩn -> bỏ qua an toàn
             continue
@@ -201,19 +202,24 @@ def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str,
 # đang gửi, lấy mẫu 150 dòng đầu (đúng số dòng Gemini đang lấy), để 2 engine
 # cho ra bối cảnh cùng "chất lượng" và cùng cách suy luận, không lệch nhau.
 
-CONTEXT_SAMPLE_LINES = 150   # số dòng lấy mẫu để phân tích - KHỚP với Gemini
+CONTEXT_SAMPLE_EPISODES = 3
+CONTEXT_SAMPLE_LINES = 400   # khớp giới hạn ngữ cảnh hiện tại của Gemini
 
 
 def _build_context_prompt(sample_text: str) -> str:
-    """Nguyên văn prompt phân tích bối cảnh, copy y hệt từ GeminiTranslateThread."""
+    """Prompt ghi chú biên tập dùng chung với luồng Gemini hiện tại."""
     return (
-        "Đọc kịch bản sau và hãy đóng vai nhà phê bình phim để trả lời NGẮN GỌN 2 câu hỏi:\n"
-        "1. Phim này thuộc thể loại gì?\n"
-        "2. Nhận diện các nhân vật xuất hiện và cách họ xưng hô với nhau sao cho chuẩn "
-        "tiếng Việt nhất (Ví dụ: Lâm Xung (y/hắn), đại ca - đệ, hoàng thượng - thần thiếp, "
-        "anh - em...)?\n\n"
-        "TUYỆT ĐỐI KHÔNG DỊCH VĂN BẢN. CHỈ TRẢ VỀ TÓM TẮT ĐÁNH GIÁ (Khoảng 4-5 dòng).\n"
-        f"Văn bản trích xuất:\n{sample_text}"
+        "Hãy giúp tôi lập ghi chú biên tập ngắn từ phụ đề các tập đầu phim Trung Quốc dưới đây. "
+        "Ghi chú này dùng để giữ bản dịch các tập nhất quán; chưa cần dịch từng câu thoại. "
+        "Vui lòng trình bày bốn mục:\n\n"
+        "1. Bối cảnh: một câu nêu thể loại và thời đại, không cần kể cốt truyện.\n"
+        "2. Văn phong: một câu mô tả cách dịch tự nhiên, gọn và giữ sắc thái theo từng cảnh.\n"
+        "3. Xưng hô: với mỗi cặp nhân vật chính, ghi người nói → người nghe, cách tự xưng, "
+        "cách gọi đối phương và bằng chứng tập/câu. Chỉ chốt khi có bằng chứng; chưa đủ thì ghi "
+        "'chưa xác định'. Không mặc định 我/你 thành một cặp đại từ cụ thể và không dùng tao/mày.\n"
+        "4. Thuật ngữ và tên: tên nhân vật (gốc → Việt), chức tước, biệt danh, thuật ngữ đặc trưng "
+        "và cách dịch đề xuất.\n\n"
+        f"Nội dung phụ đề tham khảo:\n{sample_text}"
     )
 
 
@@ -230,7 +236,7 @@ def analyze_movie_context(api_key: str, full_script_text: str,
     try:
         raw = _call_deepseek(
             api_key=api_key,
-            system_prompt="Bạn là nhà phê bình phim chuyên nghiệp, trả lời đúng theo yêu cầu, không dịch văn bản.",
+            system_prompt="Bạn là biên tập viên phụ đề phim Trung Quốc. Chỉ lập ghi chú nhất quán theo yêu cầu, không dịch từng câu thoại.",
             user_prompt=context_prompt,
             max_tokens=500,
             temperature=0.3,
@@ -269,19 +275,21 @@ MAX_CHUNK_RETRIES = 5
 
 
 def _build_strict_rules(n_lines: int, context_text: str) -> str:
-    """Nguyên văn 5 quy tắc cứng, copy y hệt từ GeminiTranslateThread."""
-    return f"""QUY TẮC TUYỆT ĐỐI (VI PHẠM SẼ LỖI PHẦN MỀM):
-1. BẮT BUỘC trả về ĐÚNG {n_lines} dòng. Không gộp, không tách.
-2. KHÔNG giải thích, KHÔNG CHÀO HỎI. KHÔNG dùng thẻ markdown. CHỈ TRẢ VỀ NỘI DUNG DỊCH.
-3. BẮT BUỘC SỬ DỤNG TIẾNG VIỆT CÓ DẤU CHUẨN CHÍNH TẢ (Ví dụ: "Không", tuyệt đối không viết "Khong"). Đảm bảo giữ nguyên các dấu thanh của tiếng Việt.
-4. DỊCH SẠCH 100%, KHÔNG ĐỂ SÓT LẠI KÝ TỰ HÁN/TRUNG QUỐC.
-5. ÁP DỤNG BỐI CẢNH VÀ XƯNG HÔ SAU ĐÂY VÀO BẢN DỊCH:
+    """Quy tắc dịch và định dạng đồng bộ với GeminiTranslateThread."""
+    return f"""Hướng dẫn định dạng và biên dịch:
+1. Mỗi dòng nguồn được đánh số [1], [2], [3]... Hãy dịch đủ {n_lines} dòng và giữ số ở đầu từng dòng theo mẫu: "[1] Xin chào". Không gộp hoặc tách dòng.
+2. Chỉ xuất các dòng "[số] nội dung"; không thêm lời chào, giải thích hoặc thẻ markdown.
+3. Viết tiếng Việt có dấu và đúng chính tả.
+4. Dịch toàn bộ tiếng Trung sang tiếng Việt. Thán từ ngắn như 嗯, 啊, 哎 cũng phải được dịch tự nhiên để không có dòng trống.
+5. Giữ bản dịch súc tích, tự nhiên, đủ nghĩa và phù hợp thời lượng đọc TTS. Có thể bỏ từ đệm nhưng không được làm mất ý chính hoặc phủ định; rút gọn riêng từng câu, tuyệt đối không gộp dòng.
+6. Không dùng "tao", "mày" hoặc cách xưng hô thô tục tương tự. Nếu chưa rõ quan hệ, ưu tiên diễn đạt trung tính hoặc lược đại từ khi vẫn tự nhiên.
+7. Áp dụng bối cảnh, văn phong và xưng hô dưới đây khi phù hợp. Nếu lời thoại hiện tại có bằng chứng rõ hơn thì ưu tiên lời thoại hiện tại:
 ---
 {context_text}
 ---"""
 
 
-def _clean_ai_response(raw: str) -> List[str]:
+def _clean_ai_response(raw: str, expected_count: int = 0) -> List[str]:
     """Dọn phản hồi y hệt logic 'Phẫu thuật sub' bên Gemini: bỏ code fence,
     bỏ dấu *, cắt câu chào hỏi thừa ở đầu, dồn khoảng trắng/từ lặp, lọc bỏ
     dòng "rác" AI tự chèn thêm (số đếm trần trụi / dòng timestamp tự bịa)."""
@@ -296,6 +304,27 @@ def _clean_ai_response(raw: str) -> List[str]:
         else:
             break
 
+    # Ưu tiên khôi phục theo mã [n] để một dòng thiếu không làm lệch toàn bộ
+    # phụ đề phía sau. Đây là cơ chế đang dùng trong GeminiTranslateThread.
+    if expected_count > 0:
+        slots = [None] * expected_count
+        num_re = re.compile(r'^\s*\[(\d+)\]\s*(.*)$')
+        matched_any = False
+        for line in temp_lines_raw:
+            match = num_re.match(line)
+            if not match:
+                continue
+            slot = int(match.group(1)) - 1
+            body = match.group(2).strip()
+            if 0 <= slot < expected_count:
+                matched_any = True
+                body = re.sub(r'(\b\w+\b)(?:\s+\1){2,}', r'\1', body, flags=re.IGNORECASE)
+                body = re.sub(r' +', ' ', body).strip()
+                if body:
+                    slots[slot] = body
+        if matched_any:
+            return [body for body in slots if body is not None]
+
     temp_lines = []
     _timestamp_line_re = re.compile(r'^\d{1,2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{3}$')
     for line in temp_lines_raw:
@@ -307,7 +336,10 @@ def _clean_ai_response(raw: str) -> List[str]:
             continue
         if _timestamp_line_re.match(stripped):
             continue
-        clean_line = re.sub(r'(\b\w+\b)(?:\s+\1){2,}', r'\1', line, flags=re.IGNORECASE)
+        # DeepSeek/Gemini đều được yêu cầu trả [n]. Bỏ mã trước khi ghép lại SRT.
+        clean_line = re.sub(r'^\s*\[\s*\d+\s*\]\s*', '', line)
+        clean_line = re.sub(r'^(?:dòng|line)\s*\d+\s*[:.)-]\s*', '', clean_line, flags=re.IGNORECASE)
+        clean_line = re.sub(r'(\b\w+\b)(?:\s+\1){2,}', r'\1', clean_line, flags=re.IGNORECASE)
         clean_line = re.sub(r' +', ' ', clean_line)
         temp_lines.append(clean_line)
     return temp_lines
@@ -342,11 +374,14 @@ def translate_chunk(api_key: str, ctx: SeriesContext,
     while remaining and retry_count < MAX_CHUNK_RETRIES:
         current_batch = remaining[:batch_size]
         lines_to_translate = [b.text for b in current_batch]
-        text_payload = "\n".join(lines_to_translate)
+        text_payload = "\n".join(f"[{n + 1}] {text}" for n, text in enumerate(lines_to_translate))
 
         strict_rules = _build_strict_rules(len(lines_to_translate), context_text)
-        system_prompt = f"{ctx.genre}\n\n{strict_rules}"
-        user_prompt = f"Dịch {len(lines_to_translate)} dòng sau:\n{text_payload}"
+        system_prompt = f"Bạn là biên tập viên dịch phụ đề {ctx.genre}. Văn phong: {ctx.target_style}. Yêu cầu đầu ra: {ctx.output_requirements}."
+        user_prompt = (
+            f"{strict_rules}\n\n"
+            f"Dịch {len(lines_to_translate)} dòng sau, giữ nguyên số [n] ở đầu mỗi dòng:\n{text_payload}"
+        )
 
         try:
             raw = _call_deepseek(
@@ -362,7 +397,7 @@ def translate_chunk(api_key: str, ctx: SeriesContext,
             time.sleep(RETRY_DELAY_SEC)
             continue
 
-        temp_lines = _clean_ai_response(raw)
+        temp_lines = _clean_ai_response(raw, len(current_batch))
 
         if not temp_lines:
             _log("⚠️ AI không trả về dòng nào hợp lệ. Thử lại...\n")
