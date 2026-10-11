@@ -1536,6 +1536,34 @@ class MergeRenderedThread(QThread):
         except Exception:
             return False
 
+    def _probe_stream_signature(self, ffmpeg, filepath):
+        """Thông số phải giống nhau mới được nối nhanh bằng stream-copy."""
+        try:
+            ffprobe = os.path.join(os.path.dirname(ffmpeg),
+                                   "ffprobe.exe" if os.name == "nt" else "ffprobe")
+            if not os.path.isfile(ffprobe):
+                ffprobe = shutil.which("ffprobe") or ffprobe
+            si = subprocess.STARTUPINFO() if os.name == "nt" else None
+            if si: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name,profile,width,height,pix_fmt,r_frame_rate,time_base",
+                 "-of", "json", filepath],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=si,
+                text=True, encoding="utf-8", errors="replace")
+            if result.returncode != 0:
+                return None
+            import json
+            streams = json.loads(result.stdout or "{}").get("streams") or []
+            if not streams:
+                return None
+            stream = streams[0]
+            return tuple(str(stream.get(key, "")) for key in
+                         ("codec_name", "profile", "width", "height", "pix_fmt",
+                          "r_frame_rate", "time_base"))
+        except Exception:
+            return None
+
     def _prepare_thumbnail(self):
         """Chuẩn hóa ảnh bìa thành JPG 1280×720 (chuẩn thumbnail YouTube), nền phủ
         16:9 không méo. Trả về đường dẫn JPG tạm, hoặc None nếu không có ảnh."""
@@ -1683,11 +1711,15 @@ class MergeRenderedThread(QThread):
         # ── Probe thông số đầu vào ───────────────────────────────────────────
         resolutions = [self._probe_resolution(ffmpeg, fp) for fp in files]
         fps_list = [self._probe_fps(ffmpeg, fp) for fp in files]
+        signatures = [self._probe_stream_signature(ffmpeg, fp) for fp in files]
         unique_res = set(r for r in resolutions if r is not None)
         unique_fps = set(f for f in fps_list if f is not None)
         mixed_res = len(unique_res) > 1
         mixed_fps = len(unique_fps) > 1
-        mixed = mixed_res or mixed_fps
+        valid_signatures = [signature for signature in signatures if signature]
+        mixed_stream = (len(valid_signatures) != len(files)
+                        or len(set(valid_signatures)) > 1)
+        mixed = mixed_res or mixed_fps or mixed_stream
 
         target_fps = max(unique_fps) if unique_fps else 30.0
         if unique_res:
@@ -1703,6 +1735,8 @@ class MergeRenderedThread(QThread):
         if mixed_fps:
             fps_txt = ", ".join(f"{f:g}fps" for f in sorted(unique_fps))
             self.log.emit(f"⚠️ FPS KHÔNG đồng nhất: {fps_txt}\n")
+        if mixed_stream and not (mixed_res or mixed_fps):
+            self.log.emit("⚠️ Codec/profile/time-base giữa các tập không đồng nhất.\n")
         if mixed:
             self.log.emit(
                 f"   → Chuẩn hóa từng input trước khi concat: {target_w}×{target_h} @ {target_fps:g}fps.\n"
@@ -3957,8 +3991,9 @@ class SingleSeriesRenderWidget(QWidget):
 
         rp_row = QHBoxLayout(); rp_row.setSpacing(5)
         rp_row.addWidget(QLabel("Song song", styleSheet="color:#858D96; font-size:8px; border:none;"))
-        self.spn_render_parallel = QSpinBox(); self.spn_render_parallel.setRange(1, 2)
-        self.spn_render_parallel.setValue(min(2, int(self.settings.value("render_parallel", 2))))
+        self.spn_render_parallel = QSpinBox(); self.spn_render_parallel.setRange(1, 4)
+        self.spn_render_parallel.setValue(4)
+        self.settings.setValue("render_parallel", 4)
         self.spn_render_parallel.setFixedWidth(43)
         self.spn_render_parallel.valueChanged.connect(lambda v: self.settings.setValue("render_parallel", v))
         rp_row.addWidget(self.spn_render_parallel)

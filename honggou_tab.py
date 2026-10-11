@@ -306,7 +306,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.97"
+APP_VERSION = "1.0.98"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -1137,6 +1137,129 @@ class HonggouMergeThread(QThread):
                 return
 
         self.finished_signal.emit()
+
+
+class HonggouNormalizeSeriesThread(HonggouMergeThread):
+    """Chuẩn hóa cả bộ về H.264 + AAC 48 kHz, không ghép file."""
+
+    def __init__(self, files):
+        files = sorted([os.path.abspath(p) for p in files], key=_natural_episode_sort_key)
+        super().__init__(os.path.dirname(files[0]) if files else "", [])
+        self.files = files
+
+    def run(self):
+        ffmpeg = get_ffmpeg_path()
+        ffprobe = get_ffprobe_path()
+        if not ffmpeg:
+            self.error_signal.emit("Không tìm thấy ffmpeg.exe để chuẩn hóa bộ phim.")
+            return
+
+        si = None
+        cf = 0
+        if sys.platform == "win32":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            cf = 0x08000000
+
+        def _run(cmd):
+            return subprocess.run(cmd, startupinfo=si, creationflags=cf,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        temp_paths = []
+        try:
+            self.progress_msg.emit(f"🔎 Đã tải đủ {len(self.files)} tập · đang đọc chuẩn chung toàn bộ...")
+            probes = []
+            for fp in self.files:
+                w, h, fps = self._probe_res_fps(ffmpeg, fp)
+                stream = probe_stream(fp, ffprobe)
+                probes.append({"fp": fp, "w": w, "h": h, "fps": fps,
+                               "vcodec": stream.get("vcodec", ""),
+                               "has_audio": bool(stream.get("has_audio"))})
+
+            from collections import Counter
+            rc = Counter((p["w"], p["h"]) for p in probes if p["w"] and p["h"])
+            fc = Counter(p["fps"] for p in probes if p["fps"])
+            if not rc:
+                raise RuntimeError("Không đọc được độ phân giải video của bộ phim.")
+            tw, th = max(rc.items(), key=lambda kv: (kv[1], kv[0][0] * kv[0][1]))[0]
+            tw, th = (tw // 2) * 2, (th // 2) * 2
+            tfps = max(fc.items(), key=lambda kv: (kv[1], kv[0]))[0] if fc else None
+            # Render Sub Mềm xuất H.264, vì vậy chuẩn hóa trước luôn dùng H.264.
+            # Không chọn codec theo số đông: nguồn HEVC/H.265 sẽ được chuyển sang
+            # H.264 ngay tại đây để bước render sau không phải đổi codec lần nữa.
+            family = "h264"
+            self.progress_msg.emit(
+                f"🎯 Chuẩn chung: {tw}×{th}" + (f" @ {tfps:g}fps" if tfps else "")
+                + " · H.264/AVC · AAC 48 kHz stereo")
+
+            # Dò encoder một lần trước khi chạy nhiều luồng.
+            self._detect_gpu_encoder(ffmpeg, family)
+            self._merge_parallel_workers = max(1, min(4, len(probes)))
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def _one(index, p):
+                fp = p["fp"]
+                stem = fp + ".presync"
+                ts_path = stem + ".ts"
+                mp4_path = stem + ".mp4"
+                temp_paths.extend([ts_path, mp4_path])
+                source_codec = str(p["vcodec"] or "").strip().lower()
+                current_family = "h264" if source_codec in ("h264", "avc", "avc1") else "other"
+                mismatch = ((p["w"], p["h"]) != (tw, th)
+                            or (tfps and p["fps"] and abs(p["fps"] - tfps) > 0.05)
+                            or current_family != family)
+                if mismatch:
+                    ok = self._fix_episode_to_ts(ffmpeg, fp, ts_path, tw, th, tfps,
+                                                 p["has_audio"], _run, family=family)
+                else:
+                    ok = self._remux_episode_to_ts(ffmpeg, fp, ts_path, p["vcodec"],
+                                                   p["has_audio"], _run)
+                if not ok:
+                    raise RuntimeError(f"Không chuẩn hóa được {os.path.basename(fp)}")
+                cmd = [ffmpeg, "-y", "-i", ts_path, "-c", "copy",
+                       "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4_path]
+                result = _run(cmd)
+                if (result.returncode != 0 or not os.path.isfile(mp4_path)
+                        or os.path.getsize(mp4_path) <= 1024
+                        or not SingleDriveDownloadThread._looks_like_mp4(mp4_path)):
+                    raise RuntimeError(f"Không đóng gói lại được {os.path.basename(fp)}")
+                check = probe_stream(mp4_path, ffprobe)
+                if not check.get("vcodec") or (p["has_audio"] and not check.get("has_audio")):
+                    raise RuntimeError(f"File chuẩn hóa thiếu luồng: {os.path.basename(fp)}")
+                output_codec = str(check.get("vcodec") or "").strip().lower()
+                if output_codec not in ("h264", "avc", "avc1"):
+                    raise RuntimeError(
+                        f"File chuẩn hóa chưa về H.264: {os.path.basename(fp)} ({output_codec})")
+                return index, fp, ts_path, mp4_path
+
+            completed = 0
+            ready_outputs = []
+            with ThreadPoolExecutor(max_workers=self._merge_parallel_workers,
+                                    thread_name_prefix="presync") as pool:
+                futures = [pool.submit(_one, i, p) for i, p in enumerate(probes)]
+                for future in as_completed(futures):
+                    index, fp, ts_path, mp4_path = future.result()
+                    ready_outputs.append((index, fp, ts_path, mp4_path))
+                    completed += 1
+                    self.progress_msg.emit(
+                        f"✅ Chuẩn hóa trước render: {completed}/{len(probes)} tập")
+
+            # Chỉ thay file gốc sau khi TẤT CẢ tập đều chuẩn hóa thành công.
+            # Nếu một tập lỗi, finally dọn file tạm và cả bộ gốc còn nguyên.
+            for index, fp, ts_path, mp4_path in sorted(ready_outputs):
+                os.replace(mp4_path, fp)
+                try: os.remove(ts_path)
+                except Exception: pass
+
+            self.finished_signal.emit()
+        except Exception as exc:
+            self.error_signal.emit(f"Chuẩn hóa trước render thất bại: {exc}")
+        finally:
+            for path in temp_paths:
+                try:
+                    if os.path.exists(path): os.remove(path)
+                except Exception:
+                    pass
 
 # ==========================================
 # CÁC LUỒNG XỬ LÝ NỀN (THREADS)
@@ -4701,6 +4824,7 @@ class HonggouWidget(QWidget):
                 image: none; }
             QCheckBox::indicator:checked::after { color: white; }
         """)
+        self.chk_auto_stt.toggled.connect(self._on_auto_stt_toggled)
         stt_ctrl.addWidget(self.chk_auto_stt)
 
         lbl_stt_src = QLabel("  Tiếng gốc:")
@@ -4802,7 +4926,7 @@ class HonggouWidget(QWidget):
         self.btn_stt_now.setEnabled(False)
         self.btn_stt_now.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_stt_now.setStyleSheet("QPushButton { padding: 8px 18px; background-color: #7c3aed; color: white; border-radius: 8px; font-weight: bold; font-size: 13px; border: none; } QPushButton:hover { background-color: #6d28d9; } QPushButton:disabled { background-color: #374151; color: #64748b; }")
-        self.btn_stt_now.clicked.connect(self._run_stt_on_downloaded)
+        self.btn_stt_now.clicked.connect(self._run_stt_with_presync)
         stt_ctrl.addWidget(self.btn_stt_now)
         stt_ctrl.addStretch()
         detail_layout.addLayout(stt_ctrl)
@@ -6633,6 +6757,7 @@ class HonggouWidget(QWidget):
         cover_pixmap = state.get("cover_pixmap", getattr(self, 'current_cover_pixmap', None))
         movie_folder = _hg_movie_folder(self.save_folder, series_id, title)
             
+        local_video_files = []
         for i in range(total_eps):
             ep_num = i + 1
             ep_data = next((e for e in episodes if e.get("episode_number") == ep_num), None)
@@ -6659,6 +6784,7 @@ class HonggouWidget(QWidget):
             local_path = os.path.join(movie_folder, safe_name)
             
             if os.path.exists(local_path) and os.path.getsize(local_path) > 1024:
+                local_video_files.append(local_path)
                 link_item = QTableWidgetItem("💾 Đã có trên máy")
                 link_item.setForeground(QColor("#c084fc"))
                 _f = link_item.font(); _f.setBold(True); link_item.setFont(_f)
@@ -6670,6 +6796,13 @@ class HonggouWidget(QWidget):
                 link_item.setForeground(QColor("#10b981"))
                 
             link_item.setFlags(readonly_flags); link_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter); table.setItem(i, 3, link_item)
+
+        state["local_video_files"] = sorted(local_video_files, key=_natural_episode_sort_key)
+        if table is getattr(self, 'table', None):
+            self.downloaded_file_paths = list(state["local_video_files"])
+            self._files_for_stt = list(state["local_video_files"])
+            if hasattr(self, 'btn_stt_now'):
+                self.btn_stt_now.setEnabled(bool(local_video_files))
 
     def _toggle_select_all(self):
         def _on_disk(i):
@@ -6773,9 +6906,14 @@ class HonggouWidget(QWidget):
         # Luôn tách ngay trong lúc tải, kể cả đang chạy Tải hàng loạt. Trước đây
         # nhánh background vô tình tắt cờ này nên phải chờ đủ cả bộ mới thấy SRT.
         self._stt_background_series_mode = False
-        self._stt_during_download = bool(
+        # Tập nào tải xong thì tách sub tập đó ngay (tối đa 10 luồng). Chỉ khi
+        # tải + STT cả bộ xong mới chuẩn hóa video theo chuẩn số đông.
+        self._stt_after_presync = bool(
             hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked()
         )
+        self._stt_during_download = self._stt_after_presync
+        self._presync_complete = False
+        self._pending_presync_after_stt = False
         self._stt_pipeline_queue = []
         self._stt_pipeline_seen = set()
         self._stt_pipeline_active = 0
@@ -7190,6 +7328,57 @@ class HonggouWidget(QWidget):
                 self._maybe_finish_stt_pipeline()
             elif getattr(self, '_batch_running', False):
                 self._batch_tab_finished()
+            return
+
+        auto_stt = hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked()
+
+        # Với STT tự động: tập nào tải xong đã được tách ngay (tối đa 10 luồng).
+        # Chờ toàn bộ STT kết thúc rồi mới chuẩn hóa để FFmpeg không ghi đè file
+        # trong lúc bộ nhận dạng giọng nói đang đọc.
+        if auto_stt and valid_files and not getattr(self, '_presync_complete', False):
+            self._files_for_stt = list(valid_files)
+            self._stt_files = list(valid_files)
+            for fp in valid_files:
+                self._enqueue_stt_during_download(fp)
+            self._pending_presync_after_stt = True
+            self._stt_pipeline_downloads_done = True
+            self.lbl_status.setText(
+                f"✅ Đã tải {total_downloaded} tập · đang chờ tối đa {MAX_PARALLEL_STT} luồng tách sub...")
+            self._maybe_finish_stt_pipeline()
+            return
+
+        # Không tách sub tự động: tải đủ toàn bộ rồi chuẩn hóa ngay.
+        if valid_files and not getattr(self, '_presync_complete', False):
+            self.btn_download.setEnabled(False)
+            self.btn_download.setText("⚙️ Đang chuẩn hóa cả bộ...")
+            self.lbl_status.setText(
+                f"🔎 Đã tải đủ {len(valid_files)} tập · đang đọc chuẩn chung trước render...")
+            self.presync_thread = HonggouNormalizeSeriesThread(list(valid_files))
+            self.presync_thread.progress_msg.connect(lambda msg: self.lbl_status.setText(msg))
+
+            def _presync_done():
+                self._presync_complete = True
+                try:
+                    self._tab_data.get(self._active_dl_table, {})["presync_done"] = True
+                except Exception:
+                    pass
+                self._stt_during_download = bool(getattr(self, '_stt_after_presync', False))
+                self._on_all_downloads_done(len(valid_files))
+
+            def _presync_error(message):
+                self.btn_download.setEnabled(True)
+                self.btn_download.setText("📥 Tải đã chọn")
+                self.lbl_status.setText("❌ Chuẩn hóa cả bộ thất bại — chưa chuyển sang render.")
+                if hasattr(self, 'txt_stt_log'):
+                    self.txt_stt_log.append(f"❌ {message}")
+                QMessageBox.critical(self, "Lỗi chuẩn hóa trước render", message)
+                if getattr(self, '_batch_running', False):
+                    self._batch_tab_finished()
+
+            self.presync_thread.finished_signal.connect(_presync_done)
+            self.presync_thread.error_signal.connect(_presync_error)
+            self._keep_thread_alive(self.presync_thread)
+            self.presync_thread.start()
             return
 
         mode = self.merge_mode_combo.currentIndex()
@@ -7832,6 +8021,34 @@ class HonggouWidget(QWidget):
             QMessageBox.information(self, "Lồng tiếng hoàn tất",
                 f"Đã lồng tiếng thành công {ok} video!\nFile đầu ra: *_dubbed.mp4 cạnh file gốc.")
 
+    def _on_auto_stt_toggled(self, checked):
+        """Nếu bộ đã có sẵn trên máy, tích tự động sẽ chạy ngay thay vì chờ tải."""
+        if not checked:
+            return
+        files = getattr(self, '_files_for_stt', None) or getattr(self, 'downloaded_file_paths', [])
+        if files:
+            QTimer.singleShot(0, self._run_stt_with_presync)
+
+    def _run_stt_with_presync(self):
+        """Chuẩn hóa cả bộ hiện có trước rồi mới bắt đầu STT."""
+        files = getattr(self, '_files_for_stt', None) or getattr(self, 'downloaded_file_paths', [])
+        files = sorted([os.path.abspath(f) for f in files if os.path.isfile(f)],
+                       key=_natural_episode_sort_key)
+        if not files:
+            QMessageBox.warning(self, "Không có file", "Chưa có file video nào để tách sub!")
+            return
+        state = self._tab_data.get(getattr(self, 'table', None), {})
+        if state.get("presync_done"):
+            self._files_for_stt = list(files)
+            self._run_stt_on_downloaded()
+            return
+        # Bộ có sẵn trên máy cũng ưu tiên tách sub trước bằng 10 luồng; khi STT
+        # kết thúc, _on_stt_finished mới khóa file và chuẩn hóa toàn bộ.
+        self._files_for_stt = list(files)
+        self._stt_files = list(files)
+        self._pending_presync_after_stt = True
+        self._run_stt_on_downloaded()
+
     def _run_stt_on_downloaded(self):
         files = getattr(self, '_files_for_stt', None) or getattr(self, 'downloaded_file_paths', [])
         files = [f for f in files if os.path.exists(f)]
@@ -7848,7 +8065,9 @@ class HonggouWidget(QWidget):
         self._stt_files = list(files)   
         self._stt_out_lang = out
 
-        self._stt_thread = SttBatchThread(files, src_lang=src, out_lang=out, use_trans=use_trans, stt_workers=3)
+        self._stt_thread = SttBatchThread(
+            files, src_lang=src, out_lang=out, use_trans=use_trans,
+            stt_workers=MAX_PARALLEL_STT)
         self._stt_thread.progress_signal.connect(self._on_stt_progress)
         self._stt_thread.finished_signal.connect(self._on_stt_finished)
         self._keep_thread_alive(self._stt_thread)
@@ -7881,6 +8100,49 @@ class HonggouWidget(QWidget):
         self._do_merge(mode, files)
 
     def _on_stt_finished(self, ok, failed):
+        if getattr(self, '_pending_presync_after_stt', False):
+            self._pending_presync_after_stt = False
+            files = sorted(
+                [f for f in (getattr(self, '_stt_files', []) or []) if os.path.isfile(f)],
+                key=_natural_episode_sort_key)
+            if not files:
+                self.lbl_status.setText("❌ Không còn video để chuẩn hóa sau tách sub.")
+                if getattr(self, '_batch_running', False):
+                    self._batch_tab_finished()
+                return
+
+            self.btn_stt_now.setEnabled(False)
+            self.btn_stt_now.setText("⚙️ Đang chuẩn hóa...")
+            self.lbl_status.setText(
+                f"✅ Tách sub đã kết thúc · đang chuẩn hóa chung {len(files)} tập...")
+            self.presync_thread = HonggouNormalizeSeriesThread(files)
+            self.presync_thread.progress_msg.connect(lambda msg: self.lbl_status.setText(msg))
+
+            def _done_after_stt():
+                self._presync_complete = True
+                try:
+                    self._tab_data.get(self._active_dl_table, {})["presync_done"] = True
+                except Exception:
+                    pass
+                self.btn_stt_now.setText("🔤 Tách sub ngay")
+                self._on_stt_finished(ok, failed)
+
+            def _error_after_stt(message):
+                self.btn_stt_now.setEnabled(True)
+                self.btn_stt_now.setText("🔤 Tách sub ngay")
+                self.lbl_status.setText("❌ Chuẩn hóa sau tách sub thất bại.")
+                if hasattr(self, 'txt_stt_log'):
+                    self.txt_stt_log.append(f"❌ {message}")
+                QMessageBox.critical(self, "Lỗi chuẩn hóa cả bộ", message)
+                if getattr(self, '_batch_running', False):
+                    self._batch_tab_finished()
+
+            self.presync_thread.finished_signal.connect(_done_after_stt)
+            self.presync_thread.error_signal.connect(_error_after_stt)
+            self._keep_thread_alive(self.presync_thread)
+            self.presync_thread.start()
+            return
+
         self.btn_stt_now.setEnabled(True); self.btn_stt_now.setText("🔤 Tách sub ngay")
         summary = f"✅ Tách sub xong: {ok} thành công, {failed} lỗi."
         self.lbl_status.setText(summary); self.txt_stt_log.append("\n" + summary)
