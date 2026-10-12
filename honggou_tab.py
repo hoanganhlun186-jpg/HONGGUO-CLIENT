@@ -306,7 +306,7 @@ def _clamp_edge_rate(rate_pct):
 # ==========================================
 # CẤU HÌNH SERVER & PHIÊN BẢN
 # ==========================================
-APP_VERSION = "1.0.98"
+APP_VERSION = "1.0.99"
 SERVER_URL = "http://163.61.182.119:8000"
 GITHUB_REPO = "anhstudiovn/hongguo-downloader"  # đổi thành repo thật của bạn
 
@@ -4811,6 +4811,27 @@ class HonggouWidget(QWidget):
         bottom_layout.addWidget(self.btn_select_all)
         bottom_layout.addLayout(dl_row)
 
+        self.chk_normalize_after_download = QCheckBox(
+            "⚙️ Chuẩn hóa đầu ra video (chậm)"
+        )
+        self.chk_normalize_after_download.setToolTip(
+            "Bật: tải đủ bộ xong sẽ chuẩn hóa chung độ phân giải/FPS, chuyển H.264 + AAC 48 kHz.\n"
+            "Tắt: tải MP4 về nguyên bản, không chạy FFmpeg chuẩn hóa."
+        )
+        self.chk_normalize_after_download.setChecked(
+            self.settings.value("normalize_after_hongguo_download", "false") == "true"
+        )
+        self.chk_normalize_after_download.setStyleSheet("""
+            QCheckBox { color:#67e8f9; font-size:12px; padding:5px 4px; font-weight:bold; }
+            QCheckBox::indicator { width:18px; height:18px; border:2px solid #06b6d4;
+                border-radius:4px; background:#1e293b; }
+            QCheckBox::indicator:checked { background:#06b6d4; border-color:#06b6d4; }
+        """)
+        self.chk_normalize_after_download.toggled.connect(
+            lambda checked: self.settings.setValue(
+                "normalize_after_hongguo_download", "true" if checked else "false"))
+        bottom_layout.addWidget(self.chk_normalize_after_download)
+
         stt_ctrl = QHBoxLayout(); stt_ctrl.setSpacing(8)
         self.chk_auto_stt = QCheckBox("🔤 Tải xong từng tập → tách sub ngay")
         self.chk_auto_stt.setToolTip(
@@ -6911,6 +6932,12 @@ class HonggouWidget(QWidget):
         self._stt_after_presync = bool(
             hasattr(self, 'chk_auto_stt') and self.chk_auto_stt.isChecked()
         )
+        # Chốt lựa chọn tại đầu phiên để người dùng đổi checkbox trong lúc tải
+        # không làm pipeline của bộ đang chạy đổi hướng giữa chừng.
+        self._normalize_after_download = bool(
+            hasattr(self, 'chk_normalize_after_download')
+            and self.chk_normalize_after_download.isChecked()
+        )
         self._stt_during_download = self._stt_after_presync
         self._presync_complete = False
         self._pending_presync_after_stt = False
@@ -7340,15 +7367,17 @@ class HonggouWidget(QWidget):
             self._stt_files = list(valid_files)
             for fp in valid_files:
                 self._enqueue_stt_during_download(fp)
-            self._pending_presync_after_stt = True
+            self._pending_presync_after_stt = bool(
+                getattr(self, '_normalize_after_download', True))
             self._stt_pipeline_downloads_done = True
             self.lbl_status.setText(
                 f"✅ Đã tải {total_downloaded} tập · đang chờ tối đa {MAX_PARALLEL_STT} luồng tách sub...")
             self._maybe_finish_stt_pipeline()
             return
 
-        # Không tách sub tự động: tải đủ toàn bộ rồi chuẩn hóa ngay.
-        if valid_files and not getattr(self, '_presync_complete', False):
+        # Không tách sub tự động: chỉ chuẩn hóa khi người dùng có tích lựa chọn.
+        if (valid_files and getattr(self, '_normalize_after_download', True)
+                and not getattr(self, '_presync_complete', False)):
             self.btn_download.setEnabled(False)
             self.btn_download.setText("⚙️ Đang chuẩn hóa cả bộ...")
             self.lbl_status.setText(
