@@ -10,6 +10,7 @@ import os
 import sys
 from pathlib import Path
 import subprocess
+import shutil
 
 try:
     from shared_utils import get_ffmpeg_path, get_ffprobe_path, CREATE_NO_WINDOW
@@ -2645,6 +2646,10 @@ class DubFeatureWidget(QWidget):
         btn_login.setStyleSheet("background:#7c3aed;")
         lay.addWidget(btn_login)
 
+        btn_relogin = QPushButton("🚪 Thoát Gemini / Đăng nhập lại")
+        btn_relogin.setStyleSheet("background:#dc2626;")
+        lay.addWidget(btn_relogin)
+
         _s = QSettings("HongguoDownloader", "ClientApp")
         lay.addWidget(QLabel("Chọn prompt dịch:"))
         cb_preset = QComboBox()
@@ -2689,6 +2694,45 @@ class DubFeatureWidget(QWidget):
             self._gemini_login_thread.finished_signal.connect(_fin)
             self._gemini_login_thread.start()
         btn_login.clicked.connect(_do_login)
+
+        def _logout_relogin():
+            if QMessageBox.question(
+                    self, "Đăng nhập lại Gemini",
+                    "Tool sẽ dừng phiên Gemini automation hiện tại, xóa phiên đăng nhập "
+                    "và dữ liệu Chrome riêng của BOOM Studio rồi mở đăng nhập mới.\n\n"
+                    "Chrome cá nhân và tài khoản BOOM Studio không bị ảnh hưởng. Tiếp tục?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+            btn_login.setEnabled(False); btn_relogin.setEnabled(False)
+            log_box.append("⏳ Đang đóng phiên Gemini automation cũ...")
+            for name in ("_gtrans_thread", "_gemini_login_thread"):
+                thread = getattr(self, name, None)
+                if thread is not None and thread.isRunning():
+                    try: thread.requestInterruption()
+                    except Exception: pass
+                    try: thread.wait(5000)
+                    except Exception: pass
+            errors = []
+            try:
+                if os.path.isfile(AUTH_FILE): os.remove(AUTH_FILE)
+            except Exception as exc:
+                errors.append(f"gemini_auth.json: {exc}")
+            profile_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "BoomStudio_ChromeData")
+            try:
+                if os.path.isdir(profile_dir): shutil.rmtree(profile_dir)
+            except Exception as exc:
+                errors.append(f"BoomStudio_ChromeData: {exc}")
+            if errors:
+                log_box.append("❌ Chưa xóa sạch phiên cũ: " + " | ".join(errors))
+                btn_login.setEnabled(True); btn_relogin.setEnabled(True)
+                return
+            lbl_status.setText("🔴 Đã thoát Gemini — đang mở đăng nhập mới")
+            self._refresh_gemini_btn()
+            log_box.append("✅ Đã xóa phiên Gemini và Chrome riêng của tool.")
+            btn_relogin.setEnabled(True)
+            _do_login()
+        btn_relogin.clicked.connect(_logout_relogin)
 
         btn_save = QPushButton("💾 Lưu & Đóng")
         btn_save.setStyleSheet("background:#16a34a;")

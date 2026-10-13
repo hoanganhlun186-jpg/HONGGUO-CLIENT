@@ -2343,23 +2343,25 @@ class SingleRenderThread(QThread):
                 except Exception: pass
 
     def _validate_output_timeline(self):
-        """Chỉ công nhận tập đã render khi timeline bắt đầu từ 0 và đủ duration."""
+        """Với xuất file lẻ, chỉ cần đầu ra tồn tại và FFprobe đọc được duration."""
         source_duration = _probe_duration_sec(self.vp)
         output_duration = _probe_duration_sec(self.op)
         speed = 1.05 if self.cfg.get("speed") else 1.0
         expected = source_duration / speed if source_duration > 0 else 0.0
-        fps = float(self.cfg.get("target_fps") or 30.0)
-        tolerance = max(0.12, 2.0 / max(fps, 1.0))
-        if expected <= 0 or output_duration <= 0 or abs(output_duration - expected) > tolerance:
-            self.log.emit(
-                f"❌ Timeline tập chưa đạt: {output_duration:.3f}/{expected:.3f}s "
-                f"(lệch {abs(output_duration - expected):.3f}s) → không đánh dấu xong.\n")
+        if output_duration <= 0 or not os.path.isfile(self.op) or os.path.getsize(self.op) <= 0:
+            self.log.emit("❌ File render đầu ra không tồn tại hoặc không đọc được thời lượng.\n")
             try:
                 if os.path.isfile(self.op): os.remove(self.op)
             except OSError:
                 pass
             return False
-        self.log.emit(f"✅ Timeline tập đạt chuẩn: {output_duration:.3f}s · timebase 1/90000.\n")
+        delta = abs(output_duration - expected) if expected > 0 else 0.0
+        if expected > 0 and delta > 0.12:
+            self.log.emit(
+                f"ℹ️ File lẻ đã render xong: {output_duration:.3f}s "
+                f"(nguồn dự kiến {expected:.3f}s, lệch {delta:.3f}s; chỉ thông báo, không coi là lỗi).\n")
+        else:
+            self.log.emit(f"✅ File lẻ đã render xong: {output_duration:.3f}s.\n")
         return True
 
     def _emit_progress_from_line(self, line, last_pct):
@@ -2796,10 +2798,17 @@ class SingleRenderThread(QThread):
                         self.done.emit(True)
                     else:
                         tail2 = "".join(list(stderr_lines2)[-15:])
-                        self.log.emit(f"❌ FFmpeg lỗi cả khi dùng CPU (code {proc.returncode})\n📋 Chi tiết:\n{tail2}\n")
+                        if proc.returncode == 0:
+                            self.log.emit("❌ CPU đã render xong nhưng file đầu ra không đạt kiểm tra timeline.\n")
+                        else:
+                            self.log.emit(f"❌ FFmpeg lỗi cả khi dùng CPU (code {proc.returncode})\n📋 Chi tiết:\n{tail2}\n")
                         self.done.emit(False)
                 else:
-                    self.log.emit(f"❌ FFmpeg lỗi (code {proc.returncode})\n📋 Chi tiết:\n{tail}\n"); self.done.emit(False)
+                    if proc.returncode == 0:
+                        self.log.emit("❌ FFmpeg đã chạy xong nhưng file đầu ra không đạt kiểm tra timeline.\n")
+                    else:
+                        self.log.emit(f"❌ FFmpeg lỗi (code {proc.returncode})\n📋 Chi tiết:\n{tail}\n")
+                    self.done.emit(False)
         except Exception as e:
             self.log.emit(f"❌ Lỗi: {e}\n"); self.done.emit(False)
         finally:
