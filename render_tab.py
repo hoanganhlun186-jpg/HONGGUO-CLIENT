@@ -168,6 +168,78 @@ def _srt_has_content(srt_path):
         return False
 
 
+def _merge_srt_files_for_videos(video_paths, srt_paths, output_srt):
+    """Nối SRT theo timeline video tương ứng và ghi UTF-8 cạnh file gộp.
+
+    SRT thiếu/rỗng của một tập được bỏ qua, nhưng thời lượng video của tập đó
+    vẫn được cộng vào offset để phụ đề các tập sau không bị chạy sớm.
+    Trả về (số cue, số SRT hợp lệ, danh sách cảnh báo).
+    """
+    cue_re = re.compile(
+        r"(?ms)^\s*(?:\d+\s*\r?\n)?"
+        r"(?P<start>\d{1,3}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*"
+        r"(?P<end>\d{1,3}:\d{2}:\d{2}[,.]\d{3})[^\r\n]*\r?\n"
+        r"(?P<text>.*?)(?=\r?\n\s*\r?\n|\Z)"
+    )
+
+    def to_ms(value):
+        h, m, sec = value.replace(',', '.').split(':')
+        return round((int(h) * 3600 + int(m) * 60 + float(sec)) * 1000)
+
+    def stamp(value):
+        value = max(0, int(value))
+        h, rem = divmod(value, 3600000)
+        m, rem = divmod(rem, 60000)
+        s, ms = divmod(rem, 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    offset_ms = 0
+    merged = []
+    valid_files = 0
+    warnings = []
+    for index, video_path in enumerate(video_paths):
+        duration_ms = max(0, round(float(_probe_duration_sec(video_path) or 0) * 1000))
+        srt_path = srt_paths[index] if index < len(srt_paths) else None
+        episode_cues = 0
+        if srt_path and _srt_has_content(srt_path):
+            try:
+                with open(srt_path, 'r', encoding='utf-8-sig', errors='replace') as handle:
+                    text = handle.read()
+                for match in cue_re.finditer(text):
+                    start_ms, end_ms = to_ms(match.group('start')), to_ms(match.group('end'))
+                    body = match.group('text').strip()
+                    if not body or end_ms <= start_ms:
+                        continue
+                    if duration_ms > 0:
+                        if start_ms >= duration_ms:
+                            continue
+                        end_ms = min(end_ms, duration_ms)
+                    if end_ms <= start_ms:
+                        continue
+                    merged.append((offset_ms + start_ms, offset_ms + end_ms, body))
+                    episode_cues += 1
+                if episode_cues:
+                    valid_files += 1
+                else:
+                    warnings.append(f"{os.path.basename(srt_path)} không đọc được cue hợp lệ")
+            except OSError as exc:
+                warnings.append(f"{os.path.basename(srt_path)}: {exc}")
+        elif srt_path:
+            warnings.append(f"{os.path.basename(srt_path)} rỗng/không hợp lệ")
+        else:
+            warnings.append(f"{os.path.basename(video_path)} chưa có SRT")
+        offset_ms += duration_ms
+
+    if not merged:
+        return 0, valid_files, warnings
+    tmp = output_srt + '.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as handle:
+        for number, (start_ms, end_ms, body) in enumerate(merged, 1):
+            handle.write(f"{number}\n{stamp(start_ms)} --> {stamp(end_ms)}\n{body}\n\n")
+    os.replace(tmp, output_srt)
+    return len(merged), valid_files, warnings
+
+
 def _merge_srt_intervals(srt_path, gap=0.3, expand=0.5, max_intervals=150):
     try:
         with open(srt_path, "r", encoding="utf-8") as f: srt_text = f.read()
@@ -1476,7 +1548,7 @@ class MergeRenderedThread(QThread):
     done = pyqtSignal(bool, str)
 
     def __init__(self, file_list, out_file, intro_image=None, allow_single=False, part_badge=None,
-                 video_only=False):
+                 video_only=False, subtitle_files=None):
         super().__init__()
         self.part_badge = part_badge
         self.thumbnail_error = ""
@@ -1485,6 +1557,53 @@ class MergeRenderedThread(QThread):
         self.out_file = out_file
         self.intro_image = intro_image
         self.video_only = bool(video_only)
+        self.subtitle_files = list(subtitle_files or [])
+
+    def _embed_merged_subtitles(self, ffmpeg, files, si):
+        """Nối SRT từng tập và nhúng một track mov_text vào MP4 đã gộp."""
+        if not self.subtitle_files:
+            return
+        output_srt = os.path.splitext(self.out_file)[0] + "_vi.srt"
+        cue_count, valid_count, warnings = _merge_srt_files_for_videos(
+            files, self.subtitle_files, output_srt)
+        for warning in warnings:
+            self.log.emit(f"   ⚠️ {warning}\n")
+        if cue_count <= 0:
+            self.log.emit("⚠️ Không có SRT hợp lệ để nhúng; file video gộp vẫn được giữ.\n")
+            return
+
+        temp_out = os.path.splitext(self.out_file)[0] + "_with_sub_tmp.mp4"
+        try:
+            cmd = [
+                ffmpeg, "-y", "-nostdin", "-i", self.out_file, "-i", output_srt,
+                "-map", "0:v:0", "-map", "0:a?", "-map", "1:0",
+                "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
+                "-metadata:s:s:0", "language=vie",
+                "-metadata:s:s:0", "title=Tiếng Việt",
+                "-disposition:s:0", "default",
+                "-movflags", "+faststart", temp_out,
+            ]
+            result = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                startupinfo=si, text=True, encoding="utf-8", errors="replace")
+            if (result.returncode != 0 or not os.path.isfile(temp_out)
+                    or os.path.getsize(temp_out) <= 1024):
+                raise RuntimeError((result.stderr or "FFmpeg không tạo được MP4 có phụ đề")[-1200:])
+            before = _probe_duration_sec(self.out_file)
+            after = _probe_duration_sec(temp_out)
+            if before <= 0 or after <= 0 or abs(before - after) > 0.12:
+                raise RuntimeError(
+                    f"thời lượng đổi sau khi nhúng SRT ({after:.3f}/{before:.3f}s)")
+            os.replace(temp_out, self.out_file)
+            self.log.emit(
+                f"✅ Đã nối {cue_count} câu từ {valid_count} SRT và nhúng phụ đề mềm Tiếng Việt.\n")
+            self.log.emit(f"📝 Đã lưu SRT trọn bộ: {os.path.basename(output_srt)}\n")
+        finally:
+            if os.path.isfile(temp_out):
+                try:
+                    os.remove(temp_out)
+                except OSError:
+                    pass
 
     def _probe_resolution(self, ffmpeg, filepath):
         """Trả về (width, height) của video, hoặc None nếu probe thất bại."""
@@ -1838,6 +1957,7 @@ class MergeRenderedThread(QThread):
                     except OSError:
                         pass
                     self.log.emit("🔇 Video sub trọn bộ đã không có audio → giữ nguyên, không sao chép lại.\n")
+            self._embed_merged_subtitles(ffmpeg, files, si)
             self.log.emit(f"✅ Gộp trọn bộ thành công ({mode}): {os.path.basename(self.out_file)}\n")
             thumb_jpg = self._prepare_thumbnail()
             if thumb_jpg:
@@ -5036,10 +5156,10 @@ class SingleSeriesRenderWidget(QWidget):
         """Đoán srt đi kèm 1 video lẻ (khi thêm bằng + File)."""
         stem = os.path.splitext(video_path)[0]
         low = stem.lower()
-        if low.endswith("_dubbed"):
-            stem = stem[:-len("_dubbed")]
-        elif low.endswith("_final"):
-            stem = stem[:-len("_final")]
+        for suffix in ("_dubbed", "_final", "_rendered", "_video_sub"):
+            if low.endswith(suffix):
+                stem = stem[:-len(suffix)]
+                break
         for cand in (stem + "_vi.srt", stem + ".srt"):
             if os.path.exists(cand):
                 return cand
@@ -6800,27 +6920,37 @@ class SingleSeriesRenderWidget(QWidget):
             QMessageBox.information(self, "Chưa chọn video", "Hãy tick ít nhất 2 video muốn gộp.")
             return
 
-        files_to_merge = []
+        merge_pairs = []
+        seen_videos = set()
         for c in selected_cards:
             vp = getattr(c, "video_path", None)
-            if vp and os.path.exists(vp) and vp not in files_to_merge:
-                files_to_merge.append(vp)
+            if vp and os.path.exists(vp) and vp not in seen_videos:
+                srt = getattr(c, "srt_path", None)
+                if not srt or not os.path.isfile(srt):
+                    srt = self._guess_srt_for(vp)
+                merge_pairs.append((vp, srt if srt and os.path.isfile(srt) else None))
+                seen_videos.add(vp)
                 
-        if len(files_to_merge) < 2:
+        if len(merge_pairs) < 2:
             QMessageBox.information(self, "Chưa đủ file", "Cần ít nhất 2 file video để gộp.")
             return
 
         # Sắp xếp đúng theo thứ tự tự nhiên (Tập 1, 2, ... 10)
-        files_to_merge.sort(key=lambda x: _natural_key(os.path.basename(x)))
+        merge_pairs.sort(key=lambda pair: _natural_key(os.path.basename(pair[0])))
+        files_to_merge = [pair[0] for pair in merge_pairs]
+        subtitles_to_merge = [pair[1] for pair in merge_pairs]
+        srt_count = sum(bool(path) for path in subtitles_to_merge)
 
         reply = QMessageBox.question(
             self, "Xác nhận Gộp", 
             f"Bạn có chắc muốn gộp nhanh {len(files_to_merge)} video này thành 1 file không?\n\n"
-            "(Lưu ý: Quá trình sẽ bỏ qua render ghép sub/màu. Thứ tự đã được tự động sắp xếp từ 1 đến hết)",
+            f"Tìm thấy SRT cho {srt_count}/{len(files_to_merge)} tập. "
+            "SRT sẽ được nối đúng timeline, nhúng thành phụ đề mềm và xuất kèm file SRT tổng.\n"
+            "(Không render lại hình/màu; thứ tự được tự động sắp xếp từ tập 1 đến hết.)",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self._start_merge(files_to_merge)
+            self._start_merge(files_to_merge, subtitles_to_merge)
 
     def _start_export_original_audio(self):
         """Khởi chạy nhánh audio độc lập; có thể chạy cùng lúc với render/amix."""
@@ -7401,8 +7531,16 @@ class SingleSeriesRenderWidget(QWidget):
             QMessageBox.warning(self, "Lỗi gộp theo phần",
                 "Đã dừng vì một phần gộp lỗi. Các phần đã hoàn tất được giữ lại. Hãy kiểm tra log.")
 
-    def _start_merge(self, file_list):
-        file_list = [p for p in (file_list or []) if p and os.path.exists(p)]
+    def _start_merge(self, file_list, subtitle_files=None):
+        subtitle_files = list(subtitle_files or [])
+        pairs = []
+        for index, path in enumerate(file_list or []):
+            if path and os.path.exists(path):
+                subtitle = subtitle_files[index] if index < len(subtitle_files) else None
+                pairs.append((path, subtitle if subtitle and os.path.isfile(subtitle) else None))
+        pairs.sort(key=lambda pair: _natural_key(os.path.basename(pair[0])))
+        file_list = [pair[0] for pair in pairs]
+        subtitle_files = [pair[1] for pair in pairs]
         # Gộp trọn bộ 3 file phải lấy trạng thái thật trên ổ đĩa, không chỉ
         # dùng _rendered_files của phiên hiện tại (phiên mở lại sẽ thiếu các
         # tập đã render từ trước). Quét lại toàn bộ *_video_sub.mp4 cạnh các
@@ -7430,13 +7568,13 @@ class SingleSeriesRenderWidget(QWidget):
                         f"ổ đĩa có {len(disk_videos)} tập → dùng đủ file trên ổ đĩa."
                     )
                 file_list = disk_videos
+                subtitle_files = []
         if len(file_list) < 2:
             self._log("⚠️ Không đủ ít nhất 2 file hợp lệ để gộp.")
             QMessageBox.warning(self, "Không đủ file", "Cần ít nhất 2 file video hợp lệ để gộp.")
             return
         # Render song song -> file xong KHÔNG theo thứ tự. Sắp lại theo số tập
         # để gộp trọn bộ đúng 1 -> cuối.
-        file_list = sorted(file_list, key=lambda p: _natural_key(os.path.basename(p)))
         self._log(f"🔗 Đang chuẩn bị gộp {len(file_list)} file thành 1...")
         self.btn_run.setEnabled(False)
         self.btn_run.setText("⏳ ĐANG GỘP FILE...")
@@ -7504,7 +7642,8 @@ class SingleSeriesRenderWidget(QWidget):
                 
         self.merge_thread = MergeRenderedThread(
             file_list, out_path, intro_img,
-            video_only=bool(getattr(self, "_separate_export_mode", False)))
+            video_only=bool(getattr(self, "_separate_export_mode", False)),
+            subtitle_files=subtitle_files)
         self.merge_thread.log.connect(self._log)
         self._full_merge_result = (False, out_path)
         self.merge_thread.done.connect(self._remember_full_merge_result)
