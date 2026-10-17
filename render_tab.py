@@ -1559,8 +1559,8 @@ class MergeRenderedThread(QThread):
         self.video_only = bool(video_only)
         self.subtitle_files = list(subtitle_files or [])
 
-    def _embed_merged_subtitles(self, ffmpeg, files, si):
-        """Nối SRT từng tập và nhúng một track mov_text vào MP4 đã gộp."""
+    def _merge_subtitles(self, files):
+        """Nối SRT từng tập theo timeline video và lưu thành một file SRT riêng."""
         if not self.subtitle_files:
             return
         output_srt = os.path.splitext(self.out_file)[0] + "_vi.srt"
@@ -1569,41 +1569,11 @@ class MergeRenderedThread(QThread):
         for warning in warnings:
             self.log.emit(f"   ⚠️ {warning}\n")
         if cue_count <= 0:
-            self.log.emit("⚠️ Không có SRT hợp lệ để nhúng; file video gộp vẫn được giữ.\n")
+            self.log.emit("⚠️ Không có SRT hợp lệ để gộp; file video gộp vẫn được giữ.\n")
             return
-
-        temp_out = os.path.splitext(self.out_file)[0] + "_with_sub_tmp.mp4"
-        try:
-            cmd = [
-                ffmpeg, "-y", "-nostdin", "-i", self.out_file, "-i", output_srt,
-                "-map", "0:v:0", "-map", "0:a?", "-map", "1:0",
-                "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
-                "-metadata:s:s:0", "language=vie",
-                "-metadata:s:s:0", "title=Tiếng Việt",
-                "-disposition:s:0", "default",
-                "-movflags", "+faststart", temp_out,
-            ]
-            result = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                startupinfo=si, text=True, encoding="utf-8", errors="replace")
-            if (result.returncode != 0 or not os.path.isfile(temp_out)
-                    or os.path.getsize(temp_out) <= 1024):
-                raise RuntimeError((result.stderr or "FFmpeg không tạo được MP4 có phụ đề")[-1200:])
-            before = _probe_duration_sec(self.out_file)
-            after = _probe_duration_sec(temp_out)
-            if before <= 0 or after <= 0 or abs(before - after) > 0.12:
-                raise RuntimeError(
-                    f"thời lượng đổi sau khi nhúng SRT ({after:.3f}/{before:.3f}s)")
-            os.replace(temp_out, self.out_file)
-            self.log.emit(
-                f"✅ Đã nối {cue_count} câu từ {valid_count} SRT và nhúng phụ đề mềm Tiếng Việt.\n")
-            self.log.emit(f"📝 Đã lưu SRT trọn bộ: {os.path.basename(output_srt)}\n")
-        finally:
-            if os.path.isfile(temp_out):
-                try:
-                    os.remove(temp_out)
-                except OSError:
-                    pass
+        self.log.emit(
+            f"✅ Đã nối {cue_count} câu từ {valid_count} SRT theo timeline video.\n")
+        self.log.emit(f"📝 Đã lưu SRT trọn bộ riêng: {os.path.basename(output_srt)}\n")
 
     def _probe_resolution(self, ffmpeg, filepath):
         """Trả về (width, height) của video, hoặc None nếu probe thất bại."""
@@ -1957,7 +1927,7 @@ class MergeRenderedThread(QThread):
                     except OSError:
                         pass
                     self.log.emit("🔇 Video sub trọn bộ đã không có audio → giữ nguyên, không sao chép lại.\n")
-            self._embed_merged_subtitles(ffmpeg, files, si)
+            self._merge_subtitles(files)
             self.log.emit(f"✅ Gộp trọn bộ thành công ({mode}): {os.path.basename(self.out_file)}\n")
             thumb_jpg = self._prepare_thumbnail()
             if thumb_jpg:
@@ -6945,7 +6915,7 @@ class SingleSeriesRenderWidget(QWidget):
             self, "Xác nhận Gộp", 
             f"Bạn có chắc muốn gộp nhanh {len(files_to_merge)} video này thành 1 file không?\n\n"
             f"Tìm thấy SRT cho {srt_count}/{len(files_to_merge)} tập. "
-            "SRT sẽ được nối đúng timeline, nhúng thành phụ đề mềm và xuất kèm file SRT tổng.\n"
+            "SRT sẽ được nối đúng timeline và xuất thành file SRT tổng riêng, không nhúng vào video.\n"
             "(Không render lại hình/màu; thứ tự được tự động sắp xếp từ tập 1 đến hết.)",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
